@@ -1,0 +1,1720 @@
+# TrafficPlannerModel 전체 설계 문서
+
+이 문서는 TrafficPlannerModel의 데이터 입력부터 디코더 출력까지 모든 네트워크 구조, 차원, 피처 흐름을 코드 기반으로 상세히 설명합니다.
+
+---
+
+## 목차
+
+1. [모델 개요](#1-모델-개요)
+2. [입력 데이터 구조](#2-입력-데이터-구조)
+3. [Map Encoder](#3-map-encoder)
+4. [Temporal GCN Encoder](#4-temporal-gcn-encoder)
+5. [z_global Encoder (Prior/Posterior)](#5-z_global-encoder-priorposterior)
+6. [Decoder](#6-decoder)
+7. [z_local Encoder](#7-z_local-encoder)
+8. [전체 Forward Pass 흐름](#8-전체-forward-pass-흐름)
+9. [네트워크 파라미터 요약](#9-네트워크-파라미터-요약)
+
+---
+
+## 1. 모델 개요
+
+### 1.1 핵심 특징
+
+TrafficPlannerModel은 **Conditional VAE** 기반 다중 에이전트 궤적 예측 모델로, 다음과 같은 특징을 가집니다:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TrafficPlannerModel 개요                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  • 잠재 변수: z_global (전역 의도) + z_local (지역 반응, Ego 전용)              │
+│  • 인코더: per-step GCN + Temporal Encoding (GRU 또는 Transformer)           │
+│  • 디코더: Autoregressive, Ego/Other 분리 경로                               │
+│  • 출력: Bicycle Model (가속도 a, 요율 hdot)                                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 하이퍼파라미터 (기본값)
+
+```python
+# trafficplanner_model.py:68-84
+npast = 4                    # PT: past timesteps
+nfuture = 12                 # FT: future timesteps
+map_obs_size_pix = 200       # 맵 크롭 크기 (픽셀)
+nclasses = 2                 # NC: 시맨틱 클래스 수 (car, truck 등)
+map_feat_size = 64           # 맵 피처 차원
+past_feat_size = 64          # GRU hidden 차원
+latent_size = 32             # z_global 차원
+z_local_size = 32            # z_local 차원
+z_local_window = 4           # 슬라이딩 윈도우 크기
+gcn_hidden_dim = 64          # GCN 출력 차원
+transformer_nhead = 8        # Transformer attention heads
+transformer_nlayer = 3       # Transformer layers
+dt = 0.5                     # 시간 간격 (초)
+```
+
+---
+
+## 2. 입력 데이터 구조
+
+### 2.1 Scene Graph (PyTorch Geometric Batch)
+
+데이터셋(`NuScenesDataset`)에서 로드된 `scene_graph`는 다음과 같은 구조를 가집니다:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Scene Graph 구조                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  scene_graph.past        : (NA, PT, 6)    # 과거 궤적                        │
+│                            [x, y, hx, hy, s, hdot]                          │
+│                                                                             │
+│  scene_graph.past_vis    : (NA, PT)       # 과거 가시성 (0 or 1)             │
+│                                                                             │
+│  scene_graph.future      : (NA, FT, 6)    # 미래 궤적 (학습 시 GT)            │
+│                            [x, y, hx, hy, s, hdot]                          │
+│                                                                             │
+│  scene_graph.future_vis  : (NA, FT)       # 미래 가시성 (0 or 1)             │
+│                                                                             │
+│  scene_graph.lw          : (NA, 2)        # 차량 크기 [length, width]        │
+│                                                                             │
+│  scene_graph.sem         : (NA, NC)       # 시맨틱 클래스 (one-hot)           │
+│                                                                             │
+│  scene_graph.edge_index  : (2, num_edges) # 그래프 연결 (fully connected)    │
+│                                                                             │
+│  scene_graph.batch       : (NA,)          # 배치 소속 인덱스                  │
+│                                                                             │
+│  scene_graph.ptr         : (B+1,)         # 배치 경계 포인터                  │
+│                            [0, n1, n1+n2, ...]                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+NA = 배치 내 전체 에이전트 수 (모든 씬의 에이전트 합)
+B  = 배치 크기 (씬 개수)
+PT = 4 (past timesteps)
+FT = 12 (future timesteps)
+NC = 2 (semantic classes)
+```
+
+### 2.2 상태 벡터 설명
+
+```
+State Vector (6차원):
+┌─────┬─────┬──────┬──────┬─────┬──────┐
+│  x  │  y  │  hx  │  hy  │  s  │ hdot │
+├─────┼─────┼──────┼──────┼─────┼──────┤
+│위치x│위치y│heading│heading│속력│요율 │
+│     │     │ cos  │ sin  │    │      │
+└─────┴─────┴──────┴──────┴─────┴──────┘
+```
+
+### 2.3 Ego 에이전트 식별
+
+```python
+# trafficplanner_model.py:688-700
+def _get_ego_mask(self, scene_graph):
+    """
+    Ego는 각 배치(씬)의 첫 번째 에이전트 (ptr[:-1] 인덱스)
+    """
+    NA = scene_graph.x.size(0)
+    ego_mask = torch.zeros(NA, dtype=torch.bool, device=scene_graph.x.device)
+    ego_inds = scene_graph.ptr[:-1]  # [0, n1, n1+n2, ...]
+    ego_mask[ego_inds] = True
+    return ego_mask
+```
+
+예시:
+```
+B=2, 씬1: 3개 에이전트, 씬2: 2개 에이전트
+ptr = [0, 3, 5]
+ego_mask = [True, False, False, True, False]
+           └────씬1────┘  └───씬2───┘
+```
+
+---
+
+## 3. Map Encoder
+
+### 3.1 아키텍처
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Map Encoder                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  입력: scene_graph.pos (NA, 4) - 에이전트 현재 위치 [x, y, hx, hy]           │
+│                                                                             │
+│  1. Map Crop 추출 (map_env.get_map_crop)                                    │
+│     ┌─────────────────────────────────────────┐                            │
+│     │  pos로부터 200x200 픽셀 로컬 맵 크롭      │                            │
+│     │  channels = 4 (drivable, lanes 등)       │                            │
+│     └─────────────────────────────────────────┘                            │
+│     출력: (NA, 4, 200, 200)                                                 │
+│                                                                             │
+│  2. CNN (6 layers)                                                         │
+│     ┌─────────────────────────────────────────────────────────────────┐    │
+│     │  Conv2d(4→16, k=7, s=2) → GN(16) → ReLU                          │    │
+│     │  Conv2d(16→32, k=5, s=2) → GN(32) → ReLU                         │    │
+│     │  Conv2d(32→64, k=5, s=2) → GN(64) → ReLU                         │    │
+│     │  Conv2d(64→64, k=3, s=2) → GN(64) → ReLU                         │    │
+│     │  Conv2d(64→128, k=3, s=2) → GN(128) → ReLU                       │    │
+│     │  Conv2d(128→128, k=3, s=2) → GN(128) → ReLU                      │    │
+│     └─────────────────────────────────────────────────────────────────┘    │
+│     출력: (NA, 128, 1, 1)  [200→94→43→19→8→3→1]                            │
+│                                                                             │
+│  3. Flatten + Linear                                                        │
+│     ┌─────────────────────────────────────────┐                            │
+│     │  Flatten: 128*1*1 = 128                  │                            │
+│     │  Linear(128 → 64)                        │                            │
+│     └─────────────────────────────────────────┘                            │
+│                                                                             │
+│  출력: map_feat (NA, 64)                                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 코드 근거
+
+```python
+# trafficplanner_model.py:123-141
+conv_layer_list = []
+final_conv_out = map_obs_size_pix  # 200
+conv_filter_list = [conv_channel_in] + conv_filter_list  # [4, 16, 32, 64, 64, 128, 128]
+
+for lidx in range(len(conv_kernel_list)):  # kernels: [7, 5, 5, 3, 3, 3]
+    cur_conv = nn.Conv2d(conv_filter_list[lidx],
+                         conv_filter_list[lidx+1],
+                         kernel_size=conv_kernel_list[lidx],
+                         stride=conv_stride_list[lidx],  # [2, 2, 2, 2, 2, 2]
+                         padding=0)
+    cur_gn = nn.GroupNorm(1, conv_filter_list[lidx+1])
+    conv_layer_list.extend([cur_conv, cur_gn, nn.ReLU()])
+    final_conv_out = calc_conv_out(final_conv_out, conv_kernel_list[lidx], conv_stride_list[lidx])
+
+self.map_conv = nn.Sequential(*conv_layer_list)
+self.map_feat_in_size = conv_filter_list[-1] * final_conv_out * final_conv_out  # 128*1*1=128
+self.map_feat_out_size = map_feat_size  # 64
+self.map_feature = nn.Linear(self.map_feat_in_size, self.map_feat_out_size)
+```
+
+---
+
+## 4. Temporal GCN Encoder
+
+### 4.1 전체 구조
+
+`_run_temporal_encoder` 함수가 Prior와 Posterior 모두에서 사용됩니다.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Temporal GCN Encoder                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  입력: traj_data (NA, T, 6), vis_data (NA, T)                               │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  For each timestep t = 0 to T-1:                                    │   │
+│  │                                                                     │   │
+│  │  1. Step Feature 생성                                               │   │
+│  │     step_in_feat = concat(                                          │   │
+│  │         cur_state,    # (NA, 6)  - 현재 상태                         │   │
+│  │         cur_lw,       # (NA, 2)  - 차량 크기                         │   │
+│  │         cur_vis,      # (NA, 1)  - 가시성                            │   │
+│  │         cur_sem       # (NA, NC) - 시맨틱 클래스                      │   │
+│  │     )                                                               │   │
+│  │     → (NA, 6+2+1+NC) = (NA, 11)                                     │   │
+│  │                                                                     │   │
+│  │  2. Step Feature Extractor (MLP)                                    │   │
+│  │     ┌───────────────────────────────────────────┐                   │   │
+│  │     │  Linear(11 → 128) → LayerNorm → ReLU      │                   │   │
+│  │     │  Linear(128 → 64)                         │                   │   │
+│  │     └───────────────────────────────────────────┘                   │   │
+│  │     gcn_node_in → (NA, 64)                                          │   │
+│  │                                                                     │   │
+│  │  3. Per-step GCN (IndividualSceneInteractionNet)                    │   │
+│  │     ┌───────────────────────────────────────────┐                   │   │
+│  │     │  scene_graph.x = gcn_node_in              │                   │   │
+│  │     │  scene_graph.pos = cur_state[:, :4]       │                   │   │
+│  │     │  ego_feat_t, other_feat_t = temporal_gcn_encoder(...)        │   │
+│  │     │  gcn_feat_t = merge(ego_feat_t, other_feat_t)                │   │
+│  │     └───────────────────────────────────────────┘                   │   │
+│  │     → (NA, 64) per timestep                                         │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Stack all timesteps: sequence_features → (NA, T, 64)                       │
+│                                                                             │
+│  ┌─────────────────────┐    ┌─────────────────────────────────────────┐    │
+│  │  Prior (past)       │    │  Posterior (future)                      │    │
+│  │  use_transformer=   │    │  use_transformer=True                    │    │
+│  │  False              │    │                                          │    │
+│  │                     │    │  1. Positional Encoding                  │    │
+│  │  GRU                │    │     sequence_features += PE              │    │
+│  │  (64→64, 1 layer)   │    │                                          │    │
+│  │                     │    │  2. TransformerEncoder                   │    │
+│  │  gru_out:           │    │     (d_model=64, nhead=8, nlayer=3)      │    │
+│  │  (NA, T, 64)        │    │                                          │    │
+│  │                     │    │  transformer_out: (NA, T, 64)            │    │
+│  └─────────────────────┘    └─────────────────────────────────────────┘    │
+│                                                                             │
+│  출력:                                                                       │
+│    - sequence_output: (NA, T, 64)                                           │
+│    - context_vector: (NA, 64) ← sequence_output[:, -1, :]                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 temporal_gcn_encoder (IndividualSceneInteractionNet)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    IndividualSceneInteractionNet                             │
+│                    (temporal_gcn_encoder)                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  입력:                                                                       │
+│    scene_graph.x        : (NA, 64)  - gcn_node_in                           │
+│    scene_graph.pos      : (NA, 4)   - [x, y, hx, hy]                        │
+│    scene_graph.sem      : (NA, NC)  - 시맨틱 클래스                          │
+│    scene_graph.edge_index: (2, E)   - 그래프 연결                            │
+│    ego_mask             : (NA,)     - Ego 마스크                             │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. mlp_in (공유, 모든 에이전트)                                      │   │
+│  │     ┌───────────────────────────────────────────────────────────┐   │   │
+│  │     │  Linear(64 → 128)                                         │   │   │
+│  │     │  LayerNorm(128) → ReLU → Linear(128 → 128)               │   │   │
+│  │     │  LayerNorm(128) → ReLU → Linear(128 → 128)               │   │   │
+│  │     └───────────────────────────────────────────────────────────┘   │   │
+│  │     x → (NA, 128) [msg_node_channels]                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  2. Message Passing (AgentInteractionConv, k=1 layer)               │   │
+│  │                                                                     │   │
+│  │     message() 함수:                                                 │   │
+│  │     ┌───────────────────────────────────────────────────────────┐   │   │
+│  │     │  msg_in = concat(x_i, x_j, sem_i, sem_j, rel_trans)       │   │   │
+│  │     │         = (128 + 128 + NC + NC + 4)                       │   │   │
+│  │     │         = (264 + 2*NC) → (268) for NC=2                   │   │   │
+│  │     │                                                           │   │   │
+│  │     │  edge_mlp:                                                │   │   │
+│  │     │    Linear(268 → 128)                                      │   │   │
+│  │     │    LayerNorm → ReLU → Linear(128 → 128)                   │   │   │
+│  │     │    LayerNorm → ReLU → Linear(128 → 128)                   │   │   │
+│  │     └───────────────────────────────────────────────────────────┘   │   │
+│  │                                                                     │   │
+│  │     aggregate(): max pooling over neighbors                         │   │
+│  │     aggr_out → (NA, 128)                                            │   │
+│  │                                                                     │   │
+│  │     update() 함수:                                                  │   │
+│  │     ┌───────────────────────────────────────────────────────────┐   │   │
+│  │     │  update_in = concat(x, aggr_out, sem)                     │   │   │
+│  │     │            = (128 + 128 + NC)                             │   │   │
+│  │     │            = (258) for NC=2                               │   │   │
+│  │     │                                                           │   │   │
+│  │     │  update_mlp:                                              │   │   │
+│  │     │    Linear(258 → 128)                                      │   │   │
+│  │     │    LayerNorm → ReLU → Linear(128 → 128)                   │   │   │
+│  │     └───────────────────────────────────────────────────────────┘   │   │
+│  │     x → (NA, 128)                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  3. mlp_out (Ego/Other 분리)                                        │   │
+│  │                                                                     │   │
+│  │     mlp_out_ego (Ego 에이전트):                                      │   │
+│  │     ┌───────────────────────────────────────────────────────────┐   │   │
+│  │     │  Linear(128 → 128)                                        │   │   │
+│  │     │  LayerNorm → ReLU → Linear(128 → 128)                     │   │   │
+│  │     │  LayerNorm → ReLU → Linear(128 → 64)                      │   │   │
+│  │     └───────────────────────────────────────────────────────────┘   │   │
+│  │     ego_feat → (num_ego, 64)                                        │   │
+│  │                                                                     │   │
+│  │     mlp_out_other (Other 에이전트):                                  │   │
+│  │     ┌───────────────────────────────────────────────────────────┐   │   │
+│  │     │  Linear(128 → 128)                                        │   │   │
+│  │     │  LayerNorm → ReLU → Linear(128 → 128)                     │   │   │
+│  │     │  LayerNorm → ReLU → Linear(128 → 64)                      │   │   │
+│  │     └───────────────────────────────────────────────────────────┘   │   │
+│  │     other_feat → (num_other, 64)                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  출력:                                                                       │
+│    ego_feat   : (num_ego, 64)                                               │
+│    other_feat : (num_other, 64)                                             │
+│    → merge하여 (NA, 64)                                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.3 코드 근거
+
+```python
+# trafficplanner_model.py:148-160
+step_input_size = self.state_size + self.att_feat_size + 1 + self.NC  # 6+2+1+NC = 11
+self.step_feature_extractor = MLP([step_input_size, 128, gcn_hidden_dim])  # 11→128→64
+
+self.temporal_gcn_encoder = IndividualSceneInteractionNet(
+    gcn_hidden_dim,  # 64 - agent input feat size
+    self.NC,         # NC - semantic feat size
+    4,               # edge feat size (x,y,hx,hy)
+    128,             # msg_node_channels - interaction node size
+    gcn_hidden_dim,  # 64 - output feat size
+)
+
+# Prior: GRU
+self.prior_temporal_gru = nn.GRU(gcn_hidden_dim, gcn_hidden_dim, 1, batch_first=True)
+
+# Posterior: PE + Transformer
+self.positional_encoding = PositionalEncoding(gcn_hidden_dim, max_len=max(self.PT, self.FT))
+encoder_layer = TransformerEncoderLayer(d_model=gcn_hidden_dim, nhead=transformer_nhead, batch_first=True)
+self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=transformer_nlayer)
+```
+
+---
+
+## 5. z_global Encoder (Prior/Posterior)
+
+### 5.1 전체 구조
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        z_global Encoder                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                         PRIOR (Past → z_global)                      │   │
+│  │                                                                     │   │
+│  │  1. Temporal Encoding (Past)                                        │   │
+│  │     past_seq_out, past_context = _run_temporal_encoder(             │   │
+│  │         scene_graph.past,      # (NA, PT, 6)                        │   │
+│  │         scene_graph.past_vis,  # (NA, PT)                           │   │
+│  │         PT=4,                                                       │   │
+│  │         use_transformer=False  # GRU 사용                           │   │
+│  │     )                                                               │   │
+│  │     past_seq_out: (NA, PT, 64)                                      │   │
+│  │     past_context: (NA, 64) ← past_seq_out[:, -1, :]                 │   │
+│  │                                                                     │   │
+│  │  2. Prior Input                                                     │   │
+│  │     prior_in = concat(                                              │   │
+│  │         past_context,  # (NA, 64)                                   │   │
+│  │         map_feat,      # (NA, 64)                                   │   │
+│  │         sem            # (NA, NC)                                   │   │
+│  │     )                                                               │   │
+│  │     → (NA, 64+64+NC) = (NA, 130) for NC=2                           │   │
+│  │                                                                     │   │
+│  │  3. latent_prior_net (MLP)                                          │   │
+│  │     ┌───────────────────────────────────────────────────────────┐   │   │
+│  │     │  Linear(130 → 128)                                        │   │   │
+│  │     │  LayerNorm → ReLU → Linear(128 → 64)                      │   │   │
+│  │     └───────────────────────────────────────────────────────────┘   │   │
+│  │     prior_z → (NA, 64) = (NA, z_size*2)                             │   │
+│  │                                                                     │   │
+│  │  4. Split                                                           │   │
+│  │     prior_mu  = prior_z[:, :32]  → (NA, 32)                         │   │
+│  │     prior_var = exp(prior_z[:, 32:]) → (NA, 32)                     │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                      POSTERIOR (Future → z_global)                   │   │
+│  │                                                                     │   │
+│  │  1. Temporal Encoding (Future)                                      │   │
+│  │     _, future_context = _run_temporal_encoder(                      │   │
+│  │         scene_graph.future,     # (NA, FT, 6)                       │   │
+│  │         scene_graph.future_vis, # (NA, FT)                          │   │
+│  │         FT=12,                                                      │   │
+│  │         use_transformer=True    # PE + Transformer 사용             │   │
+│  │     )                                                               │   │
+│  │     future_context: (NA, 64)                                        │   │
+│  │                                                                     │   │
+│  │  2. Posterior Input                                                 │   │
+│  │     posterior_in = concat(                                          │   │
+│  │         past_context,   # (NA, 64) ← Prior에서 받음                  │   │
+│  │         future_context, # (NA, 64)                                  │   │
+│  │         map_feat,       # (NA, 64)                                  │   │
+│  │         sem             # (NA, NC)                                  │   │
+│  │     )                                                               │   │
+│  │     → (NA, 64+64+64+NC) = (NA, 194) for NC=2                        │   │
+│  │                                                                     │   │
+│  │  3. latent_posterior_net (MLP)                                      │   │
+│  │     ┌───────────────────────────────────────────────────────────┐   │   │
+│  │     │  Linear(194 → 128)                                        │   │   │
+│  │     │  LayerNorm → ReLU → Linear(128 → 64)                      │   │   │
+│  │     └───────────────────────────────────────────────────────────┘   │   │
+│  │     posterior_z → (NA, 64) = (NA, z_size*2)                         │   │
+│  │                                                                     │   │
+│  │  4. Split                                                           │   │
+│  │     post_mu  = posterior_z[:, :32]  → (NA, 32)                      │   │
+│  │     post_var = exp(posterior_z[:, 32:]) → (NA, 32)                  │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Sampling (Reparameterization Trick):                                       │
+│    z_global = post_mu + eps * sqrt(post_var)   # 학습 시                     │
+│    z_global = prior_mu + eps * sqrt(prior_var) # 테스트 시                   │
+│    eps ~ N(0, 1)                                                            │
+│    → (NA, 32)                                                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 코드 근거
+
+```python
+# trafficplanner_model.py:183-199
+self.z_size = latent_size  # 32
+
+self.latent_prior_net = MLP([
+    gcn_hidden_dim + self.map_feat_out_size + self.NC,  # 64+64+NC = 130
+    128,
+    self.z_size * 2  # 64 (mean + variance)
+])
+
+self.latent_posterior_net = MLP([
+    gcn_hidden_dim * 2 + self.map_feat_out_size + self.NC,  # 64*2+64+NC = 194
+    128,
+    self.z_size * 2  # 64
+])
+```
+
+---
+
+## 6. Decoder
+
+### 6.1 전체 구조
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Autoregressive Decoder                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  입력:                                                                       │
+│    scene_graph : 그래프 구조                                                 │
+│    map_feat    : (NA, 64) 맵 피처                                           │
+│    past_seq_out: (NA, PT, 64) Prior GRU 시퀀스 출력                          │
+│    z_global    : (NA, 32) 샘플링된 잠재 변수                                  │
+│                                                                             │
+│  초기화:                                                                     │
+│    prev_state = scene_graph.past[:, -1, :]     # (NA, 6) 마지막 과거 상태    │
+│    past_feat = past_seq_out[:, -1, :]          # (NA, 64) GRU 마지막 출력    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Warm-up Phase: z_local 슬라이딩 윈도우 초기화                         │   │
+│  │                                                                     │   │
+│  │  for pt in range(PT=4):                                             │   │
+│  │      past_state_t = scene_graph.past[:, pt, :]  # (NA, 6)           │   │
+│  │      z_local_gcn_in = concat(past_state_t, lw, sem)                 │   │
+│  │                     = (NA, 6+2+NC) = (NA, 10)                        │   │
+│  │      ego_feat, other_feat = z_local_gcn(z_local_gcn_in, ego_mask)   │   │
+│  │      ego_feat_window.append(ego_feat)                               │   │
+│  │      other_feat_window.append(other_feat)                           │   │
+│  │                                                                     │   │
+│  │  → ego_feat_window   : [feat_1, feat_2, feat_3, feat_4]  # 4 steps  │   │
+│  │  → other_feat_window : [feat_1, feat_2, feat_3, feat_4]  # 4 steps  │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Autoregressive Loop: for t = 0 to FT-1 (12 steps)                  │   │
+│  │                                                                     │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐ │   │
+│  │  │  Step 1: z_local 계산 (Ego 전용)                               │ │   │
+│  │  │                                                               │ │   │
+│  │  │  ego_current_feat = ego_feat_window[-1]  # (num_ego, 64)      │ │   │
+│  │  │  z_local = _compute_z_local(                                  │ │   │
+│  │  │      ego_current_feat,   # Query                              │ │   │
+│  │  │      other_feat_window   # Key/Value (GRU temporal encoding)  │ │   │
+│  │  │  )                                                            │ │   │
+│  │  │  → z_local: (num_ego, 32)                                     │ │   │
+│  │  └───────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                     │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐ │   │
+│  │  │  Step 2: Other 에이전트 디코딩 (GCN 기반, STRIVE 스타일)        │ │   │
+│  │  │                                                               │ │   │
+│  │  │  decoder_in = concat(                                         │ │   │
+│  │  │      cur_past_feat,  # (NA, 64)                               │ │   │
+│  │  │      cur_map_feat,   # (NA, 64)                               │ │   │
+│  │  │      cur_sem,        # (NA, NC)                               │ │   │
+│  │  │      z_global,       # (NA, 32)                               │ │   │
+│  │  │      cur_lw          # (NA, 2)                                │ │   │
+│  │  │  )                                                            │ │   │
+│  │  │  → (NA, 64+64+NC+32+2) = (NA, 164) for NC=2                   │ │   │
+│  │  │                                                               │ │   │
+│  │  │  scene_graph.x = decoder_in                                   │ │   │
+│  │  │  _, other_traj_out = decoder_net(scene_graph, ego_mask)       │ │   │
+│  │  │  → other_traj_out: (num_other, 2) [a, hdot]                   │ │   │
+│  │  └───────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                     │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐ │   │
+│  │  │  Step 3: Ego 에이전트 디코딩 (z_global + z_local → GRU)        │ │   │
+│  │  │                                                               │ │   │
+│  │  │  z_global_ego = z_global[ego_mask]  # (num_ego, 32)           │ │   │
+│  │  │                                                               │ │   │
+│  │  │  z_combined = z_combine_mlp(concat(z_global_ego, z_local))    │ │   │
+│  │  │             = MLP([32+32, 64, 64])                            │ │   │
+│  │  │  → z_combined: (num_ego, 64)                                  │ │   │
+│  │  │                                                               │ │   │
+│  │  │  ego_gru_in = concat(                                         │ │   │
+│  │  │      z_combined,    # (num_ego, 64)                           │ │   │
+│  │  │      ego_map_feat,  # (num_ego, 64)                           │ │   │
+│  │  │      ego_sem,       # (num_ego, NC)                           │ │   │
+│  │  │      ego_lw         # (num_ego, 2)                            │ │   │
+│  │  │  )                                                            │ │   │
+│  │  │  → (num_ego, 64+64+NC+2) = (num_ego, 132) for NC=2            │ │   │
+│  │  │                                                               │ │   │
+│  │  │  ego_decoder_gru: GRU(132→64, 3 layers)                       │ │   │
+│  │  │  ego_gru_out → (num_ego, 64)                                  │ │   │
+│  │  │                                                               │ │   │
+│  │  │  ego_output_mlp: MLP([64, 64, 2])                             │ │   │
+│  │  │  ego_traj_out → (num_ego, 2) [a, hdot]                        │ │   │
+│  │  └───────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                     │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐ │   │
+│  │  │  Step 4: 출력 병합 및 상태 업데이트                             │ │   │
+│  │  │                                                               │ │   │
+│  │  │  decoder_out = merge(ego_traj_out, other_traj_out)            │ │   │
+│  │  │  → (NA, 2) [a, hdot]                                          │ │   │
+│  │  │                                                               │ │   │
+│  │  │  Bicycle Model Dynamics:                                      │ │   │
+│  │  │  cur_state_global = sim_traj(prev_state, a, hdot, veh_len)    │ │   │
+│  │  │  → (NA, 4) [x, y, hx, hy] in global frame                     │ │   │
+│  │  │                                                               │ │   │
+│  │  │  traj_out.append(cur_state_global)                            │ │   │
+│  │  └───────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                     │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐ │   │
+│  │  │  Step 5: 다음 스텝 준비 (t < FT-1)                             │ │   │
+│  │  │                                                               │ │   │
+│  │  │  Memory 업데이트 (decoder_memory GRU):                        │ │   │
+│  │  │    other_past_feat_new = decoder_memory(other_state_local)    │ │   │
+│  │  │    ego_past_feat_new = decoder_memory(ego_state_local)        │ │   │
+│  │  │                                                               │ │   │
+│  │  │  Map Feature 업데이트:                                         │ │   │
+│  │  │    cur_map_feat = encode_map(cur_state_global)                │ │   │
+│  │  │                                                               │ │   │
+│  │  │  z_local Window 업데이트:                                      │ │   │
+│  │  │    new_ego_feat, new_other_feat = z_local_gcn(cur_state)      │ │   │
+│  │  │    ego_feat_window.pop(0); ego_feat_window.append(new_ego)    │ │   │
+│  │  │    other_feat_window.pop(0); other_feat_window.append(new_other)│ │   │
+│  │  └───────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  출력: traj_out → (NA, FT, 4) [x, y, hx, hy] in global frame                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 decoder_net (IndividualSceneInteractionNet for Other Agents)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    decoder_net (Other 에이전트용)                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  입력:                                                                       │
+│    decode_in_size = z_size + past_feat_size + map_feat_out_size + NC + 2    │
+│                   = 32 + 64 + 64 + NC + 2 = 164 (NC=2)                      │
+│                                                                             │
+│  IndividualSceneInteractionNet(                                              │
+│      in_node_channels=164,    # 입력 노드 피처                               │
+│      in_sem_channels=NC,      # 시맨틱 피처                                  │
+│      in_edge_channels=4,      # 엣지 피처 (x,y,hx,hy)                        │
+│      msg_node_channels=64,    # 메시지 패싱 차원                             │
+│      out_channels=2           # 출력 (a, hdot)                              │
+│  )                                                                          │
+│                                                                             │
+│  구조:                                                                       │
+│    mlp_in: Linear(164→128)→LN→ReLU→Linear(128→128)→LN→ReLU→Linear(128→64)  │
+│    msg: AgentInteractionConv(64, NC, 4, 64)                                 │
+│    mlp_out_ego: Linear(64→128)→LN→ReLU→...→Linear(128→2)                   │
+│    mlp_out_other: Linear(64→128)→LN→ReLU→...→Linear(128→2)                 │
+│                                                                             │
+│  출력:                                                                       │
+│    _, other_traj_out = decoder_net(scene_graph, ego_mask)                   │
+│    → other_traj_out: (num_other, 2) [a, hdot]                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.3 decoder_memory (GRU for State Memory)
+
+```python
+# trafficplanner_model.py:218-225
+self.num_memory_layers = 3
+self.decoder_memory = nn.GRU(
+    4,                    # input size (x,y,hx,hy) - local frame 변환된 상태
+    self.past_feat_size,  # hidden size = 64
+    self.num_memory_layers,  # 3 layers
+    batch_first=True,
+)
+```
+
+### 6.4 Ego Decoder Components
+
+```python
+# trafficplanner_model.py:259-273
+
+# z_combine_mlp: z_global + z_local 결합
+z_combine_in_size = self.z_size + self.z_local_size  # 32+32=64
+self.z_combine_mlp = MLP([z_combine_in_size, 64, 64])
+
+# ego_decoder_gru: Ego 궤적 디코딩용 GRU
+ego_gru_in_size = 64 + self.map_feat_out_size + self.NC + self.att_feat_size
+# = 64 + 64 + NC + 2 = 132 (NC=2)
+self.ego_decoder_gru = nn.GRU(
+    ego_gru_in_size,       # 132
+    64,                    # hidden size
+    self.num_memory_layers,  # 3 layers
+    batch_first=True,
+)
+
+# ego_output_mlp: GRU 출력 → 궤적 (a, hdot)
+self.ego_output_mlp = MLP([64, 64, self.traj_out_size])  # 64→64→2
+```
+
+---
+
+## 7. z_local Encoder
+
+### 7.1 전체 구조
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          z_local Encoder                                     │
+│                      (Ego 전용, 매 디코더 스텝)                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  목적: 슬라이딩 윈도우 내 다른 에이전트들의 상태를 참고하여                      │
+│        Ego의 reactive한 지역 잠재 변수 생성                                   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. z_local_gcn (IndividualSceneInteractionNet)                      │   │
+│  │     per-step GCN으로 현재 상태에서 에이전트 상호작용 피처 추출             │   │
+│  │                                                                     │   │
+│  │     입력: concat(state, lw, sem)                                     │   │
+│  │          = (NA, 6+2+NC) = (NA, 10) for NC=2                          │   │
+│  │                                                                     │   │
+│  │     IndividualSceneInteractionNet(                                   │   │
+│  │         in_node_channels=10,    # state(6) + lw(2) + sem(NC)         │   │
+│  │         in_sem_channels=NC,                                          │   │
+│  │         in_edge_channels=4,                                          │   │
+│  │         msg_node_channels=64,                                        │   │
+│  │         out_channels=64         # z_local_gcn_feat_size              │   │
+│  │     )                                                                │   │
+│  │                                                                     │   │
+│  │     출력:                                                             │   │
+│  │       ego_feat   : (num_ego, 64)                                     │   │
+│  │       other_feat : (num_other, 64)                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  2. Sliding Window (4 timesteps)                                     │   │
+│  │                                                                     │   │
+│  │     ego_feat_window   = [ego_t-3, ego_t-2, ego_t-1, ego_t]          │   │
+│  │     other_feat_window = [other_t-3, other_t-2, other_t-1, other_t]  │   │
+│  │                                                                     │   │
+│  │     매 스텝: pop(0) → append(new_feat)                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  3. _compute_z_local_dist() 함수 (확률 분포 출력)                     │   │
+│  │                                                                     │   │
+│  │     For each ego agent (batch별로):                                  │   │
+│  │                                                                     │   │
+│  │     a. Other Temporal Encoding                                       │   │
+│  │        other_feat_seq = stack(other_feat_window)  # (W, num_other, 64)│  │
+│  │        other_feat_seq = other_feat_seq.permute(1,0,2) # (num_other, W, 64)│
+│  │                                                                     │   │
+│  │        z_local_temporal_gru: GRU(64→64, 1 layer)                    │   │
+│  │        temporal_out, _ = gru(other_feat_seq)                        │   │
+│  │        temporal_encoded = temporal_out[:, -1, :]  # (num_other, 64)  │   │
+│  │                                                                     │   │
+│  │     b. Cross-Attention (Ego → Other)                                 │   │
+│  │        Q = ego_current_feat  # (1, 64)                               │   │
+│  │        K = V = temporal_encoded  # (num_other, 64)                   │   │
+│  │                                                                     │   │
+│  │        cross_attn: MultiheadAttention(                               │   │
+│  │            embed_dim=64,                                             │   │
+│  │            num_heads=4,                                              │   │
+│  │            batch_first=True                                          │   │
+│  │        )                                                            │   │
+│  │        attn_out, _ = cross_attn(Q, K, V)  # (1, 64)                  │   │
+│  │                                                                     │   │
+│  │     c. z_local 분포 파라미터 (VAE-style)                              │   │
+│  │        z_local_mean_mlp: MLP([64, 64, 32])                          │   │
+│  │        z_local_var_mlp:  MLP([64, 64, 32])                          │   │
+│  │                                                                     │   │
+│  │        z_local_mean = z_local_mean_mlp(attn_out)  # (32,)           │   │
+│  │        z_local_var = softplus(z_local_var_mlp(attn_out))  # (32,)   │   │
+│  │                                                                     │   │
+│  │     d. Reparameterization Trick (rsample)                            │   │
+│  │        eps = torch.randn_like(z_local_mean)                         │   │
+│  │        z_local = z_local_mean + eps * sqrt(z_local_var)             │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  출력: z_local_mean → (num_ego, 32)                                         │
+│        z_local_var  → (num_ego, 32)                                         │
+│        z_local (sampled) → (num_ego, 32)                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 코드 근거
+
+```python
+# trafficplanner_model.py:227-257
+
+# z_local GCN
+self.z_local_gcn_feat_size = 64
+z_local_gcn_in_size = self.state_size + self.att_feat_size + self.NC  # 6+2+NC=10
+self.z_local_gcn = IndividualSceneInteractionNet(
+    z_local_gcn_in_size,  # 10
+    self.NC,              # NC
+    4,                    # edge feat
+    64,                   # msg_node_channels
+    self.z_local_gcn_feat_size  # 64
+)
+
+# Temporal GRU for sliding window
+self.z_local_temporal_gru = nn.GRU(
+    self.z_local_gcn_feat_size,  # 64
+    self.z_local_gcn_feat_size,  # 64
+    1,  # 1 layer
+    batch_first=True,
+)
+
+# Cross-attention
+self.cross_attn_heads = 4
+self.cross_attn = nn.MultiheadAttention(
+    embed_dim=self.z_local_gcn_feat_size,  # 64
+    num_heads=self.cross_attn_heads,       # 4
+    batch_first=True,
+)
+
+# z_local 분포 출력 MLP (VAE-style)
+self.z_local_mean_mlp = MLP([self.z_local_gcn_feat_size, 64, self.z_local_size])  # 64→64→32
+self.z_local_var_mlp = MLP([self.z_local_gcn_feat_size, 64, self.z_local_size])   # 64→64→32
+```
+
+### 7.3 z_local 샘플링 (Reparameterization)
+
+z_local은 확률 분포에서 샘플링되며, gradient flow를 위해 reparameterization trick을 사용합니다:
+
+```python
+# _compute_z_local_dist() 내부
+z_local_mean = self.z_local_mean_mlp(attn_out)              # (num_ego, 32)
+z_local_var = F.softplus(self.z_local_var_mlp(attn_out))    # (num_ego, 32), positive
+
+# Reparameterization trick for gradient flow
+eps = torch.randn_like(z_local_mean)
+z_local = z_local_mean + eps * torch.sqrt(z_local_var)      # rsample
+
+return z_local_mean, z_local_var, z_local
+```
+
+**설계 이유:**
+- z_global과 마찬가지로 z_local도 확률 분포로 모델링하여 불확실성 표현
+- 매 디코더 스텝마다 새로운 z_local 샘플링 → reactive한 local adaptation
+- softplus로 variance를 양수로 보장
+
+---
+
+## 8. 전체 Forward Pass 흐름
+
+### 8.1 학습 시 (forward)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Training Forward Pass                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  입력: scene_graph, map_idx, map_env                                        │
+│                                                                             │
+│  Step 1: Map Feature 추출                                                   │
+│  ────────────────────────                                                   │
+│  scene_graph.pos = scene_graph.past[:, -1, :4]  # 마지막 past 위치          │
+│  map_feat = encode_map(scene_graph, map_idx, map_env)                       │
+│  → map_feat: (NA, 64)                                                       │
+│                                                                             │
+│  Step 2: PRIOR (Past → z_global)                                            │
+│  ───────────────────────────────                                            │
+│  prior_mu, prior_var, past_seq_out = prior(scene_graph, map_feat)           │
+│  → prior_mu: (NA, 32), prior_var: (NA, 32), past_seq_out: (NA, PT, 64)      │
+│                                                                             │
+│  Step 3: POSTERIOR (Future → z_global)                                      │
+│  ─────────────────────────────────────                                      │
+│  past_context = past_seq_out[:, -1, :]  # (NA, 64)                          │
+│  post_mu, post_var = encoder(scene_graph, map_feat, past_context)           │
+│  → post_mu: (NA, 32), post_var: (NA, 32)                                    │
+│                                                                             │
+│  Step 4: z_global 샘플링 (Reparameterization)                               │
+│  ─────────────────────────────────────────────                              │
+│  z_samp = rsample(post_mu, post_var)  # posterior에서 샘플                   │
+│  → z_samp: (NA, 32)                                                         │
+│                                                                             │
+│  Step 5: DECODER                                                            │
+│  ───────────────                                                            │
+│  future_pred = decoder(scene_graph, map_feat, past_seq_out, z_samp, ...)    │
+│  → future_pred: (NA, FT, 4)                                                 │
+│                                                                             │
+│  출력:                                                                       │
+│  {                                                                          │
+│      'prior_out': (prior_mu, prior_var),                                    │
+│      'posterior_out': (post_mu, post_var),                                  │
+│      'future_pred': future_pred,                                            │
+│      'past_seq_out': past_seq_out                                           │
+│  }                                                                          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 테스트 시 (sample_batched)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Test Sampling (sample_batched)                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  입력: scene_graph, map_idx, map_env, num_samples=NS                        │
+│                                                                             │
+│  Step 1-2: Map Feature + PRIOR (동일)                                       │
+│  ──────────────────────────────────                                         │
+│  prior_mu, prior_var, past_seq_out = prior(scene_graph, map_feat)           │
+│                                                                             │
+│  Step 3: 다중 샘플 (NS개)                                                    │
+│  ────────────────────────                                                   │
+│  samp_mu = prior_mu.expand(NS, NA, 32)                                      │
+│  samp_var = prior_var.expand(NS, NA, 32)                                    │
+│  z_samp = rsample(samp_mu, samp_var)                                        │
+│  → z_samp: (NS, NA, 32) → transpose → (NA, NS, 32)                          │
+│                                                                             │
+│  Step 4: Batched Decoding                                                   │
+│  ────────────────────────                                                   │
+│  future_pred = decoder(..., z_samp.transpose(0,1), ...)                     │
+│  → future_pred: (NA, NS, FT, 4)                                             │
+│                                                                             │
+│  Note: mult_samp=True일 때 모든 텐서가 3D로 확장됨                            │
+│        decoder 내부에서 (NA*NS) 형태로 reshape하여 처리                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 9. 네트워크 파라미터 요약
+
+### 9.1 Encoder 모듈
+
+| 모듈 | 입력 차원 | 출력 차원 | 구조 |
+|------|----------|----------|------|
+| `step_feature_extractor` | 6+2+1+NC=11 | 64 | MLP: 11→128→64 |
+| `temporal_gcn_encoder` | 64 | 64 | IndividualSceneInteractionNet |
+| `prior_temporal_gru` | 64 | 64 | GRU(64→64, 1 layer) |
+| `positional_encoding` | 64 | 64 | Sinusoidal PE |
+| `transformer_encoder` | 64 | 64 | TransformerEncoder(nhead=8, nlayer=3) |
+| `latent_prior_net` | 64+64+NC=130 | 64 | MLP: 130→128→64 |
+| `latent_posterior_net` | 128+64+NC=194 | 64 | MLP: 194→128→64 |
+
+### 9.2 Decoder 모듈
+
+| 모듈 | 입력 차원 | 출력 차원 | 구조 |
+|------|----------|----------|------|
+| `decoder_net` | 32+64+64+NC+2=164 | 2 | IndividualSceneInteractionNet |
+| `decoder_memory` | 4 | 64 | GRU(4→64, 3 layers) |
+| `z_combine_mlp` | 32+32=64 | 64 | MLP: 64→64→64 |
+| `ego_decoder_gru` | 64+64+NC+2=132 | 64 | GRU(132→64, 3 layers) |
+| `ego_output_mlp` | 64 | 2 | MLP: 64→64→2 |
+
+### 9.3 z_local 모듈
+
+| 모듈 | 입력 차원 | 출력 차원 | 구조 |
+|------|----------|----------|------|
+| `z_local_gcn` | 6+2+NC=10 | 64 | IndividualSceneInteractionNet |
+| `z_local_temporal_gru` | 64 | 64 | GRU(64→64, 1 layer) |
+| `cross_attn` | 64 | 64 | MultiheadAttention(64, nhead=4) |
+| `z_local_mlp` | 64 | 32 | MLP: 64→64→32 |
+
+### 9.4 Map Encoder
+
+| 모듈 | 입력 차원 | 출력 차원 | 구조 |
+|------|----------|----------|------|
+| `map_conv` | (4, 200, 200) | (128, 1, 1) | 6-layer CNN |
+| `map_feature` | 128 | 64 | Linear |
+
+### 9.5 IndividualSceneInteractionNet 내부 (공통)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  mlp_in      : Linear(in→128)→LN→ReLU→Linear(128→128)→LN→ReLU  │
+│                →Linear(128→128)                                │
+│  edge_mlp    : Linear(edge_in→128)→LN→ReLU→Linear(128→128)     │
+│                →LN→ReLU→Linear(128→out)                        │
+│  update_mlp  : Linear(update_in→128)→LN→ReLU→Linear(128→out)   │
+│  mlp_out_ego : Linear(128→128)→LN→ReLU→...→Linear(128→out)     │
+│  mlp_out_other: Linear(128→128)→LN→ReLU→...→Linear(128→out)    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 부록: 전체 데이터 흐름 다이어그램
+
+### A.1 전체 흐름도 (네트워크 타입 명시)
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              TrafficPlannerModel 전체 흐름                                         │
+│                              (각 화살표에 네트워크 타입 명시)                                        │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+     scene_graph
+         │
+         │  past: (NA,4,6)      ← timestep 0~3 (총 4 steps)
+         │  future: (NA,12,6)   ← timestep 0~11 (총 12 steps)
+         │  lw: (NA,2)
+         │  sem: (NA,NC)
+         ▼
+┌──────────────────────┐
+│     Map Encoder      │◄─── scene_graph.pos (NA,4)
+│                      │
+│  ┌────────────────┐  │
+│  │ 6-layer CNN    │  │
+│  │ (4ch→128ch)    │  │
+│  └───────┬────────┘  │
+│          │           │
+│  ┌───────▼────────┐  │
+│  │ Linear (MLP)   │  │
+│  │ 128 → 64       │  │
+│  └───────┬────────┘  │
+└──────────┼───────────┘
+           │ map_feat: (NA,64)
+           ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                         ENCODER                                                    │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                   │
+│  ┌─────────────────────────────────────────┐    ┌─────────────────────────────────────────┐      │
+│  │              PRIOR                       │    │            POSTERIOR                    │      │
+│  │                                          │    │                                         │      │
+│  │  past: (NA, 4, 6)                        │    │  future: (NA, 12, 6)                    │      │
+│  │         │                                │    │         │                               │      │
+│  │         │ for t = 0..3:                  │    │         │ for t = 0..11:                │      │
+│  │         ▼                                │    │         ▼                               │      │
+│  │  ┌─────────────────────────────────┐    │    │  ┌─────────────────────────────────┐   │      │
+│  │  │  step_feature_extractor (MLP)   │    │    │  │  step_feature_extractor (MLP)   │   │      │
+│  │  │  11 → 128 → 64                  │    │    │  │  11 → 128 → 64                  │   │      │
+│  │  └────────────┬────────────────────┘    │    │  └────────────┬────────────────────┘   │      │
+│  │               │ (NA, 64)                 │    │               │ (NA, 64)               │      │
+│  │               ▼                          │    │               ▼                        │      │
+│  │  ┌─────────────────────────────────┐    │    │  ┌─────────────────────────────────┐   │      │
+│  │  │  temporal_gcn_encoder           │    │    │  │  temporal_gcn_encoder           │   │      │
+│  │  │  (IndividualSceneInteractionNet)│    │    │  │  (IndividualSceneInteractionNet)│   │      │
+│  │  │                                 │    │    │  │                                 │   │      │
+│  │  │  ┌───────────────────────────┐  │    │    │  │  ┌───────────────────────────┐  │   │      │
+│  │  │  │ mlp_in (MLP)              │  │    │    │  │  │ mlp_in (MLP)              │  │   │      │
+│  │  │  │ 64→128→128→128            │  │    │    │  │  │ 64→128→128→128            │  │   │      │
+│  │  │  └─────────────┬─────────────┘  │    │    │  │  └─────────────┬─────────────┘  │   │      │
+│  │  │                │                │    │    │  │                │                │   │      │
+│  │  │  ┌─────────────▼─────────────┐  │    │    │  │  ┌─────────────▼─────────────┐  │   │      │
+│  │  │  │ AgentInteractionConv      │  │    │    │  │  │ AgentInteractionConv      │  │   │      │
+│  │  │  │ (Message Passing + MLP)   │  │    │    │  │  │ (Message Passing + MLP)   │  │   │      │
+│  │  │  └─────────────┬─────────────┘  │    │    │  │  └─────────────┬─────────────┘  │   │      │
+│  │  │        ┌───────┴───────┐        │    │    │  │        ┌───────┴───────┐        │   │      │
+│  │  │        ▼               ▼        │    │    │  │        ▼               ▼        │   │      │
+│  │  │  ┌──────────┐   ┌──────────┐   │    │    │  │  ┌──────────┐   ┌──────────┐   │   │      │
+│  │  │  │mlp_out_  │   │mlp_out_  │   │    │    │  │  │mlp_out_  │   │mlp_out_  │   │   │      │
+│  │  │  │ego (MLP) │   │other(MLP)│   │    │    │  │  │ego (MLP) │   │other(MLP)│   │   │      │
+│  │  │  │128→..→64 │   │128→..→64 │   │    │    │  │  │128→..→64 │   │128→..→64 │   │   │      │
+│  │  │  └────┬─────┘   └────┬─────┘   │    │    │  │  └────┬─────┘   └────┬─────┘   │   │      │
+│  │  │       │              │         │    │    │  │       │              │         │   │      │
+│  │  └───────┼──────────────┼─────────┘    │    │  └───────┼──────────────┼─────────┘   │      │
+│  │          │              │               │    │          │              │             │      │
+│  │          └──────┬───────┘               │    │          └──────┬───────┘             │      │
+│  │                 │ merge                  │    │                 │ merge               │      │
+│  │                 ▼                        │    │                 ▼                     │      │
+│  │          (NA, 64) per step              │    │          (NA, 64) per step            │      │
+│  │                 │                        │    │                 │                     │      │
+│  │         stack → (NA, 4, 64)             │    │         stack → (NA, 12, 64)          │      │
+│  │                 │                        │    │                 │                     │      │
+│  │                 ▼                        │    │                 ▼                     │      │
+│  │  ┌─────────────────────────────────┐    │    │  ┌─────────────────────────────────┐   │      │
+│  │  │  prior_temporal_gru (GRU)       │    │    │  │  positional_encoding (PE)       │   │      │
+│  │  │  GRU(64→64, 1 layer)            │    │    │  │  Sinusoidal                     │   │      │
+│  │  │  (NA,4,64) → (NA,4,64)          │    │    │  └────────────┬────────────────────┘   │      │
+│  │  └────────────┬────────────────────┘    │    │               │                        │      │
+│  │               │                          │    │               ▼                        │      │
+│  │               │                          │    │  ┌─────────────────────────────────┐   │      │
+│  │               │                          │    │  │  transformer_encoder            │   │      │
+│  │               │                          │    │  │  TransformerEncoder             │   │      │
+│  │               │                          │    │  │  (nhead=8, nlayer=3)            │   │      │
+│  │               │                          │    │  │  (NA,12,64) → (NA,12,64)        │   │      │
+│  │               │                          │    │  └────────────┬────────────────────┘   │      │
+│  │               │                          │    │               │                        │      │
+│  │               ▼                          │    │               ▼                        │      │
+│  │  past_seq_out: (NA,4,64)                │    │  transformer_out: (NA,12,64)          │      │
+│  │  past_context = [:,-1,:] → (NA,64)      │    │  future_context = [:,-1,:] → (NA,64)  │      │
+│  │               │                          │    │               │                        │      │
+│  │               │ concat(past_context,     │    │               │ concat(past_context,   │      │
+│  │               │        map_feat, sem)    │    │               │   future_context,      │      │
+│  │               │ → (NA, 130)              │    │               │   map_feat, sem)       │      │
+│  │               │                          │    │               │ → (NA, 194)            │      │
+│  │               ▼                          │    │               ▼                        │      │
+│  │  ┌─────────────────────────────────┐    │    │  ┌─────────────────────────────────┐   │      │
+│  │  │  latent_prior_net (MLP)         │    │    │  │  latent_posterior_net (MLP)     │   │      │
+│  │  │  130 → 128 → 64                 │    │    │  │  194 → 128 → 64                 │   │      │
+│  │  └────────────┬────────────────────┘    │    │  └────────────┬────────────────────┘   │      │
+│  │               │                          │    │               │                        │      │
+│  │               ▼                          │    │               ▼                        │      │
+│  │  split → prior_mu (NA,32)               │    │  split → post_mu (NA,32)              │      │
+│  │          prior_var (NA,32)              │    │          post_var (NA,32)             │      │
+│  │                                          │    │                                        │      │
+│  └──────────────────────────────────────────┘    └────────────────────────────────────────┘      │
+│                                                               │                                   │
+│                                                               ▼                                   │
+│                                              z_global = rsample(post_mu, post_var)               │
+│                                              → (NA, 32)                                          │
+│                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                               │
+                                                               ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                           DECODER                                                  │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                   │
+│  초기화:                                                                                           │
+│    prev_state = past[:,-1,:]  (NA,6)                                                              │
+│    past_feat = past_seq_out[:,-1,:]  (NA,64)                                                      │
+│                                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Warm-up Phase: z_local window 초기화 (past timestep 0~3)                                    │ │
+│  │                                                                                              │ │
+│  │  for pt = 0..3:                                                                             │ │
+│  │    past_state_t = past[:,pt,:]  (NA,6)                                                      │ │
+│  │           │                                                                                  │ │
+│  │           ▼                                                                                  │ │
+│  │    ┌──────────────────────────────────────────┐                                             │ │
+│  │    │  z_local_gcn (IndividualSceneInteractionNet)                                           │ │
+│  │    │                                          │                                             │ │
+│  │    │  ┌────────────────────────────────────┐  │                                             │ │
+│  │    │  │ mlp_in (MLP): 10→128→128→64        │  │                                             │ │
+│  │    │  └─────────────┬──────────────────────┘  │                                             │ │
+│  │    │                │                         │                                             │ │
+│  │    │  ┌─────────────▼──────────────────────┐  │                                             │ │
+│  │    │  │ AgentInteractionConv (Msg Passing)  │  │                                             │ │
+│  │    │  └─────────────┬──────────────────────┘  │                                             │ │
+│  │    │        ┌───────┴───────┐                 │                                             │ │
+│  │    │        ▼               ▼                 │                                             │ │
+│  │    │  ┌──────────┐   ┌──────────┐            │                                             │ │
+│  │    │  │mlp_out_  │   │mlp_out_  │            │                                             │ │
+│  │    │  │ego (MLP) │   │other(MLP)│            │                                             │ │
+│  │    │  └────┬─────┘   └────┬─────┘            │                                             │ │
+│  │    └───────┼──────────────┼───────────────────┘                                             │ │
+│  │            ▼              ▼                                                                  │ │
+│  │    ego_feat_window    other_feat_window                                                     │ │
+│  │    .append(ego_feat)  .append(other_feat)                                                   │ │
+│  │                                                                                              │ │
+│  │  → ego_feat_window = [feat_0, feat_1, feat_2, feat_3]  (4 steps)                            │ │
+│  │  → other_feat_window = [feat_0, feat_1, feat_2, feat_3]  (4 steps)                          │ │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Autoregressive Loop: for t = 0..11 (총 12 steps 예측)                                      │ │
+│  │                                                                                              │ │
+│  │  ┌───────────────────────────────────────────────────────────────────────────────────────┐  │ │
+│  │  │                          z_local 계산 (Ego 전용)                                       │  │ │
+│  │  │                                                                                       │  │ │
+│  │  │  ego_current = ego_feat_window[-1]  (num_ego, 64)  ← 현재 스텝만 query로 사용          │  │ │
+│  │  │  other_window = stack(other_feat_window)  (4, num_other, 64)                          │  │ │
+│  │  │               │                                                                        │  │ │
+│  │  │               │ permute → (num_other, 4, 64)                                           │  │ │
+│  │  │               ▼                                                                        │  │ │
+│  │  │  ┌─────────────────────────────────────────────┐                                      │  │ │
+│  │  │  │  z_local_temporal_gru (GRU)                 │                                      │  │ │
+│  │  │  │  GRU(64→64, 1 layer)                        │                                      │  │ │
+│  │  │  │  (num_other, 4, 64) → [:,-1,:] → (num_other, 64)                                   │  │ │
+│  │  │  └────────────────────────┬────────────────────┘                                      │  │ │
+│  │  │                           │ temporal_encoded                                           │  │ │
+│  │  │                           ▼                                                            │  │ │
+│  │  │  ┌─────────────────────────────────────────────┐                                      │  │ │
+│  │  │  │  cross_attn (MultiheadAttention)            │                                      │  │ │
+│  │  │  │  Q = ego_current     (1, 64)                │                                      │  │ │
+│  │  │  │  K = V = temporal_encoded  (num_other, 64)  │                                      │  │ │
+│  │  │  │  nhead=4                                    │                                      │  │ │
+│  │  │  └────────────────────────┬────────────────────┘                                      │  │ │
+│  │  │                           │ attn_out (1, 64)                                           │  │ │
+│  │  │                           ▼                                                            │  │ │
+│  │  │  ┌─────────────────────────────────────────────┐                                      │  │ │
+│  │  │  │  z_local_mlp (MLP)                          │                                      │  │ │
+│  │  │  │  64 → 64 → 32                               │                                      │  │ │
+│  │  │  └────────────────────────┬────────────────────┘                                      │  │ │
+│  │  │                           │                                                            │  │ │
+│  │  │                           ▼                                                            │  │ │
+│  │  │                    z_local (num_ego, 32)                                               │  │ │
+│  │  └───────────────────────────┼───────────────────────────────────────────────────────────┘  │ │
+│  │                              │                                                               │ │
+│  │  ┌───────────────────────────┼───────────────────────────────────────────────────────────┐  │ │
+│  │  │                           │      Other Agent 디코딩 (GCN 기반)                         │  │ │
+│  │  │                           │                                                            │  │ │
+│  │  │  decoder_in = concat(past_feat, map_feat, sem, z_global, lw) → (NA, 164)              │  │ │
+│  │  │               │                                                                        │  │ │
+│  │  │               ▼                                                                        │  │ │
+│  │  │  ┌─────────────────────────────────────────────────────────────────────┐              │  │ │
+│  │  │  │  decoder_net (IndividualSceneInteractionNet)                         │              │  │ │
+│  │  │  │                                                                      │              │  │ │
+│  │  │  │  ┌────────────────────────────────────┐                              │              │  │ │
+│  │  │  │  │ mlp_in (MLP): 164→128→128→64       │                              │              │  │ │
+│  │  │  │  └─────────────┬──────────────────────┘                              │              │  │ │
+│  │  │  │                │                                                     │              │  │ │
+│  │  │  │  ┌─────────────▼──────────────────────┐                              │              │  │ │
+│  │  │  │  │ AgentInteractionConv (Msg Passing)  │                              │              │  │ │
+│  │  │  │  └─────────────┬──────────────────────┘                              │              │  │ │
+│  │  │  │        ┌───────┴───────┐                                             │              │  │ │
+│  │  │  │        ▼               ▼                                             │              │  │ │
+│  │  │  │  ┌──────────┐   ┌──────────┐                                        │              │  │ │
+│  │  │  │  │mlp_out_  │   │mlp_out_  │                                        │              │  │ │
+│  │  │  │  │ego (MLP) │   │other(MLP)│  ← Other만 사용                         │              │  │ │
+│  │  │  │  │(unused)  │   │64→...→2  │                                        │              │  │ │
+│  │  │  │  └──────────┘   └────┬─────┘                                        │              │  │ │
+│  │  │  └──────────────────────┼──────────────────────────────────────────────┘              │  │ │
+│  │  │                         │                                                              │  │ │
+│  │  │                         ▼                                                              │  │ │
+│  │  │                  other_traj_out: (num_other, 2) [a, hdot]                              │  │ │
+│  │  └────────────────────────────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                                              │ │
+│  │  ┌───────────────────────────────────────────────────────────────────────────────────────┐  │ │
+│  │  │                          Ego Agent 디코딩 (z_global + z_local → GRU)                  │  │ │
+│  │  │                                                                                       │  │ │
+│  │  │  z_global_ego = z_global[ego_mask]  (num_ego, 32)                                     │  │ │
+│  │  │               │                                                                        │  │ │
+│  │  │               │ concat(z_global_ego, z_local) → (num_ego, 64)                          │  │ │
+│  │  │               ▼                                                                        │  │ │
+│  │  │  ┌─────────────────────────────────────────────┐                                      │  │ │
+│  │  │  │  z_combine_mlp (MLP)                        │                                      │  │ │
+│  │  │  │  64 → 64 → 64                               │                                      │  │ │
+│  │  │  └────────────────────────┬────────────────────┘                                      │  │ │
+│  │  │                           │ z_combined (num_ego, 64)                                   │  │ │
+│  │  │                           │                                                            │  │ │
+│  │  │               │ concat(z_combined, map_feat, sem, lw) → (num_ego, 132)                 │  │ │
+│  │  │               ▼                                                                        │  │ │
+│  │  │  ┌─────────────────────────────────────────────┐                                      │  │ │
+│  │  │  │  ego_decoder_gru (GRU)                      │                                      │  │ │
+│  │  │  │  GRU(132→64, 3 layers)                      │                                      │  │ │
+│  │  │  └────────────────────────┬────────────────────┘                                      │  │ │
+│  │  │                           │ ego_gru_out (num_ego, 64)                                  │  │ │
+│  │  │                           ▼                                                            │  │ │
+│  │  │  ┌─────────────────────────────────────────────┐                                      │  │ │
+│  │  │  │  ego_output_mlp (MLP)                       │                                      │  │ │
+│  │  │  │  64 → 64 → 2                                │                                      │  │ │
+│  │  │  └────────────────────────┬────────────────────┘                                      │  │ │
+│  │  │                           │                                                            │  │ │
+│  │  │                           ▼                                                            │  │ │
+│  │  │                    ego_traj_out: (num_ego, 2) [a, hdot]                                │  │ │
+│  │  └───────────────────────────┼───────────────────────────────────────────────────────────┘  │ │
+│  │                              │                                                               │ │
+│  │          ┌───────────────────┴───────────────────────────────┐                              │ │
+│  │          │                                                   │                              │ │
+│  │          ▼                                                   ▼                              │ │
+│  │   ego_traj_out                                        other_traj_out                        │ │
+│  │   (num_ego, 2)                                        (num_other, 2)                        │ │
+│  │          │                                                   │                              │ │
+│  │          └───────────────────┬───────────────────────────────┘                              │ │
+│  │                              │ merge (index로 재배치)                                        │ │
+│  │                              ▼                                                               │ │
+│  │                       decoder_out: (NA, 2) [a, hdot]                                        │ │
+│  │                              │                                                               │ │
+│  │                              ▼                                                               │ │
+│  │  ┌─────────────────────────────────────────────────────────────────────────────────────┐   │ │
+│  │  │  Bicycle Model (sim_traj)                                                            │   │ │
+│  │  │  car_dynamics 함수로 (a, hdot) → 다음 상태 계산                                       │   │ │
+│  │  └──────────────────────────────────────┬──────────────────────────────────────────────┘   │ │
+│  │                                          │                                                  │ │
+│  │                                          ▼                                                  │ │
+│  │                               cur_state_global: (NA, 4) [x, y, hx, hy]                     │ │
+│  │                                          │                                                  │ │
+│  │                                          ▼                                                  │ │
+│  │                               traj_out.append(cur_state_global)                            │ │
+│  │                                          │                                                  │ │
+│  │                                          ▼                                                  │ │
+│  │  ┌─────────────────────────────────────────────────────────────────────────────────────┐   │ │
+│  │  │  상태 업데이트 (t < 11일 때만)                                                        │   │ │
+│  │  │                                                                                      │   │ │
+│  │  │  1. decoder_memory (GRU) 로 past_feat 업데이트 (Ego + Other 모두)                    │   │ │
+│  │  │     GRU(4→64, 3 layers), input: cur_state_local (x,y,hx,hy)                          │   │ │
+│  │  │     - Other: decoder_net 입력으로 직접 사용 (trajectory 출력)                        │   │ │
+│  │  │     - Ego: decoder_net message passing용 (Other가 Ego 정보 참조, 출력은 미사용)      │   │ │
+│  │  │                                                                                      │   │ │
+│  │  │  2. encode_map (CNN+Linear) 로 map_feat 업데이트                                     │   │ │
+│  │  │                                                                                      │   │ │
+│  │  │  3. z_local window 슬라이드                                                          │   │ │
+│  │  │     new_ego_feat, new_other_feat = z_local_gcn(cur_state)                            │   │ │
+│  │  │     ego_feat_window.pop(0); ego_feat_window.append(new_ego_feat)                     │   │ │
+│  │  │     other_feat_window.pop(0); other_feat_window.append(new_other_feat)               │   │ │
+│  │  │                                                                                      │   │ │
+│  │  │  ┌──────────────────── 다음 iteration (t+1)에서 재사용 ────────────────────┐         │   │ │
+│  │  │  │                                                                        │         │   │ │
+│  │  │  │  cur_state_local (4dim) ─→ decoder_memory ─→ cur_past_feat ─→ decoder  │         │   │ │
+│  │  │  │                                                                        │         │   │ │
+│  │  │  │  cur_state_global (4dim) ─→ scene_graph.pos ─→ encode_map ─→ map_feat  │         │   │ │
+│  │  │  │                                                                        │         │   │ │
+│  │  │  │  cur_bike_state (6dim) ─→ z_local_gcn ─→ window slide ─→ z_local       │         │   │ │
+│  │  │  │                                                                        │         │   │ │
+│  │  │  └────────────────────────────────────────────────────────────────────────┘         │   │ │
+│  │  └─────────────────────────────────────────────────────────────────────────────────────┘   │ │
+│  │                                                                                              │ │
+│  └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                   │
+│  출력: stack(traj_out) → future_pred: (NA, 12, 4)                                                │
+│                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### A.2 네트워크 타입 범례
+
+| 표기 | 네트워크 타입 | 설명 |
+|------|-------------|------|
+| MLP | Multi-Layer Perceptron | Linear → LayerNorm → ReLU → Linear → ... |
+| GRU | Gated Recurrent Unit | 시퀀스 처리용 RNN |
+| CNN | Convolutional Neural Network | 2D 이미지 처리 (맵 인코딩) |
+| PE | Positional Encoding | Sinusoidal 위치 인코딩 |
+| Transformer | TransformerEncoder | Self-attention 기반 시퀀스 모델 |
+| MultiheadAttention | Cross-Attention | Q/K/V 기반 어텐션 |
+| IndividualSceneInteractionNet | GCN | mlp_in + Message Passing + mlp_out_ego/other |
+| AgentInteractionConv | Message Passing | edge_mlp → aggregate → update_mlp |
+
+---
+
+## B. Teacher Forcing 학습 방식
+
+Teacher Forcing(TF)은 autoregressive 디코딩에서 에러 누적을 방지하기 위한 학습 기법입니다.
+모델 구조는 동일하며, 학습 시 디코더 상태를 주기적으로 GT로 리셋합니다.
+
+### B.1 기본 개념
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Teacher Forcing Training                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  문제: 기존 autoregressive 디코딩의 에러 누적                                 │
+│  ─────────────────────────────────────────────                              │
+│  t=0에서 작은 오차 발생 → t=1 입력으로 사용 → 오차 증폭                        │
+│  → t=2, t=3... 갈수록 예측이 GT에서 멀어짐                                   │
+│                                                                             │
+│  해결: Segment 단위로 GT 상태에서 재시작                                      │
+│  ────────────────────────────────────                                       │
+│  매 segment(3 steps)마다 디코더 상태를 GT로 리셋                              │
+│  → 어느 시점에서 시작해도 정확한 예측이 가능하도록 학습                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.2 Segment 구조
+
+```
+Future Timeline (FT=12 steps):
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│ t0 │ t1 │ t2 │ t3 │ t4 │ t5 │ t6 │ t7 │ t8 │ t9 │t10 │t11 │
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+
+Segments (tf_segment_len=3):
+├─ Seg0 ─┼─ Seg1 ─┼─ Seg2 ─┼─ Seg3 ─┼─ Seg4 ─┼─ Seg5 ─┤...
+│ t0→t2  │ t1→t3  │ t2→t4  │ t3→t5  │ t4→t6  │ t5→t7  │
+└────────┴────────┴────────┴────────┴────────┴────────┘
+
+총 12개 segment (sliding window, stride=1)
+```
+
+### B.3 Ego vs Other 경로 생성 흐름
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   Ego와 Other의 경로 생성 차이                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Ego 경로 생성                                                       │   │
+│  │  ─────────────                                                       │   │
+│  │  입력: z_global + z_local + map_feat + past_feat                    │   │
+│  │                                                                     │   │
+│  │  • z_global: scene-level intent (posterior에서 샘플)                 │   │
+│  │  • z_local:  매 스텝 sliding window 기반 분포에서 샘플               │   │
+│  │              (다른 에이전트 반응 반영)                                │   │
+│  │  • map_feat: 도로 정보                                               │   │
+│  │  • past_feat: ego의 past 시퀀스 인코딩 (GRU)                        │   │
+│  │                                                                     │   │
+│  │  GRU: ego_gru_hidden → ego_gru → pred_ego_t                        │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Other 경로 생성                                                     │   │
+│  │  ──────────────                                                      │   │
+│  │  입력: z_global + past_feat (z_local 사용 안 함!)                    │   │
+│  │                                                                     │   │
+│  │  • z_global: scene-level intent (posterior에서 샘플)                 │   │
+│  │  • past_feat: other의 past 시퀀스 인코딩 (GRU memory)                │   │
+│  │                                                                     │   │
+│  │  GRU: other_gru_hidden → other_gru → pred_other_t                  │   │
+│  │                                                                     │   │
+│  │  ※ Other는 z_local을 사용하지 않음 (reactive 아님)                   │   │
+│  │  ※ Other는 z_local 계산의 "참조 대상"으로만 사용됨                    │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  z_local 계산 시 Ego와 Other의 역할                                  │   │
+│  │  ────────────────────────────────────                                │   │
+│  │                                                                     │   │
+│  │  1. z_local GCN 계산: Ego, Other 모두 참여                          │   │
+│  │     ego_feat, other_feat = z_local_gcn(all_agents_state)            │   │
+│  │                                                                     │   │
+│  │  2. Sliding Window: Ego, Other 모두 윈도우 유지                      │   │
+│  │     ego_feat_window.append(ego_feat)                                │   │
+│  │     other_feat_window.append(other_feat)                            │   │
+│  │                                                                     │   │
+│  │  3. z_local 분포 계산: Ego만 사용                                    │   │
+│  │     Q = ego_current_feat         # Ego의 현재 상태                  │   │
+│  │     K, V = temporal_gru(other_feat_window)  # Other의 윈도우        │   │
+│  │     attn_out = cross_attn(Q, K, V)                                  │   │
+│  │     z_local = sample(mean_mlp(attn_out), var_mlp(attn_out))         │   │
+│  │                                                                     │   │
+│  │  → Ego는 Other들의 움직임을 보고 reactive하게 z_local 결정           │   │
+│  │  → Other는 independent하게 z_global 기반으로만 경로 생성             │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.4 Teacher Forcing 디코더 흐름
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Teacher Forcing Decoder Flow                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  For each segment s ∈ [0, FT-1] (12 segments):                              │
+│                                                                             │
+│    Step 1: GT로 디코더 상태 초기화                                           │
+│    ──────────────────────────────                                           │
+│    ego_state = GT_ego[s]          # Ego의 segment 시작점 GT                 │
+│    other_state = GT_other[s]      # Other의 segment 시작점 GT               │
+│    ego_h = None                   # Ego GRU hidden state 리셋               │
+│    other_h = None                 # Other GRU hidden state 리셋             │
+│    z_local 윈도우 리셋 (GT 기반으로 재구축)                                   │
+│                                                                             │
+│    Step 2: Autoregressive 3-step 예측                                       │
+│    ──────────────────────────────────                                       │
+│    For each step k ∈ [0, min(3, FT-s)-1]:                                   │
+│                                                                             │
+│      a. z_local GCN: Ego + Other 함께 처리                                  │
+│         ego_feat, other_feat = z_local_gcn(ego_state, other_state)         │
+│         ego_feat_window.append(ego_feat)                                   │
+│         other_feat_window.append(other_feat)                               │
+│                                                                             │
+│      b. Ego z_local 분포 계산 (Other 윈도우 참조)                            │
+│         z_local_mean, z_local_var, z_local = _compute_z_local_dist(        │
+│             ego_feat_window, other_feat_window)                            │
+│                                                                             │
+│      c. Ego 궤적 예측                                                        │
+│         ego_input = concat(z_global, z_local, map_feat, ego_past_feat)     │
+│         pred_ego_t, ego_h = ego_gru(ego_input, ego_h)                      │
+│                                                                             │
+│      d. Other 궤적 예측 (z_local 없음!)                                      │
+│         other_input = concat(z_global, other_past_feat)                    │
+│         pred_other_t, other_h = other_gru(other_input, other_h)            │
+│                                                                             │
+│      e. segment_preds에 저장                                                │
+│         segment_preds.append(concat(pred_ego_t, pred_other_t))             │
+│                                                                             │
+│      f. 다음 스텝 입력 준비 (autoregressive)                                 │
+│         ego_state = pred_ego_t                                             │
+│         other_state = pred_other_t                                         │
+│                                                                             │
+│    Step 3: Segment 예측 저장                                                 │
+│    ──────────────────────                                                   │
+│    all_segment_preds.append(segment_preds)                                  │
+│                                                                             │
+│  출력: all_segment_preds = [seg0_preds, seg1_preds, ..., seg11_preds]       │
+│        각 segment는 최대 3개의 예측을 포함 (Ego + Other 함께)                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.5 Segment별 GRU 초기화 상세
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Segment별 Other GRU 초기화                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Other의 past_feat는 past 시퀀스 + GT를 GRU에 통과시켜 생성                  │
+│  각 segment 시작 시 해당 시점까지의 context로 GRU hidden state 초기화        │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Segment 0 (actual t=0 시작):                                        │   │
+│  │  ───────────────────────────                                         │   │
+│  │  Other GRU 초기 입력: past[:PT]               → GRU → other_h        │   │
+│  │    k=0: pred_0 생성, other_h 업데이트                                │   │
+│  │    k=1: pred_1 (pred_0 기반), other_h 업데이트                       │   │
+│  │    k=2: pred_2 (pred_1 기반), other_h 업데이트                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Segment 1 (actual t=1 시작):                                        │   │
+│  │  ───────────────────────────                                         │   │
+│  │  Other GRU 초기 입력: past[:PT] + GT[0]       → GRU → other_h (리셋) │   │
+│  │    k=0: pred_1 생성, other_h 업데이트                                │   │
+│  │    k=1: pred_2 (pred_1 기반), other_h 업데이트                       │   │
+│  │    k=2: pred_3 (pred_2 기반), other_h 업데이트                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Segment 2 (actual t=2 시작):                                        │   │
+│  │  ───────────────────────────                                         │   │
+│  │  Other GRU 초기 입력: past[:PT] + GT[0:2]     → GRU → other_h (리셋) │   │
+│  │    k=0: pred_2 생성, other_h 업데이트                                │   │
+│  │    k=1: pred_3 (pred_2 기반), other_h 업데이트                       │   │
+│  │    k=2: pred_4 (pred_3 기반), other_h 업데이트                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ...                                                                        │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Segment 11 (actual t=11 시작):                                      │   │
+│  │  ────────────────────────────                                        │   │
+│  │  Other GRU 초기 입력: past[:PT] + GT[0:11]    → GRU → other_h (리셋) │   │
+│  │    k=0: pred_11 생성 (마지막 timestep)                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  핵심:                                                                      │
+│  • 각 segment 시작 시: past + GT[:actual_t]를 GRU에 통과 → hidden 초기화   │
+│  • Autoregressive 3-step 내: 예측값이 GRU에 추가되며 hidden 업데이트        │
+│  • 다음 segment: GT가 하나 더 추가된 상태로 GRU 리셋                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.6 GRU 학습 메커니즘
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Decoder GRU 학습 흐름                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Other GRU (other_dec_gru) - 학습 가능한 모델 파라미터:                      │
+│  ───────────────────────────────────────────────────────                    │
+│  • weight_ih (input-hidden)                                                 │
+│  • weight_hh (hidden-hidden)                                                │
+│  • bias_ih, bias_hh                                                         │
+│                                                                             │
+│  학습 과정:                                                                  │
+│  ──────────                                                                 │
+│  1. Forward:                                                                │
+│     past + GT[:t] → GRU → hidden → 예측                                    │
+│                                                                             │
+│  2. Loss 계산:                                                              │
+│     recon_loss = MSE(pred, GT)                                              │
+│                                                                             │
+│  3. Backward:                                                               │
+│     loss.backward() → GRU 파라미터에 gradient 전파                          │
+│                                                                             │
+│  4. Update:                                                                 │
+│     optimizer.step() → GRU 파라미터 업데이트                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Teacher Forcing 학습의 의미                                         │   │
+│  │  ─────────────────────────────                                       │   │
+│  │                                                                     │   │
+│  │  • 매 segment마다 다른 시작점(past + GT[:t])에서 GRU 시작            │   │
+│  │  • 다양한 context 길이(0~11개의 GT)에서 정확히 예측하도록 학습       │   │
+│  │  • 결과: "어느 시점에서 시작해도 잘 예측하는" GRU가 됨               │   │
+│  │                                                                     │   │
+│  │  일반 학습 (TF=False):                                               │   │
+│  │    t=0에서만 시작 → 오직 past context만으로 학습                    │   │
+│  │    에러 누적 시 recovery 어려움                                      │   │
+│  │                                                                     │   │
+│  │  TF 학습 (TF=True):                                                  │   │
+│  │    t=0,1,2,...,11 모든 시작점에서 학습                               │   │
+│  │    각 시점의 올바른 context를 활용한 예측 능력 습득                  │   │
+│  │    → 추론 시 에러가 발생해도 빠르게 정상 궤적으로 복귀               │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.7 예측 수 분석
+
+```
+Segment별 예측 수 (FT=12, tf_segment_len=3):
+
+Segment 0:  t=0 시작 → [pred_0, pred_1, pred_2]     3개
+Segment 1:  t=1 시작 → [pred_1, pred_2, pred_3]     3개
+Segment 2:  t=2 시작 → [pred_2, pred_3, pred_4]     3개
+...
+Segment 9:  t=9 시작 → [pred_9, pred_10, pred_11]   3개
+Segment 10: t=10 시작 → [pred_10, pred_11]          2개 (범위 초과)
+Segment 11: t=11 시작 → [pred_11]                   1개 (범위 초과)
+
+총 예측 수: 10×3 + 1×2 + 1×1 = 33개
+
+각 timestep별 예측 횟수:
+- t=0:  1번 (seg0에서만)
+- t=1:  2번 (seg0, seg1)
+- t=2~11: 3번씩 (3개 segment에서 각각)
+```
+
+### B.6 Loss 계산
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Teacher Forcing Loss Computation                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  _forward_teacher_forcing() in trafficplanner_loss.py                       │
+│                                                                             │
+│  For each segment s:                                                        │
+│    seg_traj = stack(segment_preds)  # (NA, num_preds, 4)                   │
+│    seg_gt = future_gt[:, s:s+num_preds, :]                                  │
+│                                                                             │
+│    # Reconstruction loss (Ego + Other 모두)                                 │
+│    seg_recon_loss = mse(seg_traj, seg_gt)                                   │
+│                                                                             │
+│    # Potential loss (Ego만!)                                                │
+│    ego_traj = seg_traj[ego_mask]                                            │
+│    seg_potential_veh = vehicle_repulsion(ego_traj)                          │
+│    seg_potential_env = env_boundary(ego_traj)                               │
+│                                                                             │
+│    # 누적                                                                    │
+│    total_recon += seg_recon_loss                                            │
+│    total_potential_veh += seg_potential_veh                                 │
+│    total_potential_env += seg_potential_env                                 │
+│                                                                             │
+│  # 평균화                                                                    │
+│  final_loss = mean(total_recon) + mean(total_potential)                     │
+│               + KL_loss (z_global, z_local) + comfort_loss                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.7 설정 파라미터
+
+```python
+# train_trafficplanner.cfg
+
+# Teacher Forcing 활성화
+use_teacher_forcing: True   # False면 기존 방식
+tf_segment_len: 3           # 각 segment에서 autoregressive 스텝 수
+```
+
+### B.8 Validation과의 관계
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Training vs Validation                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Training:  use_teacher_forcing=True                                        │
+│  ──────────────────────────────────                                         │
+│  - 12개 segment 각각에서 GT 시작점으로 3-step 예측                           │
+│  - 에러 누적 없이 모든 시점에서 정확한 예측 학습                              │
+│  - Ego: z_global + z_local 사용                                             │
+│  - Other: z_global만 사용                                                   │
+│                                                                             │
+│  Validation: use_teacher_forcing=False                                      │
+│  ────────────────────────────────────                                       │
+│  - 기존 방식: t=0부터 t=11까지 full autoregressive                          │
+│  - 실제 추론 성능 측정 (에러 누적 포함)                                      │
+│  - Best model 선정 기준                                                     │
+│                                                                             │
+│  의의: TF 학습 → 어느 시점에서든 정확한 예측 능력 → 전체 궤적 품질 향상       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.9 Bicycle Model과 6차원 상태 처리
+
+Teacher Forcing에서 `output_bicycle=True`일 때 상태는 6차원 `(x, y, cos, sin, v, hdot)`입니다.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Bicycle Model State Handling in TF                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  GT Future 차원:                                                            │
+│  ─────────────────                                                          │
+│  - output_bicycle=True:  scene_graph.future[:, :, :]   → (NA, FT, 6)       │
+│  - output_bicycle=False: scene_graph.future[:, :, :4] → (NA, FT, 4)        │
+│                                                                             │
+│  z_local GCN 입력 차원:                                                     │
+│  ─────────────────────                                                      │
+│  - z_local_gcn 입력: state(6) + lw(2) + sem(NC) = 10 + NC                  │
+│  - output_bicycle일 때 GT가 이미 6차원이므로 추가 패딩 불필요               │
+│                                                                             │
+│  조건부 처리 (trafficplanner_model.py:1473-1492):                           │
+│  ──────────────────────────────────────────────                             │
+│  if self.output_bicycle:                                                    │
+│      gt_state_6dim = gt_state_t  # 이미 6차원                               │
+│  else:                                                                      │
+│      gt_state_6dim = cat([gt_state_t, zeros(2)])  # 4→6 패딩               │
+│                                                                             │
+│  prev_state 업데이트:                                                       │
+│  ───────────────────                                                        │
+│  - Bicycle model: sim_traj() 출력이 6차원                                  │
+│  - prev_state = cur_bike_state  # 6차원 유지                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.10 TF Loss 계산 시 주의사항
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TF Mode Loss Considerations                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. pred['future_pred'] 형태 차이:                                          │
+│     ──────────────────────────────                                          │
+│     - TF=False: Tensor (NA, FT, 4)                                         │
+│     - TF=True:  List of 12 segments, each segment is list of (NA, 4)       │
+│                                                                             │
+│  2. compute_err() 처리:                                                     │
+│     ────────────────────                                                    │
+│     - TF 모드에서는 빈 dict 반환 (pos_err, ang_err 계산 스킵)              │
+│     - 이유: segment 형태의 예측을 단일 trajectory로 변환 불필요            │
+│     - Training loss만 계산, validation은 TF=False로 별도 측정              │
+│                                                                             │
+│  3. num_segments 텐서화:                                                    │
+│     ─────────────────────                                                   │
+│     - loss_out['num_segments']는 int가 아닌 torch.tensor                   │
+│     - c2c() 함수가 .detach() 호출하므로 텐서여야 함                        │
+│                                                                             │
+│  코드 (trafficplanner_loss.py):                                            │
+│  ─────────────────────────────                                              │
+│  if isinstance(pred_future, list):  # TF 모드 체크                         │
+│      return {}  # compute_err에서 빈 dict 반환                             │
+│                                                                             │
+│  'num_segments': torch.tensor([num_valid_segments], device=device)         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 참고: 코드 파일 위치
+
+- 모델: `src/models/trafficplanner_model.py`
+- GCN: `src/models/individual_interaction_net.py`
+- 공통 모듈 (MLP, car_dynamics): `src/models/common.py`
+- 데이터셋: `src/datasets/nuscenes_dataset.py`
+- 학습: `src/train_trafficplanner.py`
+- 손실 함수: `src/losses/trafficplanner_loss.py`
+- 테스트: `src/test_trafficplanner.py`
