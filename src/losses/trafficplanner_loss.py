@@ -19,6 +19,7 @@ from losses.common import kl_normal, log_normal
 from utils.transforms import transform2frame
 from utils.torch import c2c
 import datasets.nuscenes_utils as nutils
+from datasets.utils import NUSC_NORM_STATS
 
 ENV_COLL_THRESH = 0.05 # up to 5% of vehicle can be off the road
 VEH_COLL_THRESH = 0.02 # IoU must be over this to count as a collision for metric (not loss)
@@ -391,8 +392,7 @@ class TrafficPlannerLoss(nn.Module):
             'sur_pred_dim': 2,
             'map_gt_steps': 6,
             'map_gt_decay_lambda': 0.3,  # exponential decay: w_t = exp(-λt) / Σexp(-λt)
-            'acc_bins': [-1.0, 1.0],   # normalized thresholds
-            'yaw_bins': [-0.1, 0.1],
+            'intent_sigma': 0.5,         # Gaussian sigma for intent soft label
         }
         if aux_cfg is not None:
             default_aux_cfg.update(aux_cfg)
@@ -569,33 +569,66 @@ class TrafficPlannerLoss(nn.Module):
                     aux_loss = aux_loss + ego_pred_w * ego_pred_loss
                     loss_out_dict['ego_pred_loss'] = ego_pred_loss.detach().view((1,))
 
-        # ---- (A) Intent CE Loss (Phase 2 only) ----
+        # ---- (A) Intent Soft Label Loss (Phase 2 only) ----
+        # 9 prototypes in normalized (acc, yaw) space: 3x3 grid
+        # Soft label via Gaussian distance, loss via KL divergence
         intent_ce_w = self.loss_weights.get('intent_ce', 0.0)
-        if intent_ce_w > 0.0 and self.phase == 2 and model is not None:
+        if intent_ce_w > 0.0 and model is not None:
             z_local_raw = model.get_z_local()
             if z_local_raw is not None and hasattr(model, 'intent_ce_head'):
-                # Compute GT acc/yaw classes from GT future
+                num_intents = model.num_intents
+                # Build prototype grid: num_intents prototypes in normalized (acc, yaw)
+                # For 9 intents: (-1,-1), (-1,0), (-1,+1), (0,-1), ..., (+1,+1)
+                n_acc = int(np.sqrt(num_intents))
+                n_yaw = num_intents // n_acc
+                acc_vals = torch.linspace(-1, 1, n_acc, device=device)
+                yaw_vals = torch.linspace(-1, 1, n_yaw, device=device)
+                # prototypes: (num_intents, 2)
+                prototypes = torch.stack(torch.meshgrid(acc_vals, yaw_vals, indexing='ij'), dim=-1).reshape(-1, 2)
+
+                sigma = self.aux_cfg['intent_sigma']
+
+                # Compute GT acc/yaw in physically meaningful normalized space
+                # acc: unnormalize speed → raw speed diff / dt → divide by a_std (no mean subtraction, so 0=stationary)
+                # yaw_rate: already normalized by hdot stats (mean≈0, so 0≈straight)
                 ego_gt = gt_future[ego_mask]  # (num_ego, FT, 6)
-                ego_speed = ego_gt[:, :, 4]  # (num_ego, FT)
-                ego_prev_speed = torch.cat([scene_graph.past[:, -1, 4:5][ego_mask], ego_speed[:, :-1]], dim=1)
-                ego_acc = (ego_speed - ego_prev_speed) / 0.5  # (num_ego, FT)
-                ego_yaw_rate = ego_gt[:, :, 5]  # (num_ego, FT)
+                normalizer = model.get_normalizer()
+                s_mean, s_std = normalizer.mean_vals[4].to(device), normalizer.std_vals[4].to(device)
+                dt = model.dt
 
-                acc_bins = self.aux_cfg['acc_bins']
-                yaw_bins = self.aux_cfg['yaw_bins']
+                # Raw speed from normalized speed
+                ego_speed_raw = ego_gt[:, :, 4] * s_std + s_mean  # (num_ego, FT)
+                past_speed_norm = scene_graph.past[:, -1, 4:5][ego_mask]  # (num_ego, 1)
+                ego_prev_speed_raw = torch.cat([past_speed_norm * s_std + s_mean, ego_speed_raw[:, :-1]], dim=1)
+                # Raw acceleration, then normalize by a_std only (0 = stationary)
+                raw_acc = (ego_speed_raw - ego_prev_speed_raw) / dt  # (num_ego, FT) in m/s²
+                ninfo = NUSC_NORM_STATS[('car', 'truck')]
+                a_std = ninfo['a'][1]
+                ego_acc = raw_acc / a_std  # 0=stationary, ±1 ≈ ±1σ acceleration
 
-                acc_class = torch.zeros_like(ego_acc, dtype=torch.long)
-                acc_class[ego_acc > acc_bins[1]] = 2
-                acc_class[(ego_acc >= acc_bins[0]) & (ego_acc <= acc_bins[1])] = 1
+                # Raw yaw_rate: unnormalize hdot → divide by hdot_std only (0=straight)
+                hdot_mean = normalizer.mean_vals[5].to(device)
+                hdot_std = normalizer.std_vals[5].to(device)
+                raw_yaw_rate = ego_gt[:, :, 5] * hdot_std + hdot_mean  # raw hdot (rad/s)
+                ego_yaw_rate = raw_yaw_rate / ninfo['hdot'][1]  # 0=straight, ±1 ≈ ±1σ yaw rate
 
-                yaw_class = torch.zeros_like(ego_yaw_rate, dtype=torch.long)
-                yaw_class[ego_yaw_rate > yaw_bins[1]] = 2
-                yaw_class[(ego_yaw_rate >= yaw_bins[0]) & (ego_yaw_rate <= yaw_bins[1])] = 1
+                # Both axes: 0=no change, normalized by respective std only.
+                # Compute soft labels: Gaussian distance to each prototype
+                # gt_xy: (num_ego, FT, 2), prototypes: (num_intents, 2)
+                gt_xy = torch.stack([ego_acc, ego_yaw_rate], dim=-1)  # (num_ego, FT, 2)
+                # dist_sq: (num_ego, FT, num_intents)
+                dist_sq = ((gt_xy.unsqueeze(-2) - prototypes.unsqueeze(0).unsqueeze(0)) ** 2).sum(dim=-1)
+                gt_soft_label = torch.softmax(-dist_sq / (2 * sigma ** 2), dim=-1)  # (num_ego, FT, num_intents)
 
-                gt_class = acc_class * 3 + yaw_class  # (num_ego, FT)
-
-                intent_ce_loss = torch.tensor(0.0, device=device)
+                intent_loss = torch.tensor(0.0, device=device)
                 is_segmented = isinstance(z_local_raw[0], list)
+
+                def _intent_kl_at_t(z_t, t_idx):
+                    """KL(gt_soft || predicted_softmax) at timestep t_idx."""
+                    logits = model.intent_ce_head(z_t)  # (num_ego, num_intents)
+                    log_pred = nn.functional.log_softmax(logits, dim=-1)
+                    target = gt_soft_label[:, t_idx, :]  # (num_ego, num_intents)
+                    return nn.functional.kl_div(log_pred, target, reduction='batchmean')
 
                 if is_segmented:
                     # TF mode: z_local_raw[seg_idx] = [z_step0, z_step1, ...]
@@ -607,27 +640,25 @@ class TrafficPlannerLoss(nn.Module):
                             actual_t = seg_idx + step
                             if actual_t >= FT:
                                 break
-                            logits = model.intent_ce_head(z_t)
-                            seg_loss = seg_loss + nn.functional.cross_entropy(logits, gt_class[:, actual_t])
+                            seg_loss = seg_loss + _intent_kl_at_t(z_t, actual_t)
                             seg_count += 1
                         if seg_count > 0:
-                            intent_ce_loss = intent_ce_loss + seg_loss / seg_count
+                            intent_loss = intent_loss + seg_loss / seg_count
                             count += 1
                     if count > 0:
-                        intent_ce_loss = intent_ce_loss / count
-                        aux_loss = aux_loss + intent_ce_w * intent_ce_loss
-                        loss_out_dict['intent_ce_loss'] = intent_ce_loss.detach().view((1,))
+                        intent_loss = intent_loss / count
+                        aux_loss = aux_loss + intent_ce_w * intent_loss
+                        loss_out_dict['intent_ce_loss'] = intent_loss.detach().view((1,))
                 else:
                     # AR mode: flat list [t=0, t=1, ..., t=11]
                     num_steps = min(len(z_local_raw), FT)
                     for t in range(num_steps):
                         z_t = z_local_raw[t]
-                        logits = model.intent_ce_head(z_t)
-                        intent_ce_loss = intent_ce_loss + nn.functional.cross_entropy(logits, gt_class[:, t])
+                        intent_loss = intent_loss + _intent_kl_at_t(z_t, t)
                     if num_steps > 0:
-                        intent_ce_loss = intent_ce_loss / num_steps
-                        aux_loss = aux_loss + intent_ce_w * intent_ce_loss
-                        loss_out_dict['intent_ce_loss'] = intent_ce_loss.detach().view((1,))
+                        intent_loss = intent_loss / num_steps
+                        aux_loss = aux_loss + intent_ce_w * intent_loss
+                        loss_out_dict['intent_ce_loss'] = intent_loss.detach().view((1,))
 
         # ---- (D) Map Attn Guidance Loss: attn_weights vs GT future position ----
         # Phase 1: ego + sur, Phase 2: ego only (sur frozen)

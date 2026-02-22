@@ -505,6 +505,7 @@ def main():
     aux_cfg = {
         'map_gt_steps': getattr(cfg, 'map_gt_steps', 6),
         'map_gt_decay_lambda': getattr(cfg, 'map_gt_decay_lambda', 0.3),
+        'intent_sigma': getattr(cfg, 'intent_sigma', 0.5),
     }
 
     loss_fn = TrafficPlannerLoss(

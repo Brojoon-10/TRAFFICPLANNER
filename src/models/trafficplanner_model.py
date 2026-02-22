@@ -360,7 +360,7 @@ class TrafficPlannerModel(nn.Module):
         # 7. Auxiliary loss heads (all Linear — no MLP, force modules to encode directly)
         self.sur_pred_head = nn.Linear(self.d_model, self.sur_pred_dim)  # (B) ego→sur delta
         self.ego_pred_head = nn.Linear(self.d_model, self.sur_pred_dim)  # (C) sur→ego delta
-        self.intent_ce_head = nn.Linear(self.intent_dim, 9)  # (A) intent → 3acc×3yaw = 9 classes
+        self.intent_ce_head = nn.Linear(self.intent_dim, self.num_intents)  # (A) intent → num_intents classes
 
         # 8. Ego warmup GRU for initializing ego_decoder_gru hidden state
         self.ego_warmup_gru = nn.GRU(

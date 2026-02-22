@@ -69,6 +69,16 @@ def parse_cfg():
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=0.0)
 
+    # LR scheduler (cosine annealing)
+    parser.add_argument('--use_lr_anneal', type=str2bool, default=False,
+                        help='Enable cosine annealing LR scheduler')
+    parser.add_argument('--lr_max', type=float, default=None,
+                        help='Max LR for cosine annealing (default: use --lr)')
+    parser.add_argument('--lr_min', type=float, default=1e-6,
+                        help='Min LR for cosine annealing')
+    parser.add_argument('--lr_anneal_epochs', type=int, default=None,
+                        help='T_max for cosine annealing (default: use --epochs)')
+
     # TrafficPlannerModel architecture (must match pretrained)
     parser.add_argument('--z_local_size', type=int, default=32)
     parser.add_argument('--num_intents', type=int, default=8,
@@ -309,6 +319,17 @@ def main():
     Logger.log('Optimizer created with %d trainable parameter groups' % len(trainable_params))
     Logger.log('Total model params: %d' % count_params(model))
 
+    # LR scheduler (cosine annealing)
+    scheduler = None
+    if cfg.use_lr_anneal:
+        lr_max = cfg.lr_max if cfg.lr_max is not None else cfg.lr
+        lr_min = cfg.lr_min
+        T_max = cfg.lr_anneal_epochs if cfg.lr_anneal_epochs is not None else cfg.epochs
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr_max
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=lr_min)
+        Logger.log(f'LR Cosine Annealing: max={lr_max}, min={lr_min}, T_max={T_max}')
+
     # Set normalizers
     model.set_normalizer(train_dataset.get_state_normalizer())
     model.set_att_normalizer(train_dataset.get_att_normalizer())
@@ -412,6 +433,10 @@ def main():
         ax1.plot(train_loss)
         ax1.set_title('Train Loss (Fine-tune)')
         plt.savefig(os.path.join(cfg.out, f'loss_{cfg.loss_plot_suffix}.png'), format='png')
+
+        # Step LR scheduler
+        if scheduler is not None:
+            scheduler.step()
 
         torch.cuda.empty_cache()
         Logger.log('Epoch %d - Train loss: %.6f - Time: %.1fs' % (epoch, mean_train_loss, time.time() - start_t))
