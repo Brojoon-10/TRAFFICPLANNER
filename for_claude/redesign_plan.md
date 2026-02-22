@@ -2,7 +2,7 @@
 
 > 작성일: 2026-02-22
 > 최종 수정: 2026-02-23
-> 상태: Phase 1 구현 완료 (test_forward_pass 11개 전체 통과)
+> 상태: Phase 1 구현 완료 + Intent CE soft label + LR scheduler + 정규화 수정
 
 ---
 
@@ -14,7 +14,7 @@
 원하는 것:
 - z_global: "어디로 갈 것인가" (직진, 좌회전, 우회전) — **글로벌 의도**
 - z_local: "어떻게 반응할 것인가" (등속, 감속, 가속, 회피) — **순간 의도**
-- z_local은 **수동 카테고리 아님** — 데이터에서 자율적으로 의도 클러스터 발견
+- z_local은 **수동 카테고리 아님** — 9개 prototype(acc×yaw) 기반 soft label로 가이드
 - 맵을 "배경 정보"가 아닌 **"선택적으로 참조하는 도로 구조"**로 취급
 
 ### 현재 모델의 구체적 실패 원인
@@ -62,8 +62,8 @@
 2. **GCN은 상호작용 인코딩 전용**: decoder prediction이 아닌 history buffer 채우기용
 3. **History Attention KV = GCN feature 누적**: 풍부한 상호작용 정보 + PE로 시간 순서
 4. **Map Cross-Attention**: CNN spatial features (29×29=841 tokens @256pix, 27×27=729 @240pix), flatten 안 함
-5. **Intent Codebook (z_local)**: discrete K개 의도, z_global과 독립, ego만 적용
-6. **z_local Phase 1 zero-masking**: z_global 학습 방해 방지
+5. **Intent Codebook (z_local)**: discrete K=9개 의도, z_global과 독립, ego만 적용
+6. **z_local Phase 1에서도 활성화**: recon loss + intent CE(weight=0.1)로 학습
 7. **TF annealing 유지**: 기존 segment 방식 유지 (Scheduled Sampling은 불연속 문제)
 8. **Loop body 경량화**: pre-allocate buffer, in-place update, Python overhead 최소화
 
@@ -85,7 +85,7 @@ Level 1: z_global (scene-level, 1회)
   12스텝 전체에 동일하게 적용
 
 Level 2: z_local Intent Codebook (step-level, 매 스텝, ego만)
-  K개 learnable intent 벡터 (K=8, 조절 가능)
+  K개 learnable intent 벡터 (K=9, 3acc×3yaw)
   situation → intent_predictor → K개 중 1개 선택
   z_global과 독립 — decoder에서 합류
 
@@ -127,7 +127,7 @@ map_tokens = map_CNN_partial(map_crop)          # (NA, 841, ch) — conv3에서 
    intent_input = [ego_state, predicted_sur_delta, ego_map_ctx.detach()]
    z_local, weights = IntentCodebook(intent_input)
    → (A) Intent CE Loss
-   Phase 1: z_local = zero (구조만 유지, 출력 zero)
+   Phase 1: z_local 활성화 (recon + intent CE 0.1로 학습)
 
 5. GRU + Output:
    ego_gru_input = [ego_hist_ctx, ego_map_ctx, z_global, z_local, lw, sem]
@@ -189,7 +189,7 @@ z_local용 GCN: scene_graph → ego/sur feature → z_local attention (feature �
 
 ```python
 class IntentCodebook(nn.Module):
-    def __init__(self, num_intents=8, intent_dim=32, input_dim=D):
+    def __init__(self, num_intents=9, intent_dim=32, input_dim=D):
         self.codebook = nn.Embedding(num_intents, intent_dim)  # K개 의도 벡터
         self.intent_predictor = MLP([input_dim, 64, num_intents])  # 상황→의도 확률
 
@@ -207,10 +207,10 @@ class IntentCodebook(nn.Module):
 ```
 
 **특성:**
-- K개 의도가 뭔지는 모델이 학습 중 자율 결정 (수동 라벨 없음)
+- K=9개 의도, 9개 prototype (3acc × 3yaw)의 soft label로 가이드
 - z_global과 독립: decoder에서 z_global + z_local concat으로 합류
-- Phase 1: z_local = zero (codebook 비활성화)
-- Phase 2: codebook 활성화, temperature annealing (높음→낮음)
+- **Phase 1에서도 활성화**: recon loss로 codebook 학습 + intent CE(0.1)로 의도 구조 가이드
+- Phase 2: intent CE weight 높여서 의도 강화 (0.5~1.0)
 - 학습 후: codebook 각 slot 시각화로 의도 해석 가능
 
 ### 2f. Decoder History Attention 상세
@@ -297,7 +297,7 @@ ego_gru_input = concat([
     history_context,   # (D) — Ego History Attention 결과 (GCN feature 기반)
     map_context,       # (D) — Ego Map Cross-Attention 결과
     z_global,          # (z_size) — scene-level 의도
-    z_local_t,         # (intent_dim) — 순간 의도 (Phase 1: zero)
+    z_local_t,         # (intent_dim) — 순간 의도 (Phase 1부터 활성)
     lw,                # (2) — 차량 크기
     sem                # (NC) — semantic 정보
 ])
@@ -314,7 +314,7 @@ sur_gru_input = concat([
 ])
 ```
 
-**차이: z_local 유무만.** Phase 1에서는 z_local=zero이므로 사실상 동일 구조.
+**차이: z_local 유무만.** Phase 1에서 z_local 활성화 (intent CE 0.1), ego만 적용.
 
 **기존 대비:**
 | 항목 | 기존 ego | 기존 sur | 제안 ego | 제안 sur |
@@ -322,7 +322,7 @@ sur_gru_input = concat([
 | 과거 참조 | 없음 | 없음 | History Attn (GCN feat+PE) | History Attn (GCN feat+PE) |
 | 맵 참조 | 64dim concat | GCN 입력에 포함 | 841 token cross-attn | 841 token cross-attn |
 | z_global | z_combine_mlp(+z_local) | GCN 입력에 포함 | concat (분리) | concat (분리) |
-| z_local | noise (Phase 1) | 없음 | codebook (Phase 1: zero) | 없음 |
+| z_local | noise (Phase 1) | 없음 | codebook (Phase 1부터 활성) | 없음 |
 | decoder | GRU | GCN | GRU | GRU |
 
 ---
@@ -348,7 +348,7 @@ sur_gru_input = concat([
 │  map_resolution             ≈ 2.66m per token       │
 │  z_size (z_global)          = 32                    │
 │  intent_dim (z_local)       = 32                    │
-│  num_intents (K)            = 8                     │
+│  num_intents (K)            = 9 (3acc × 3yaw)       │
 │  hist_attn_nhead            = 4                     │
 │  hist_attn_head_dim         = 16                    │
 │  map_attn_nhead             = 4                     │
@@ -363,7 +363,8 @@ sur_gru_input = concat([
 │  gumbel_temperature_init    = 1.0                   │
 │  gumbel_temperature_min     = 0.1                   │
 │  sur_pred_dim               = 2 (dx, dy)            │
-│  intent_ce_nclass           = 9 (3acc × 3yaw)      │
+│  intent_ce_nclass           = 9 (3acc × 3yaw)       │
+│  intent_sigma               = 0.5 (soft label용)   │
 │  map_gt_steps               = 6 (전방 예측 토큰)    │
 │  map_gt_decay_lambda        = 0.3 (exponential decay)│
 └─────────────────────────────────────────────────────┘
@@ -572,7 +573,7 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  └─────────────────────────────────────────────────────────────────┘ │
 │       ↓                                                               │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │  STEP 4: Intent Selection (ego만, Phase 2만 활성)                │ │
+│  │  STEP 4: Intent Selection (ego만, Phase 1부터 활성)              │ │
 │  │                                                                   │ │
 │  │  intent_input = concat([                                         │ │
 │  │      ego_state_t,              # (N_ego, 6)                     │ │
@@ -580,7 +581,7 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  │      ego_map_ctx.detach()      # (N_ego, D)   ← Step 3에서     │ │
 │  │  ])                             # (N_ego, 6+2+D = 72)           │ │
 │  │       ↓                                                           │ │
-│  │  intent_predictor (MLP: 72→64→K=8)                               │ │
+│  │  intent_predictor (MLP: 72→64→K=9)                               │ │
 │  │       ↓                                                           │ │
 │  │  logits: (N_ego, 8)                                               │ │
 │  │       ↓                                                           │ │
@@ -589,13 +590,16 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  │       ↓                                                           │ │
 │  │  z_local = weights @ codebook.weight  → (N_ego, intent_dim=32) │ │
 │  │                                                                   │ │
-│  │  ┌─ Auxiliary (A): Intent CE (Phase 2만) ─────────────────────┐ │ │
+│  │  ┌─ Auxiliary (A): Intent Soft Label (Phase 무관, weight>0) ──┐ │ │
 │  │  │  z_local → intent_ce_head (Linear: 32→9)                   │ │ │
-│  │  │  Loss = CE(prediction, gt_acc_yaw_class)                    │ │ │
-│  │  │  gt_class = acc_bin(3) × yaw_bin(3) = 9 classes            │ │ │
+│  │  │  Loss = KL(predicted_softmax || GT_soft_label)              │ │ │
+│  │  │  GT: raw acc(std만 나눔, 0=등속) × raw yaw(std만 나눔)     │ │ │
+│  │  │      → 9 prototype Gaussian dist → softmax → soft label    │ │ │
+│  │  │  a_std, hdot_std from NUSC_NORM_STATS (고정 기준)           │ │ │
+│  │  │  sigma = intent_sigma (config, default 0.5)                 │ │ │
 │  │  └────────────────────────────────────────────────────────────┘ │ │
 │  │                                                                   │ │
-│  │  Phase 1: z_local = zeros(N_ego, intent_dim)  ← 비활성화       │ │
+│  │  z_local 활성화 (Phase 1부터, use_z_local=True)                 │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 │       ↓                                                               │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
@@ -650,7 +654,7 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  │                                                                   │ │
 │  │  ※ ego GRU input = 196dim (z_local 포함)                        │ │
 │  │  ※ sur GRU input = 164dim (z_local 없음)                        │ │
-│  │  ※ Phase 1: z_local=zero → ego도 사실상 164+32(zero) = 196     │ │
+│  │  ※ Phase 1: z_local 활성화 → ego는 196dim (z_local 포함)        │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 │       ↓                                                               │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
@@ -660,9 +664,9 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  │  prev_ego_state = next_ego_state                                 │ │
 │  │  prev_sur_state = next_sur_state                                 │ │
 │  │                                                                   │ │
-│  │  ※ map_recrop 설정으로 제어 (config: map_recrop: False)          │ │
-│  │    False: 초기 crop 재사용 (빠름, 77m 범위 내 ~50m 이동 OK)     │ │
-│  │    True: 매 스텝 re-crop + re-encode (정확, TF에서 GT 캐시)      │ │
+│  │  ※ map_recrop 설정으로 제어 (config: map_recrop: True)           │ │
+│  │    True: 매 스텝 re-crop + re-encode (64×64 맵에서 32px 반경)   │ │
+│  │    False: 초기 crop 재사용 (빠르지만 범위 밖 잘림)               │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 ╚═════════════════════════════════════════════════════════════════════╝
 
@@ -777,13 +781,13 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  IntentCodebook                                                       │
 │                                                                       │
 │  파라미터:                                                            │
-│    num_intents (K) = 8                                                │
+│    num_intents (K) = 9                                                │
 │    intent_dim = 32                                                    │
 │    input_dim = 6 + 2 + 64 = 72   (ego_state + sur_delta + map_ctx)  │
 │                                                                       │
 │  서브모듈:                                                            │
-│    codebook:         Embedding(K=8, intent_dim=32) — 의도 벡터       │
-│    intent_predictor: MLP(72→64→K=8)                — 상황→확률       │
+│    codebook:         Embedding(K=9, intent_dim=32) — 의도 벡터       │
+│    intent_predictor: MLP(72→64→K=9)                — 상황→확률       │
 │    intent_ce_head:   Linear(32→9)                  — Auxiliary (A)   │
 │                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
@@ -811,7 +815,7 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  │       ↓                                                           │ │
 │  │  z_local = weights @ codebook.weight            (N_ego, 32)      │ │
 │  │                                                                   │ │
-│  │  Phase 1: z_local = zeros(N_ego, 32) 반환 (forward 스킵)        │ │
+│  │  Phase 1: z_local 활성화 (recon + intent CE 0.1로 학습)          │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 │                                                                       │
 │  Codebook Visualization (학습 후):                                   │
@@ -932,14 +936,14 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 | **`sur_history_attn`** | MHA+PE | D, 4h | sur history cross-attn | **Train** | **Frozen** |
 | **`ego_map_attn`** | MHA | D, 4h, KV=841 | ego map cross-attn | **Train** | **Train** |
 | **`sur_map_attn`** | MHA | D, 4h, KV=841 | sur map cross-attn | **Train** | **Frozen** |
-| **`intent_codebook`** | Embed+MLP | K=8, 32dim | discrete intent (ego) | ❌ 비활성 | **Train** |
+| **`intent_codebook`** | Embed+MLP | K=9, 32dim | discrete intent (ego) | **Train** (intent_ce=0.1) | **Train** |
 | **`ego_decoder_gru`** | GRU-3L | 196→D | ego trajectory decode | **Train** | **Train** |
 | **`sur_decoder_gru`** | GRU-3L | 164→D | sur trajectory decode | **Train** | **Frozen** |
 | **`ego_output_head`** | Linear | D→2 | ego output (a, hdot) | **Train** | **Train** |
 | **`sur_output_head`** | Linear | D→2 | sur output (a, hdot) | **Train** | **Frozen** |
 | `sur_pred_head` | Linear | D→2 | Aux (B): ego→sur pred | **Train** | **Train** |
 | `ego_pred_head` | Linear | D→2 | Aux (C): sur→ego pred | **Train** | **Frozen** |
-| `intent_ce_head` | Linear | 32→9 | Aux (A): intent CE | ❌ 비활성 | **Train** |
+| `intent_ce_head` | Linear | 32→9 | Aux (A): intent soft label | **Train** (0.1) | **Train** (0.5~1.0) |
 
 ### Freeze/Train 시각 요약
 
@@ -955,7 +959,7 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  │  ├── ego_history_attn, ego_map_attn, ego_gru, ego_mlp        │  │
 │  │  ├── sur_history_attn, sur_map_attn, sur_gru, sur_mlp        │  │
 │  │  ├── sur_pred_head, ego_pred_head                             │  │
-│  │  └── (intent_codebook 비활성 — z_local = zero)                │  │
+│  │  └── (intent_codebook 활성 — intent CE=0.1)                   │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                       │
 │  Phase 2 (Adversarial Finetune):                                     │
@@ -1078,14 +1082,22 @@ LR warmup (10 epochs) + gradient clipping (max_norm=1.0) 추가.
 └── (D) Map Attention Guidance Loss         ← Map Cross-Attention 타겟 (ego + sur)
 ```
 
-### (A) Intent CE Loss — Codebook이 의미있는 행동을 학습하도록 강제
+### (A) Intent Soft Label Loss — Codebook이 의미있는 행동을 학습하도록 강제
 
 ```
-codebook_vector (intent_dim) → Linear(intent_dim, 9) → 9-class CE
+codebook_vector (intent_dim=32) → Linear(32, 9) → softmax → predicted distribution
+GT: raw acc / a_std (0=등속) × raw yaw / hdot_std (0=직진)
+    → 9 prototype Gaussian distance → softmax → GT soft label
+Loss = KL(predicted || GT_soft_label)
 ```
 
-**타겟:** acc × yaw 방향 = 3(감속/유지/가속) × 3(좌/직/우) = 9 class
-**활성:** Phase 2만 (Phase 1에서는 codebook 비활성)
+**타겟:** 9개 prototype (3acc × 3yaw) 기반 soft label
+  - acc: unnormalize speed → diff/dt → /a_std(1.046), mean 안 뺌 (0=등속)
+  - yaw: unnormalize hdot → /hdot_std(0.0557), mean 안 뺌 (0=직진)
+  - prototype (-1,0,+1) × (-1,0,+1) in normalized space
+  - sigma = intent_sigma (config, default 0.5)
+  - NUSC_NORM_STATS에서 통계 import (하드코딩 없음)
+**활성:** Phase 1 (weight=0.1) + Phase 2 (weight=0.5~1.0)
 **타겟팅 모듈:** Intent Codebook
 
 **근거:**
@@ -1208,7 +1220,7 @@ Loss = KL(soft_label || attn_weights)
 | KL Div | z_global | - | prior/posterior | CVAE encoder | ✅ | ❌ (freeze) |
 | EnvPotential | trajectory | - | drivable area | 간접 | ✅ | ✅ |
 | VehColl | trajectory | - | 차량 간 거리 | 간접 | ✅ | ✅ |
-| **(A) Intent CE** | codebook vec | Linear→9cls | acc×yaw 방향 | Intent Codebook | ❌ | ✅ ego만 |
+| **(A) Intent Soft Label** | codebook vec | Linear→9→KL | acc×yaw soft label | Intent Codebook | ✅ (0.1) | ✅ ego만 (0.5~1.0) |
 | **(B) Ego→Sur Pred** | ego hist_ctx | Linear→2 | sur next delta (dx,dy) | Ego History Attn | ✅ | ✅ |
 | **(C) Sur→Ego Pred** | sur hist_ctx | Linear→2 | ego next delta (dx,dy) | Sur History Attn | ✅ | ❌ (freeze) |
 | **(D) Ego Map Attn** | attn_weights | 없음 (직접) | 전방6스텝 GT토큰 soft label | Ego Map Attn | ✅ | ✅ |
@@ -1248,8 +1260,8 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 4. Intent Selection (ego만):
    intent_input = [ego_state, predicted_sur_delta, ego_map_ctx.detach()]
    z_local, weights = IntentCodebook(intent_input)
-   → (A) Intent CE Loss (Linear(z_local) → 9-class)
-   Phase 1: z_local = zero (intent 비활성, 구조만 유지)
+   → (A) Intent Soft Label Loss (Linear(z_local) → 9 → KL vs GT soft label)
+   Phase 1: z_local 활성화 (use_z_local=True), intent_ce weight=0.1
 
 5. GRU + Output:
    ego_gru_input = [ego_hist_ctx, ego_map_ctx, z_global, z_local, lw, sem]
@@ -1265,9 +1277,10 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 ## 4. Phase 분리
 
 ### Phase 1: Normal Driving (Pretrain)
-- z_local = zero (Intent Codebook 비활성화)
-- 전체 모델 학습: encoder, GCN, ego/sur decoder, map CNN
-- ego와 sur가 사실상 동일 구조 (z_local=zero)
+- z_local 활성화 (use_z_local=True), recon loss + intent CE(0.1)로 학습
+- 전체 모델 학습: encoder, GCN, ego/sur decoder, map CNN, intent codebook
+- LR cosine annealing: lr_max=2e-5 → lr_min=5e-6 over 1500 epochs
+- map_recrop: True (64×64 맵에서 32px 반경이라 recrop 필수)
 - 목표: val loss ≤ 3.70, train/val gap ≤ 0.03
 
 ### Phase 2: Adversarial Reactive (Finetune)
@@ -1286,8 +1299,8 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 - MapCrossAttention 모듈 구현 (conv3 분기, 29×29 tokens) — ego/sur 별도
 - Ego decoder 재설계 (history attn + map attn + GRU)
 - Sur decoder 재설계 (history attn + map attn + GRU, 기존 GCN decoder 대체)
-- IntentCodebook 모듈 구현 (K=8, Gumbel-Softmax, ego만)
-- z_local Phase 1 zero-masking
+- IntentCodebook 모듈 구현 (K=9, Gumbel-Softmax, ego만)
+- z_local Phase 1에서도 활성화 (intent CE weight=0.1)
 - z_combine MLP 제거 → concat
 - history_buffer pre-allocation + in-place update
 
@@ -1321,7 +1334,7 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 | Train/Val gap | 0.10 | ≤ 0.03 |
 | 학습 시간 (1000 epochs) | ~1일 | 반나절 이하 |
 | Map 인식 | 64dim concat (무시됨) | 841 token cross-attn (선택적) |
-| z_local 의미 | noise (64dim continuous) | discrete intent (K=8 codebook) |
+| z_local 의미 | noise (64dim continuous) | discrete intent (K=9 codebook) |
 | 과거 참조 | 없음 (ego) / 없음 (sur) | GCN feat history + PE |
 | GCN 역할 | prediction + feature 2종 | 상호작용 인코딩 전용 1개 |
 | Ego/Sur 구조 | 비대칭 (GRU vs GCN) | 대칭 (둘 다 GRU + attention) |
@@ -1331,7 +1344,7 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 
 ## 7. 리스크 및 대안
 
-**리스크 1: Codebook collapse** — K=8 중 2-3개만 활성화
+**리스크 1: Codebook collapse** — K=9 중 2-3개만 활성화
 - 대안: Codebook utilization loss 추가 (균등 사용 유도)
 - 또는 K 조절 후 재학습
 
@@ -1395,4 +1408,4 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 ### 새로 추가할 모듈 (trafficplanner_model.py 내)
 - `DecoderHistoryAttention` — GCN feature 기반 히스토리 참조 + PE (ego/sur 별도)
 - `MapCrossAttention` — 맵 spatial token 선택적 참조 (ego/sur 별도)
-- `IntentCodebook` — discrete 의도 선택, K=8, Gumbel-Softmax (ego만)
+- `IntentCodebook` — discrete 의도 선택, K=9, Gumbel-Softmax (ego만)
