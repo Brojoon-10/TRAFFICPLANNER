@@ -584,7 +584,7 @@ class TrafficPlannerLoss(nn.Module):
                 acc_vals = torch.linspace(-1, 1, n_acc, device=device)
                 yaw_vals = torch.linspace(-1, 1, n_yaw, device=device)
                 # prototypes: (num_intents, 2)
-                prototypes = torch.stack(torch.meshgrid(acc_vals, yaw_vals, indexing='ij'), dim=-1).reshape(-1, 2)
+                prototypes = torch.stack(torch.meshgrid(acc_vals, yaw_vals), dim=-1).reshape(-1, 2)
 
                 sigma = self.aux_cfg['intent_sigma']
 
