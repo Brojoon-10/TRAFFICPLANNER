@@ -84,13 +84,6 @@ def parse_cfg():
     # TrafficPlannerModel architecture parameters (past_feat_size, future_feat_size in base_args)
     parser.add_argument('--z_local_size', type=int, default=32,
                         help='Latent dimension for z_local (ego-only reactive)')
-    parser.add_argument('--z_local_window', type=int, default=4,
-                        help='Sliding window size for z_local encoder')
-    parser.add_argument('--ego_full_query', type=str2bool, default=False,
-                        help='Use full window for ego query in z_local attention')
-    parser.add_argument('--growing_window', type=str2bool, default=False,
-                        help='If True, accumulate all history for z_local; if False, use fixed z_local_window size')
-
     # Phase-based training options
     parser.add_argument('--phase', type=int, default=1, choices=[1, 2],
                         help='Training phase: 1=pretrain (z_global), 2=finetune (z_local with frozen z_global)')
@@ -105,10 +98,6 @@ def parse_cfg():
     parser.add_argument('--loss_recon', type=float, default=1.0, help='Reconstruction loss weight')
     parser.add_argument('--loss_veh_coll_prior', type=float, default=0.05, help='Vehicle collision loss weight for sample from prior')
     parser.add_argument('--loss_env_coll_prior', type=float, default=0.1, help='Map collision loss weight for sample from prior')
-
-    parser.add_argument('--loss_accel', type=float, default=0.01, help='Acceleration penalty weight for ride comfort.')
-    parser.add_argument('--loss_yaw', type=float, default=0.01, help='Yaw velocity penalty weight for ride comfort.')
-    parser.add_argument('--loss_dist', type=float, default=0.05, help='Penalty for predicting an abnormally short trajectory.')
 
     # Losses - TrafficPlanner specific (potential-based)
     parser.add_argument('--use_potential_loss', type=str2bool, default=True,
@@ -149,6 +138,28 @@ def parse_cfg():
                         help='Use lane line repulsion (requires 3-channel map)')
     parser.add_argument('--env_loss_ego_only', type=str2bool, default=False,
                         help='Apply env potential loss to ego only (default: all agents)')
+
+    # Redesign: new model architecture params
+    parser.add_argument('--num_intents', type=int, default=8,
+                        help='Number of intent codebook entries (K)')
+    parser.add_argument('--hist_attn_nhead', type=int, default=4,
+                        help='Number of heads for decoder history attention')
+    parser.add_argument('--map_attn_nhead', type=int, default=4,
+                        help='Number of heads for decoder map cross-attention')
+    parser.add_argument('--sur_pred_dim', type=int, default=2,
+                        help='Predicted surrounding agent delta dimension (dx, dy)')
+    parser.add_argument('--map_recrop', type=str2bool, default=False,
+                        help='Re-crop map tokens at each decode step')
+
+    # Redesign: auxiliary loss weights
+    parser.add_argument('--loss_sur_pred', type=float, default=0.1,
+                        help='Sur prediction auxiliary loss weight')
+    parser.add_argument('--loss_ego_pred', type=float, default=0.1,
+                        help='Ego prediction auxiliary loss weight (Phase 1 only)')
+    parser.add_argument('--loss_intent_ce', type=float, default=0.0,
+                        help='Intent classification CE loss weight (Phase 2 only)')
+    parser.add_argument('--loss_map_attn', type=float, default=0.0,
+                        help='Map attention guidance loss weight')
 
     args = parser.parse_args()
     config_dict = vars(args)
@@ -318,8 +329,6 @@ def main():
     print(f'past_len: {cfg.past_len}')
     print(f'future_len: {cfg.future_len}')
     print(f'z_local_size: {cfg.z_local_size}')
-    print(f'z_local_window: {cfg.z_local_window}')
-    print(f'ego_full_query: {cfg.ego_full_query}')
     print(f'use_potential_loss: {cfg.use_potential_loss}')
     print(f'  - use_veh_potential: {cfg.use_veh_potential}')
     print(f'use_sparse_loss: {cfg.use_sparse_loss}')
@@ -411,9 +420,8 @@ def main():
         map_feat_size=cfg.map_feat_size,
         past_feat_size=cfg.past_feat_size,
         future_feat_size=cfg.future_feat_size,
-        latent_size=cfg.latent_size,          # z_global size
-        z_local_size=cfg.z_local_size,         # z_local size
-        z_local_window=cfg.z_local_window,     # sliding window for z_local
+        latent_size=cfg.latent_size,          # z_global size (32)
+        z_local_size=cfg.z_local_size,         # intent_dim (32)
         output_bicycle=cfg.model_output_bicycle,
         dt=cfg.dt,
         # Map Conv parameters (from base config)
@@ -421,12 +429,15 @@ def main():
         conv_kernel_list=cfg.conv_kernel_list,
         conv_stride_list=cfg.conv_stride_list,
         conv_filter_list=cfg.conv_filter_list,
-        # z_local attention parameters
-        ego_full_query=cfg.ego_full_query,
-        growing_window=cfg.growing_window,
         # Teacher forcing annealing parameters
         tf_max_annealing_epoch=cfg.tf_max_annealing_epoch,
-        tf_init_segment_len=cfg.tf_init_segment_len
+        tf_init_segment_len=cfg.tf_init_segment_len,
+        # Redesign params
+        num_intents=cfg.num_intents,
+        hist_attn_nhead=cfg.hist_attn_nhead,
+        map_attn_nhead=cfg.map_attn_nhead,
+        sur_pred_dim=cfg.sur_pred_dim,
+        map_recrop=cfg.map_recrop,
     ).to(device)
 
     train_loss = []
@@ -445,6 +456,11 @@ def main():
         'potential_env': cfg.loss_potential_env if cfg.use_potential_loss else 0.0,
         # z_local sparsity loss (off by default)
         'sparse': cfg.loss_sparse if cfg.use_sparse_loss else 0.0,
+        # Auxiliary losses (Redesign)
+        'sur_pred': cfg.loss_sur_pred,
+        'ego_pred': cfg.loss_ego_pred,
+        'intent_ce': cfg.loss_intent_ce,
+        'map_attn': cfg.loss_map_attn,
     }
 
     # Potential field configuration
@@ -545,10 +561,13 @@ def main():
     Logger.log(f'  PT (past_len): {model.PT}')
     Logger.log(f'  FT (future_len): {model.FT}')
     Logger.log(f'  z_local_size: {model.z_local_size}')
-    Logger.log(f'  z_local_window: {model.z_local_window}')
-    Logger.log(f'  ego_full_query: {model.ego_full_query}')
     Logger.log(f'  tf_max_annealing_epoch: {model.tf_max_annealing_epoch}')
     Logger.log(f'  tf_init_segment_len: {model.tf_init_segment_len}')
+    Logger.log(f'  num_intents: {model.num_intents}')
+    Logger.log(f'  intent_dim: {model.intent_dim}')
+    Logger.log(f'  map_num_tokens: {model.map_num_tokens}')
+    Logger.log(f'  sur_pred_dim: {model.sur_pred_dim}')
+    Logger.log(f'  map_recrop: {model.map_recrop}')
 
     # Loss function parameters
     Logger.log('\n[Loss Function]')

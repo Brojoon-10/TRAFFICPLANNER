@@ -341,14 +341,20 @@ class SparsityLoss(nn.Module):
 
 class TrafficPlannerLoss(nn.Module):
     """
-    Loss function for TrafficPlannerModel.
+    Loss function for TrafficPlannerModel (Redesign).
 
     Phase 1 (Pre-training):
-        L = L_recon + lambda_kl * L_kl(z_global) + lambda_sparse * L_sparse(z_local)
+        L = L_recon + λ_kl * L_kl + λ_sur_pred * L_sur_pred + λ_ego_pred * L_ego_pred + λ_map_attn * L_map_attn
 
     Phase 2 (Fine-tuning):
-        L = L_recon + lambda_sparse * L_sparse(z_local) + lambda_pot * L_potential
-        (z_global is frozen, so no KL loss)
+        L = L_recon + λ_sur_pred * L_sur_pred + λ_intent_ce * L_intent_ce + λ_map_attn * L_map_attn
+        (z_global frozen, ego_pred disabled, intent_ce active)
+
+    Auxiliary Losses:
+        (A) Intent CE: z_local → 9-class (3acc × 3yaw) — Phase 2 only
+        (B) Sur Pred: ego_hist_ctx → sur delta — Phase 1+2
+        (C) Ego Pred: sur_hist_ctx → ego delta — Phase 1 only
+        (D) Map Attn Guidance: attention weight vs GT position KL — Phase 1+2
     """
     def __init__(self, loss_weights,
                     state_normalizer=None,
@@ -359,24 +365,16 @@ class TrafficPlannerLoss(nn.Module):
                     use_veh_potential=False,
                     potential_cfg=None,
                     sparsity_cfg=None,
-                    ego_only_recon=False):
+                    ego_only_recon=False,
+                    aux_cfg=None):
         """
         :param loss_weights: dict of weightings for loss terms
-            - recon: reconstruction loss weight
-            - kl: KL divergence weight (Phase 1 only)
-            - sparse: z_local sparsity weight (requires use_sparse_loss=True)
-            - potential_veh: vehicle repulsion potential weight (ego-only, requires use_potential_loss=True and use_veh_potential=True)
-            - potential_env: environment boundary potential weight (ego-only, requires use_potential_loss=True)
-            - coll_veh_prior: vehicle collision loss weight
-            - coll_env_prior: environment collision loss weight
-        :param state_normalizer: normalization object for kinematic state
-        :param att_normalizer: normalization object for length/width
-        :param phase: 1 for pre-training, 2 for fine-tuning
-        :param use_sparse_loss: enable z_local sparsity loss (default False)
-        :param use_potential_loss: master switch for potential-based repulsion loss (default True)
-        :param use_veh_potential: enable vehicle potential loss computation (default False)
-        :param potential_cfg: dict of potential field parameters (optional)
-        :param sparsity_cfg: dict of sparsity loss parameters (optional)
+        :param aux_cfg: dict of auxiliary loss config (optional)
+            - sur_pred_dim: 2 (dx, dy)
+            - map_gt_steps: 4
+            - map_gt_weights: [0.4, 0.3, 0.2, 0.1]
+            - acc_bins: [-1.0, 1.0]  (3 bins: decel, maintain, accel)
+            - yaw_bins: [-0.1, 0.1]  (3 bins: left, straight, right)
         """
         super(TrafficPlannerLoss, self).__init__()
         self.loss_weights = loss_weights
@@ -387,6 +385,18 @@ class TrafficPlannerLoss(nn.Module):
         self.use_potential_loss = use_potential_loss
         self.use_veh_potential = use_veh_potential
         self.ego_only_recon = ego_only_recon
+
+        # Auxiliary loss config
+        default_aux_cfg = {
+            'sur_pred_dim': 2,
+            'map_gt_steps': 6,
+            'map_gt_weights': [0.3, 0.25, 0.2, 0.15, 0.07, 0.03],
+            'acc_bins': [-1.0, 1.0],   # normalized thresholds
+            'yaw_bins': [-0.1, 0.1],
+        }
+        if aux_cfg is not None:
+            default_aux_cfg.update(aux_cfg)
+        self.aux_cfg = default_aux_cfg
 
         # Potential field parameters (configurable via cfg)
         # Tuned for lane width 3.5m (center-to-boundary 1.75m)
@@ -458,21 +468,301 @@ class TrafficPlannerLoss(nn.Module):
         '''Enable or disable potential-based repulsion loss.'''
         self.use_potential_loss = enable
 
+    def _compute_auxiliary_losses(self, model, scene_graph, loss_out_dict):
+        """
+        Compute auxiliary losses from model's stored outputs (Redesign).
+
+        (B) Sur Pred Loss: MSE between predicted sur delta and GT sur delta
+        (C) Ego Pred Loss: MSE between predicted ego delta and GT ego delta (Phase 1 only)
+        (D) Map Attn Guidance: KL between attn weight and GT future position (disabled for now — needs map_env)
+        (A) Intent CE: CE between intent classification and GT acc/yaw class (Phase 2 only)
+
+        :param model: TrafficPlannerModel with stored outputs
+        :param scene_graph: scene graph with GT
+        :param loss_out_dict: dict to store individual loss values
+        :return: total auxiliary loss (scalar)
+        """
+        device = scene_graph.past.device
+        aux_loss = torch.tensor(0.0, device=device)
+
+        if model is None:
+            return aux_loss
+
+        gt_future = scene_graph.future_gt  # (NA, FT, 6)
+        ego_mask = torch.zeros(gt_future.size(0), dtype=torch.bool, device=device)
+        ego_inds = scene_graph.ptr[:-1]
+        ego_mask[ego_inds] = True
+        FT = gt_future.size(1)
+
+        # ---- (B) Sur Pred Loss: ego_hist_ctx → predicted sur delta vs GT ----
+        sur_pred_w = self.loss_weights.get('sur_pred', 0.0)
+        if sur_pred_w > 0.0:
+            sur_pred_list = model.get_sur_pred_outputs()
+            if sur_pred_list is not None and len(sur_pred_list) > 0:
+                sur_pred_loss = torch.tensor(0.0, device=device)
+                count = 0
+                for t, pred_delta in enumerate(sur_pred_list):
+                    if t >= FT:
+                        break
+                    # GT sur delta: gt_future[sur_idx, t, :2] - gt_future[sur_idx, t-1, :2]
+                    sur_gt_state = gt_future[~ego_mask]  # (num_sur, FT, 6)
+                    if t == 0:
+                        sur_prev = scene_graph.past[:, -1, :2][~ego_mask]  # (num_sur, 2)
+                    else:
+                        sur_prev = sur_gt_state[:, t - 1, :2]
+                    gt_sur_delta = sur_gt_state[:, t, :2] - sur_prev  # (num_sur, 2)
+                    # pred_delta is (num_ego, 2) — each ego predicts its paired sur's delta
+                    # For simplicity, use mean across all sur agents if multiple
+                    gt_delta_per_ego = gt_sur_delta.mean(dim=0, keepdim=True).expand_as(pred_delta)
+                    sur_pred_loss = sur_pred_loss + nn.functional.mse_loss(pred_delta, gt_delta_per_ego)
+                    count += 1
+                if count > 0:
+                    sur_pred_loss = sur_pred_loss / count
+                    aux_loss = aux_loss + sur_pred_w * sur_pred_loss
+                    loss_out_dict['sur_pred_loss'] = sur_pred_loss.detach().view((1,))
+
+        # ---- (C) Ego Pred Loss: sur_hist_ctx → predicted ego delta (Phase 1 only) ----
+        ego_pred_w = self.loss_weights.get('ego_pred', 0.0)
+        if ego_pred_w > 0.0 and self.phase == 1:
+            ego_pred_list = model.get_ego_pred_outputs()
+            if ego_pred_list is not None and len(ego_pred_list) > 0:
+                ego_pred_loss = torch.tensor(0.0, device=device)
+                count = 0
+                for t, pred_delta in enumerate(ego_pred_list):
+                    if t >= FT:
+                        break
+                    ego_gt_state = gt_future[ego_mask]  # (num_ego, FT, 6)
+                    if t == 0:
+                        ego_prev = scene_graph.past[:, -1, :2][ego_mask]
+                    else:
+                        ego_prev = ego_gt_state[:, t - 1, :2]
+                    gt_ego_delta = ego_gt_state[:, t, :2] - ego_prev
+                    gt_delta_per_sur = gt_ego_delta.mean(dim=0, keepdim=True).expand_as(pred_delta)
+                    ego_pred_loss = ego_pred_loss + nn.functional.mse_loss(pred_delta, gt_delta_per_sur)
+                    count += 1
+                if count > 0:
+                    ego_pred_loss = ego_pred_loss / count
+                    aux_loss = aux_loss + ego_pred_w * ego_pred_loss
+                    loss_out_dict['ego_pred_loss'] = ego_pred_loss.detach().view((1,))
+
+        # ---- (A) Intent CE Loss (Phase 2 only) ----
+        intent_ce_w = self.loss_weights.get('intent_ce', 0.0)
+        if intent_ce_w > 0.0 and self.phase == 2 and model is not None:
+            z_local = model.get_z_local()  # (FT, num_ego, intent_dim)
+            if z_local is not None and hasattr(model, 'intent_ce_head'):
+                # Compute GT acc/yaw classes from GT future
+                ego_gt = gt_future[ego_mask]  # (num_ego, FT, 6)
+                # speed at each step, compute acceleration
+                ego_speed = ego_gt[:, :, 4]  # (num_ego, FT)
+                ego_prev_speed = torch.cat([scene_graph.past[:, -1, 4:5][ego_mask], ego_speed[:, :-1]], dim=1)
+                ego_acc = (ego_speed - ego_prev_speed) / 0.5  # (num_ego, FT)
+                ego_yaw_rate = ego_gt[:, :, 5]  # (num_ego, FT)
+
+                acc_bins = self.aux_cfg['acc_bins']
+                yaw_bins = self.aux_cfg['yaw_bins']
+
+                # Bin: 0=decel, 1=maintain, 2=accel
+                acc_class = torch.zeros_like(ego_acc, dtype=torch.long)
+                acc_class[ego_acc > acc_bins[1]] = 2
+                acc_class[(ego_acc >= acc_bins[0]) & (ego_acc <= acc_bins[1])] = 1
+
+                # Bin: 0=left, 1=straight, 2=right
+                yaw_class = torch.zeros_like(ego_yaw_rate, dtype=torch.long)
+                yaw_class[ego_yaw_rate > yaw_bins[1]] = 2
+                yaw_class[(ego_yaw_rate >= yaw_bins[0]) & (ego_yaw_rate <= yaw_bins[1])] = 1
+
+                # Combined class: 3*acc + yaw → 9 classes
+                gt_class = acc_class * 3 + yaw_class  # (num_ego, FT)
+
+                intent_ce_loss = torch.tensor(0.0, device=device)
+                num_steps = min(z_local.size(0), FT)
+                for t in range(num_steps):
+                    z_t = z_local[t]  # (num_ego, intent_dim)
+                    logits = model.intent_ce_head(z_t)  # (num_ego, 9)
+                    intent_ce_loss = intent_ce_loss + nn.functional.cross_entropy(logits, gt_class[:, t])
+
+                if num_steps > 0:
+                    intent_ce_loss = intent_ce_loss / num_steps
+                    aux_loss = aux_loss + intent_ce_w * intent_ce_loss
+                    loss_out_dict['intent_ce_loss'] = intent_ce_loss.detach().view((1,))
+
+        # ---- (D) Map Attn Guidance Loss: attn_weights vs GT future position ----
+        # Phase 1: ego + sur, Phase 2: ego only (sur frozen)
+        map_attn_w = self.loss_weights.get('map_attn', 0.0)
+        if map_attn_w > 0.0 and model is not None:
+            map_attn_loss = self._compute_map_attn_guidance_loss(
+                model, scene_graph, ego_mask, gt_future, FT)
+            if map_attn_loss is not None:
+                aux_loss = aux_loss + map_attn_w * map_attn_loss
+                loss_out_dict['map_attn_loss'] = map_attn_loss.detach().view((1,))
+
+        return aux_loss
+
+    def _compute_map_attn_guidance_loss(self, model, scene_graph, ego_mask, gt_future, FT):
+        """
+        Map Attention Guidance: attention이 전방 4스텝 GT 위치의 map token에 집중하도록 KL loss.
+
+        GT 위치 → ego/sur local frame → pixel → conv3 grid index → soft label
+        soft label vs attn_weights → KL divergence
+
+        :return: scalar loss or None
+        """
+        device = gt_future.device
+        normalizer = self.state_normalizer
+
+        ego_attn_list = model.get_ego_map_attn_weights()
+        sur_attn_list = model.get_sur_map_attn_weights()
+
+        if ego_attn_list is None or len(ego_attn_list) == 0:
+            return None
+
+        map_gt_steps = self.aux_cfg['map_gt_steps']
+        map_gt_weights = self.aux_cfg['map_gt_weights']
+        grid_size = model.map_token_spatial  # 29
+        num_tokens = grid_size * grid_size  # 841
+
+        # map_obs_bounds: [low_l, low_w, high_l, high_w] in meters
+        bounds = [-17.0, -38.5, 60.0, 38.5]
+        pix_size = model.map_obs_size_pix  # 256
+        # meters per pixel
+        m2pix_l = pix_size / (bounds[2] - bounds[0])  # 256 / 77
+        m2pix_w = pix_size / (bounds[3] - bounds[1])  # 256 / 77
+        # pixel to grid (conv3 output)
+        pix2grid_l = grid_size / pix_size  # 29 / 256
+        pix2grid_w = grid_size / pix_size
+
+        total_loss = torch.tensor(0.0, device=device)
+        count = 0
+
+        num_steps = min(len(ego_attn_list), FT)
+
+        for t in range(num_steps):
+            remaining = min(map_gt_steps, FT - t - 1)
+            if remaining <= 0:
+                continue
+
+            # --- Ego map attn guidance ---
+            ego_attn_w = ego_attn_list[t]  # (num_ego, 1, num_tokens)
+            ego_attn_dist = ego_attn_w.squeeze(1)  # (num_ego, num_tokens)
+
+            # Current ego position (frame for local transform)
+            if t == 0:
+                ego_frame = scene_graph.past[:, -1, :4][ego_mask]  # (num_ego, 4) normalized
+            else:
+                ego_frame = gt_future[ego_mask][:, t - 1, :4]
+
+            ego_soft_label = self._make_soft_label(
+                ego_frame, gt_future[ego_mask], t, remaining,
+                map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
+                pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
+
+            if ego_soft_label is not None:
+                # KL(soft_label || attn_dist) — soft_label is target
+                ego_kl = self._kl_with_epsilon(ego_soft_label, ego_attn_dist)
+                total_loss = total_loss + ego_kl
+                count += 1
+
+            # --- Sur map attn guidance (Phase 1 only) ---
+            if self.phase == 1 and sur_attn_list is not None and t < len(sur_attn_list):
+                sur_attn_w = sur_attn_list[t]  # (num_sur, 1, num_tokens)
+                sur_attn_dist = sur_attn_w.squeeze(1)
+
+                if t == 0:
+                    sur_frame = scene_graph.past[:, -1, :4][~ego_mask]
+                else:
+                    sur_frame = gt_future[~ego_mask][:, t - 1, :4]
+
+                sur_soft_label = self._make_soft_label(
+                    sur_frame, gt_future[~ego_mask], t, remaining,
+                    map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
+                    pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
+
+                if sur_soft_label is not None:
+                    sur_kl = self._kl_with_epsilon(sur_soft_label, sur_attn_dist)
+                    total_loss = total_loss + sur_kl
+                    count += 1
+
+        if count > 0:
+            return total_loss / count
+        return None
+
+    def _make_soft_label(self, frame, gt_future_agent, t, remaining,
+                         weights, normalizer, bounds, m2pix_l, m2pix_w,
+                         pix2grid_l, pix2grid_w, grid_size, num_tokens, device):
+        """
+        GT future 위치 → agent local frame → grid index → soft label 생성.
+
+        :param frame: (N, 4) current agent position (normalized, x,y,hx,hy)
+        :param gt_future_agent: (N, FT, 6) GT future for these agents (normalized)
+        :param t: current timestep
+        :param remaining: number of future steps to look ahead (1~4)
+        :return: (N, num_tokens) soft label or None
+        """
+        N = frame.size(0)
+        if N == 0:
+            return None
+
+        # Unnormalize frame and future positions
+        frame_unnorm = normalizer.unnormalize(frame)  # (N, 4)
+
+        soft_label = torch.zeros(N, num_tokens, device=device)
+
+        for k in range(remaining):
+            future_t = t + 1 + k
+            if future_t >= gt_future_agent.size(1):
+                break
+
+            gt_pos = gt_future_agent[:, future_t, :4]  # (N, 4) normalized
+            gt_pos_unnorm = normalizer.unnormalize(gt_pos)  # (N, 4)
+
+            # Global → agent local frame: transform2frame expects (B, N, 4)
+            local_pos = transform2frame(
+                frame_unnorm, gt_pos_unnorm.unsqueeze(1))  # (N, 1, 4)
+            local_xy = local_pos[:, 0, :2]  # (N, 2) — local (l, w)
+
+            # Local meters → pixel coordinates
+            pix_l = (local_xy[:, 0] - bounds[0]) * m2pix_l  # offset + scale
+            pix_w = (local_xy[:, 1] - bounds[1]) * m2pix_w
+
+            # Pixel → conv3 grid index
+            gi = (pix_l * pix2grid_l).long().clamp(0, grid_size - 1)
+            gj = (pix_w * pix2grid_w).long().clamp(0, grid_size - 1)
+
+            # Flatten index
+            flat_idx = gi * grid_size + gj  # (N,)
+
+            # Add weighted contribution
+            w = weights[k]
+            soft_label.scatter_add_(1, flat_idx.unsqueeze(1), torch.full((N, 1), w, device=device))
+
+        # Normalize to probability distribution
+        label_sum = soft_label.sum(dim=1, keepdim=True)
+        if (label_sum == 0).any():
+            return None
+        soft_label = soft_label / label_sum
+
+        return soft_label
+
+    def _kl_with_epsilon(self, target, pred, eps=1e-8):
+        """KL(target || pred) with epsilon smoothing to avoid log(0)."""
+        pred_smooth = pred + eps
+        pred_smooth = pred_smooth / pred_smooth.sum(dim=-1, keepdim=True)
+        target_smooth = target + eps
+        target_smooth = target_smooth / target_smooth.sum(dim=-1, keepdim=True)
+        kl = (target_smooth * (target_smooth.log() - pred_smooth.log())).sum(dim=-1)
+        return kl.mean()
+
     def forward(self, scene_graph, pred,
                  map_idx=None,
                  map_env=None,
                  model=None,
                  use_teacher_forcing=False):
         '''
-        Computes loss.
+        Computes loss (Redesign — with auxiliary losses).
 
         :param scene_graph: containing input and GT data
         :param pred: dict of model predictions.
-            - If use_teacher_forcing=False: pred['future_pred'] is (NA, FT, 4)
-            - If use_teacher_forcing=True: pred['future_pred'] is list of 12 segments,
-              each segment is list of (NA, 4) predictions
-        :param map_idx, map_env: only needed for env collision losses
-        :param model: TrafficPlannerModel instance (for z_local sparsity loss)
+        :param model: TrafficPlannerModel instance (for auxiliary loss computation)
         :param use_teacher_forcing: if True, compute loss over TF segments
         '''
 
@@ -480,17 +770,11 @@ class TrafficPlannerLoss(nn.Module):
         if use_teacher_forcing:
             return self._forward_teacher_forcing(scene_graph, pred, map_idx, map_env, model)
 
-        # we have a different number of agents for every sequence, and
-        #       a different number of timesteps for each agent even within
-        #       the same sequence, so we mean over all timesteps so that
-        #       the weights can be reliably balanced
-
         # reconstruction loss
-        gt_future = scene_graph.future_gt # NA x FT x 6
-        pred_future = pred['future_pred'] # NA x FT x 4
+        gt_future = scene_graph.future_gt
+        pred_future = pred['future_pred']
 
         if self.ego_only_recon:
-            # Only compute recon loss for ego agents
             ego_inds = scene_graph.ptr[:-1]
             gt_future_ego = gt_future[ego_inds]
             pred_future_ego = pred_future[ego_inds]
@@ -498,26 +782,24 @@ class TrafficPlannerLoss(nn.Module):
             gt_future_valid = gt_future_ego[future_vis_ego == 1.0]
             pred_future_valid = pred_future_ego[future_vis_ego == 1.0]
         else:
-            # only want to compute loss for timesteps we have GT data
             gt_future_valid = gt_future[scene_graph.future_vis == 1.0]
             pred_future_valid = pred_future[scene_graph.future_vis == 1.0]
 
-        # assume variance is 1 (i.e. MSE loss with extra constant)
         recon_loss = -log_normal(pred_future_valid, gt_future_valid[:, :4], torch.ones_like(pred_future_valid))
 
-        # KL divergence loss (Phase 1 only, or if weight > 0)
-        pm, pv = pred['prior_out'] # NA x z_size
+        # KL divergence loss
+        pm, pv = pred['prior_out']
         qm, qv = pred['posterior_out']
         kl_loss = kl_normal(qm, qv, pm, pv)
 
         # total weighted loss
-        loss = self.loss_weights['recon']*recon_loss.mean()
+        loss = self.loss_weights['recon'] * recon_loss.mean()
 
-        # KL loss: only in Phase 1 (when z_global is being trained)
+        # KL loss: Phase 1 only
         if self.phase == 1 and self.loss_weights.get('kl', 0.0) > 0.0:
-            loss = loss + self.loss_weights['kl']*kl_loss.mean()
+            loss = loss + self.loss_weights['kl'] * kl_loss.mean()
 
-        # z_local sparsity loss (off by default, enable with use_sparse_loss=True)
+        # z_local sparsity loss
         sparse_loss = None
         if self.use_sparse_loss and self.loss_weights.get('sparse', 0.0) > 0.0 and model is not None:
             z_local = model.get_z_local()
@@ -525,14 +807,12 @@ class TrafficPlannerLoss(nn.Module):
                 sparse_loss = self.sparsity_loss(z_local)
                 loss = loss + self.loss_weights['sparse'] * sparse_loss
 
-        # Potential-based loss (on by default, enable with use_potential_loss=True)
-        # Vehicle repulsion: ego repelled from other vehicles
+        # Potential-based losses
         potential_veh_loss = None
         if self.use_potential_loss and self.use_veh_potential and self.loss_weights.get('potential_veh', 0.0) > 0.0:
             potential_veh_loss = self.veh_potential_loss(pred_future, scene_graph)
             loss = loss + self.loss_weights['potential_veh'] * potential_veh_loss
 
-        # Environment repulsion: ego repelled from non-drivable boundaries
         potential_env_loss = None
         if self.use_potential_loss and self.loss_weights.get('potential_env', 0.0) > 0.0:
             if map_idx is not None and map_env is not None:
@@ -541,46 +821,42 @@ class TrafficPlannerLoss(nn.Module):
 
         prior_coll_loss = None
         if self.loss_weights.get('coll_veh_prior', 0.0) > 0.0:
-            # compute veh2veh collision
             if self.state_normalizer is None or self.att_normalizer is None:
-                print('Must have normalizers to compute collisison loss!')
+                print('Must have normalizers to compute collision loss!')
                 exit()
-            # unnormalize
             veh_att = self.att_normalizer.unnormalize(scene_graph.lw)
-            # build the loss function
             veh_coll_loss = VehCollLoss(veh_att, scene_graph.batch, scene_graph.ptr)
-            # compute for each desired
             if self.loss_weights['coll_veh_prior'] > 0.0 and 'future_samp' in pred:
                 prior_traj = self.state_normalizer.unnormalize(pred['future_samp'])
                 prior_coll_pens, na_sqr = veh_coll_loss(prior_traj)
                 prior_coll_loss = torch.sum(prior_coll_pens) / na_sqr
-                loss = loss + self.loss_weights['coll_veh_prior']*prior_coll_loss
+                loss = loss + self.loss_weights['coll_veh_prior'] * prior_coll_loss
 
         prior_coll_env_loss = None
         if self.loss_weights.get('coll_env_prior', 0.0) > 0.0:
             assert(map_idx is not None and map_env is not None)
-            # compute veh2env collision
             if self.state_normalizer is None or self.att_normalizer is None:
-                print('Must have normalizers to compute collisison loss!')
+                print('Must have normalizers to compute collision loss!')
                 exit()
-
-            # only compute these losses on ego vehicles since guaranteed should have no collisions
             ego_inds = scene_graph.ptr[:-1]
-            # unnormalize
             veh_att = self.att_normalizer.unnormalize(scene_graph.lw[ego_inds])
-            # build the loss function
             env_coll_loss = EnvCollLoss(veh_att, map_idx, map_env, pred['future_pred'].size(1))
-            # compute for each desired
             if self.loss_weights['coll_env_prior'] > 0.0 and 'future_samp' in pred:
                 prior_traj = self.state_normalizer.unnormalize(pred['future_samp'][ego_inds])
                 prior_coll_env_loss = env_coll_loss(prior_traj)
-                loss = loss + self.loss_weights['coll_env_prior']*prior_coll_env_loss.mean()
+                loss = loss + self.loss_weights['coll_env_prior'] * prior_coll_env_loss.mean()
 
         loss_out = {
-            'loss' : loss.view((1,)),
-            'recon_loss' : recon_loss, # (num_valid_frames, )
-            'kl_loss' : kl_loss # (NA, )
+            'loss': loss.view((1,)),
+            'recon_loss': recon_loss,
+            'kl_loss': kl_loss,
         }
+
+        # Auxiliary losses (Redesign)
+        aux_loss = self._compute_auxiliary_losses(model, scene_graph, loss_out)
+        if aux_loss.item() > 0:
+            loss = loss + aux_loss
+            loss_out['loss'] = loss.view((1,))
 
         if sparse_loss is not None:
             loss_out['sparse_loss'] = sparse_loss.view((1,))
@@ -591,7 +867,7 @@ class TrafficPlannerLoss(nn.Module):
         if prior_coll_loss is not None:
             loss_out['coll_veh_prior'] = prior_coll_loss.view((1,))
         if prior_coll_env_loss is not None:
-            loss_out['coll_env_prior'] = prior_coll_env_loss.view(-1) # (B, T)
+            loss_out['coll_env_prior'] = prior_coll_env_loss.view(-1)
 
         return loss_out
 
@@ -708,6 +984,12 @@ class TrafficPlannerLoss(nn.Module):
             'kl_loss': kl_loss,
             'num_segments': torch.tensor([num_valid_segments], device=device, dtype=torch.float32),
         }
+
+        # Auxiliary losses (Redesign)
+        aux_loss = self._compute_auxiliary_losses(model, scene_graph, loss_out)
+        if aux_loss.item() > 0:
+            loss = loss + aux_loss
+            loss_out['loss'] = loss.view((1,))
 
         if sparse_loss is not None:
             loss_out['sparse_loss'] = sparse_loss.view((1,))

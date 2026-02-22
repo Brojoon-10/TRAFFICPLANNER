@@ -2,19 +2,15 @@
 #
 # SPDX-License-Identifier: MIT
 
-import itertools
-
-import numpy as np
-
 import torch
 from torch import nn
 from torch.distributions import Normal
+import torch.nn.functional as F
 
 import math
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
-from models.interaction_net import SceneInteractionNet
 from models.individual_interaction_net import IndividualSceneInteractionNet
 from models.common import MLP, car_dynamics
 
@@ -46,6 +42,110 @@ class PositionalEncoding(nn.Module):
             x = x + self.pe[:x.size(0)]
         return self.dropout(x)
 
+
+# ============================================================
+# New Decoder Modules (Redesign)
+# ============================================================
+
+class DecoderHistoryAttention(nn.Module):
+    """
+    Cross-attention over accumulated GCN features in history buffer.
+    Q = current GRU hidden, KV = GCN features from steps 0..t-1 with learnable PE.
+    Ego and Sur each have separate instances (separate weights).
+    """
+    def __init__(self, d_model, nhead=4, max_len=12):
+        super().__init__()
+        self.d_model = d_model
+        self.feat_proj = nn.Linear(d_model, d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.pe = nn.Embedding(max_len, d_model)  # learnable positional encoding
+
+    def forward(self, query, history_buffer, t):
+        """
+        :param query: (N, D) — current GRU hidden state (last layer)
+        :param history_buffer: (N, FT, D) — pre-allocated, GCN features accumulated
+        :param t: current timestep (0-indexed)
+        :return: (N, D) — history context
+        """
+        if t == 0:
+            return torch.zeros_like(query)
+
+        # GCN feature → projected space + positional encoding
+        history = self.feat_proj(history_buffer[:, :t, :])  # (N, t, D)
+        positions = self.pe(torch.arange(t, device=query.device))  # (t, D)
+        history = history + positions.unsqueeze(0)  # broadcast (1, t, D)
+
+        Q = query.unsqueeze(1)  # (N, 1, D)
+        attn_out, _ = self.cross_attn(Q, history, history)
+        return attn_out.squeeze(1)  # (N, D)
+
+
+class MapCrossAttention(nn.Module):
+    """
+    Cross-attention over CNN spatial features (map tokens).
+    Q = current GRU hidden, KV = conv3 spatial tokens (H*W tokens).
+    Ego and Sur each have separate instances.
+    """
+    def __init__(self, d_model, map_feat_dim, nhead=4):
+        super().__init__()
+        self.map_proj = nn.Linear(map_feat_dim, d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+
+    def forward(self, query, map_tokens):
+        """
+        :param query: (N, D) — agent's current GRU hidden state
+        :param map_tokens: (N, num_tokens, map_feat_dim) — conv3 spatial features
+        :return: (attn_out, attn_weights)
+            attn_out: (N, D)
+            attn_weights: (N, 1, num_tokens)
+        """
+        map_kv = self.map_proj(map_tokens)  # (N, num_tokens, D)
+        Q = query.unsqueeze(1)  # (N, 1, D)
+        attn_out, attn_weights = self.cross_attn(Q, map_kv, map_kv)
+        return attn_out.squeeze(1), attn_weights  # (N, D), (N, 1, num_tokens)
+
+
+class IntentCodebook(nn.Module):
+    """
+    Discrete intent codebook for z_local (ego only).
+    K learnable intent vectors, selected via Gumbel-Softmax.
+    Phase 1: returns zero (inactive). Phase 2: active.
+    """
+    def __init__(self, num_intents=8, intent_dim=32, input_dim=73):
+        super().__init__()
+        self.num_intents = num_intents
+        self.intent_dim = intent_dim
+        self.codebook = nn.Embedding(num_intents, intent_dim)
+        self.intent_predictor = MLP([input_dim, 64, num_intents])
+
+    def forward(self, situation, temperature=1.0, phase=1):
+        """
+        :param situation: (N_ego, input_dim) — ego_state + predicted_sur_delta + map_ctx(detached)
+        :param temperature: Gumbel-Softmax temperature
+        :param phase: 1=zero output (inactive), 2=active
+        :return: (z_local, intent_weights)
+            z_local: (N_ego, intent_dim)
+            intent_weights: (N_ego, K)
+        """
+        N = situation.size(0)
+        device = situation.device
+
+        if phase == 1:
+            z_local = torch.zeros(N, self.intent_dim, device=device)
+            intent_weights = torch.zeros(N, self.num_intents, device=device)
+            return z_local, intent_weights
+
+        logits = self.intent_predictor(situation)  # (N_ego, K)
+
+        if self.training:
+            intent_weights = F.gumbel_softmax(logits, tau=temperature, hard=False)
+        else:
+            intent_weights = F.one_hot(logits.argmax(-1), self.num_intents).float()
+
+        z_local = intent_weights @ self.codebook.weight  # (N_ego, intent_dim)
+        return z_local, intent_weights
+
+
 from datasets.utils import normalize_scene_graph
 from utils.transforms import transform2frame, kinematics2angle, kinematics2vec
 from utils.torch import calc_conv_out
@@ -53,25 +153,21 @@ from utils.logger import throw_err, Logger
 
 class TrafficPlannerModel(nn.Module):
     """
-    Traffic + Planner Model with dual latent variables:
-    - z_global: Global intention from past trajectory (can be frozen after Phase 1)
-    - z_local: Local reaction from sliding window (ego-only, updated per step)
+    Traffic + Planner Model (Redesign).
 
-    Encoder architecture:
-    - Prior (past): per-step GCN → GRU → past_context → z_global
-    - Posterior (future): per-step GCN → PE → Transformer → future_context + past_context → z_global
-
-    Decoder architecture:
-    - Other agents: GCN (STRIVE style)
-    - Ego: z_global + z_local → GRU → trajectory
+    Key changes from v4:
+    - Symmetric ego/sur decoder: both get History Attention + Map Cross-Attention + GRU
+    - Single interaction GCN for history buffer (replaces decoder_net + z_local_gcn)
+    - Intent Codebook for z_local (discrete, ego only, Phase 2 active)
+    - Map tokens: conv3 spatial features for cross-attention
+    - Auxiliary loss heads: sur_pred, ego_pred, map_attn_guidance, intent_ce
     """
     def __init__(self, npast, nfuture, map_obs_size_pix, nclasses,
                  map_feat_size=64,
                  past_feat_size=64,
                  future_feat_size=64,
-                 latent_size=64,          # z_global size
-                 z_local_size=32,         # z_local size (same as z_global)
-                 z_local_window=4,        # sliding window size for z_local encoder
+                 latent_size=32,          # z_global size (was 64, now 32)
+                 z_local_size=32,         # intent_dim
                  output_bicycle=True,
                  dt=0.5,
                  gcn_hidden_dim=64,
@@ -81,23 +177,15 @@ class TrafficPlannerModel(nn.Module):
                  conv_kernel_list=[7, 5, 5, 3, 3, 3],
                  conv_stride_list=[2, 2, 2, 2, 2, 2],
                  conv_filter_list=[16, 32, 64, 64, 128, 128],
-                 ego_full_query=False,    # if True, use all window timesteps for ego query in z_local attention
-                 growing_window=False,    # if True, accumulate all history; if False, use fixed z_local_window size
-                 tf_max_annealing_epoch=200,  # Teacher forcing cosine annealing: max epoch for curriculum
-                 tf_init_segment_len=1    # Teacher forcing initial segment length (anneals to 12)
+                 tf_max_annealing_epoch=1600,
+                 tf_init_segment_len=1,
+                 # New redesign params
+                 num_intents=8,           # K for intent codebook
+                 hist_attn_nhead=4,
+                 map_attn_nhead=4,
+                 sur_pred_dim=2,          # predicted sur delta dim (dx, dy)
+                 map_recrop=False,        # re-crop map tokens every decode step
                  ):
-        '''
-        :param npast: number of past steps to take as input
-        :param nfuture: number of future steps to predict as output
-        :param map_obs_size_pix: width (in pixels) of map crop
-        :param nclasses: number of different semantic classes
-        :param latent_size: z_global latent dimension
-        :param z_local_size: z_local latent dimension
-        :param z_local_window: sliding window size for z_local encoder input
-        :param gcn_hidden_dim: GCN output feature dimension
-        :param transformer_nhead: number of attention heads in Transformer
-        :param transformer_nlayer: number of Transformer encoder layers
-        '''
         super(TrafficPlannerModel, self).__init__()
         self.normalizer = self.att_normalizer = None
         self.PT = npast
@@ -115,211 +203,181 @@ class TrafficPlannerModel(nn.Module):
         self.state_size = 6  # (x,y,hx,hy,s,hdot)
         self.att_feat_size = 2  # (l,w)
         self.gcn_hidden_dim = gcn_hidden_dim
-        self.past_feat_size = past_feat_size  # for decoder compatibility
+        self.past_feat_size = past_feat_size  # D = 64
+        self.d_model = gcn_hidden_dim  # D = 64 throughout
+
+        # Store redesign params
+        self.num_intents = num_intents
+        self.sur_pred_dim = sur_pred_dim
+        self.intent_dim = z_local_size  # 32
 
         #
-        # Map encoding
+        # Map encoding — split into early (conv1-3, for tokens) and late (conv4-6, for encoder feat)
         #
         self.mapH = map_obs_size_pix
         self.mapW = map_obs_size_pix
         self.map_obs_size_pix = map_obs_size_pix
 
-        conv_layer_list = []
-        final_conv_out = map_obs_size_pix
-        assert len(conv_kernel_list) == len(conv_stride_list)
-        assert len(conv_kernel_list) == len(conv_filter_list)
-        conv_filter_list = [conv_channel_in] + conv_filter_list
-        for lidx in range(len(conv_kernel_list)):
-            cur_conv = nn.Conv2d(conv_filter_list[lidx],
-                                 conv_filter_list[lidx+1],
+        # Build conv layers, tracking intermediate sizes
+        assert len(conv_kernel_list) == len(conv_stride_list) == len(conv_filter_list)
+        conv_filter_list_full = [conv_channel_in] + conv_filter_list
+
+        # conv1-3: early layers (for map tokens)
+        early_layers = []
+        self.map_token_spatial = map_obs_size_pix
+        for lidx in range(3):
+            cur_conv = nn.Conv2d(conv_filter_list_full[lidx],
+                                 conv_filter_list_full[lidx+1],
                                  kernel_size=conv_kernel_list[lidx],
                                  stride=conv_stride_list[lidx],
                                  padding=0)
-            cur_gn = nn.GroupNorm(1, conv_filter_list[lidx+1])
-            conv_layer_list.extend([cur_conv, cur_gn, nn.ReLU()])
+            cur_gn = nn.GroupNorm(1, conv_filter_list_full[lidx+1])
+            early_layers.extend([cur_conv, cur_gn, nn.ReLU()])
+            self.map_token_spatial = calc_conv_out(self.map_token_spatial, conv_kernel_list[lidx], conv_stride_list[lidx])
+
+        self.map_conv_early = nn.Sequential(*early_layers)
+        self.map_token_ch = conv_filter_list_full[3]  # 64
+        self.map_num_tokens = self.map_token_spatial * self.map_token_spatial
+        print(f'Map tokens: {self.map_token_spatial}x{self.map_token_spatial} = {self.map_num_tokens} tokens, ch={self.map_token_ch}')
+
+        # conv4-6: late layers (for encoder 64-dim feature)
+        late_layers = []
+        final_conv_out = self.map_token_spatial
+        for lidx in range(3, len(conv_kernel_list)):
+            cur_conv = nn.Conv2d(conv_filter_list_full[lidx],
+                                 conv_filter_list_full[lidx+1],
+                                 kernel_size=conv_kernel_list[lidx],
+                                 stride=conv_stride_list[lidx],
+                                 padding=0)
+            cur_gn = nn.GroupNorm(1, conv_filter_list_full[lidx+1])
+            late_layers.extend([cur_conv, cur_gn, nn.ReLU()])
             final_conv_out = calc_conv_out(final_conv_out, conv_kernel_list[lidx], conv_stride_list[lidx])
 
-        self.map_conv = nn.Sequential(*conv_layer_list)
-        self.map_feat_in_size = conv_filter_list[-1] * final_conv_out * final_conv_out
+        self.map_conv_late = nn.Sequential(*late_layers)
+        self.map_feat_in_size = conv_filter_list_full[-1] * final_conv_out * final_conv_out
         self.map_feat_out_size = map_feat_size
         self.map_feature = nn.Linear(self.map_feat_in_size, self.map_feat_out_size)
 
         #
-        # Temporal GCN Encoder (per-step GCN → temporal encoding)
-        # Replaces encode_past/encode_future
+        # Temporal GCN Encoder (per-step GCN → temporal encoding) — UNCHANGED
         #
-
-        # Step feature extractor: raw state → GCN input dimension
-        # Input: state(6) + lw(2) + vis(1) + sem(NC)
         step_input_size = self.state_size + self.att_feat_size + 1 + self.NC
         self.step_feature_extractor = MLP([step_input_size, 128, gcn_hidden_dim])
 
-        # Per-step GCN for agent interaction at each timestep (with ego/other separate output)
         self.temporal_gcn_encoder = IndividualSceneInteractionNet(
-            gcn_hidden_dim,  # agent input feat size
-            self.NC,  # semantic feat size
-            4,  # edge feat size (x,y,hx,hy)
-            128,  # interaction node size
-            gcn_hidden_dim,  # output feat size
+            gcn_hidden_dim, self.NC, 4, 128, gcn_hidden_dim,
         )
 
-        # Prior temporal encoding: GRU (for short past sequence)
+        # Prior temporal encoding: GRU
         self.prior_temporal_gru = nn.GRU(
-            gcn_hidden_dim,
-            gcn_hidden_dim,
-            2,  # 2 layers: lower=low-level temporal, upper=high-level context
-            batch_first=True,
+            gcn_hidden_dim, gcn_hidden_dim, 2, batch_first=True,
         )
 
-        # Posterior temporal encoding: PE + Transformer (for future sequence)
+        # Posterior temporal encoding: PE + Transformer
         self.positional_encoding = PositionalEncoding(gcn_hidden_dim, max_len=max(self.PT, self.FT))
         encoder_layer = TransformerEncoderLayer(
-            d_model=gcn_hidden_dim,
-            nhead=transformer_nhead,
-            batch_first=True
+            d_model=gcn_hidden_dim, nhead=transformer_nhead, batch_first=True
         )
         self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=transformer_nlayer)
 
         #
         # Latent variable sizes
         #
-        self.z_size = latent_size
-        self.z_local_size = z_local_size
-        self.z_local_window = z_local_window
-        self.ego_full_query = ego_full_query
-        self.growing_window = growing_window
+        self.z_size = latent_size  # 32
+        self.z_local_size = z_local_size  # 32 (intent_dim)
 
         #
-        # Teacher Forcing Cosine Annealing parameters
+        # Teacher Forcing parameters
         #
         self.tf_max_annealing_epoch = tf_max_annealing_epoch
         self.tf_init_segment_len = tf_init_segment_len
+        self.map_recrop = map_recrop
 
         #
-        # Prior/Posterior latent networks
-        # Input: context (from GRU/Transformer) + map_feat + sem
+        # Prior/Posterior latent networks — UNCHANGED
         #
         self.latent_prior_net = MLP([
             gcn_hidden_dim + self.map_feat_out_size + self.NC,
             128,
-            self.z_size * 2  # mean and variance
+            self.z_size * 2
         ])
         self.latent_posterior_net = MLP([
-            gcn_hidden_dim * 2 + self.map_feat_out_size + self.NC,  # past_context + future_context
+            gcn_hidden_dim * 2 + self.map_feat_out_size + self.NC,
             128,
             self.z_size * 2
         ])
 
         if self.output_bicycle:
-            self.traj_out_size = 2  # (a,hdot) for a single step
+            self.traj_out_size = 2  # (a, hdot)
         else:
-            self.traj_out_size = 4  # (x,y,hx,hy) for a single step
+            self.traj_out_size = 4  # (x, y, hx, hy)
 
         #
-        # Decoder network - using IndividualSceneInteractionNet for other agents
+        # =============================================
+        # DECODER COMPONENTS (Redesign)
+        # =============================================
         #
-        decode_in_size = self.z_size + self.past_feat_size + self.map_feat_out_size + self.NC + self.att_feat_size
-        self.decoder_net = IndividualSceneInteractionNet(
-            decode_in_size,
-            self.NC,
-            4,
-            64,
-            self.traj_out_size
+
+        # 1. Interaction GCN: one shared GCN for history buffer (replaces decoder_net + z_local_gcn)
+        # Input: state(6) + lw(2) + sem(NC) = 10
+        interaction_gcn_in = self.state_size + self.att_feat_size + self.NC
+        self.interaction_gcn = IndividualSceneInteractionNet(
+            interaction_gcn_in, self.NC, 4, 64, self.d_model,
         )
 
-        # GRU for state memory (other agents - STRIVE style)
-        self.num_memory_layers = 3
-        self.decoder_memory = nn.GRU(
-            4,  # input size (x,y,hx,hy)
-            self.past_feat_size,  # hidden size
-            self.num_memory_layers,
-            batch_first=True,
+        # 2. History Attention (ego/sur separate)
+        self.ego_history_attn = DecoderHistoryAttention(self.d_model, nhead=hist_attn_nhead, max_len=self.FT)
+        self.sur_history_attn = DecoderHistoryAttention(self.d_model, nhead=hist_attn_nhead, max_len=self.FT)
+
+        # 3. Map Cross-Attention (ego/sur separate)
+        self.ego_map_attn = MapCrossAttention(self.d_model, self.map_token_ch, nhead=map_attn_nhead)
+        self.sur_map_attn = MapCrossAttention(self.d_model, self.map_token_ch, nhead=map_attn_nhead)
+
+        # 4. Intent Codebook (ego only)
+        intent_input_dim = self.state_size + self.sur_pred_dim + self.d_model  # 6 + 2 + 64 = 72
+        self.intent_codebook = IntentCodebook(
+            num_intents=num_intents,
+            intent_dim=self.intent_dim,
+            input_dim=intent_input_dim,
         )
 
-        #
-        # z_local encoder components (ego-only)
-        #
-        self.z_local_gcn_feat_size = 64
-        z_local_gcn_in_size = self.state_size + self.att_feat_size + self.NC
-        self.z_local_gcn = IndividualSceneInteractionNet(
-            z_local_gcn_in_size,
-            self.NC,
-            4,
-            64,
-            self.z_local_gcn_feat_size
-        )
-
-        # Temporal encoder for sliding window (other agents)
-        self.z_local_temporal_gru = nn.GRU(
-            self.z_local_gcn_feat_size,
-            self.z_local_gcn_feat_size,
-            1,
-            batch_first=True,
-        )
-
-        # Temporal encoder for ego query (if ego_full_query=True)
-        if self.ego_full_query:
-            self.z_local_ego_temporal_gru = nn.GRU(
-                self.z_local_gcn_feat_size,
-                self.z_local_gcn_feat_size,
-                1,
-                batch_first=True,
-            )
-
-        # Ego warmup GRU for initializing ego_decoder_gru hidden state
-        # Uses same architecture as ego_decoder_gru for dimension compatibility
-        self.ego_warmup_gru = nn.GRU(
-            gcn_hidden_dim,  # input: 64 (from temporal_gcn_encoder)
-            64,  # hidden: same as ego_decoder_gru
-            self.num_memory_layers,  # 3 layers
-            batch_first=True,
-        )
-
-        # Cross-attention: Q=ego_feat, K/V=other_temporal (2-layer with residual + LayerNorm)
-        self.cross_attn_heads = 4
-        self.cross_attn_1 = nn.MultiheadAttention(
-            embed_dim=self.z_local_gcn_feat_size,
-            num_heads=self.cross_attn_heads,
-            batch_first=True,
-        )
-        self.cross_attn_norm_1 = nn.LayerNorm(self.z_local_gcn_feat_size)
-        self.cross_attn_2 = nn.MultiheadAttention(
-            embed_dim=self.z_local_gcn_feat_size,
-            num_heads=self.cross_attn_heads,
-            batch_first=True,
-        )
-        self.cross_attn_norm_2 = nn.LayerNorm(self.z_local_gcn_feat_size)
-
-        # z_local: no projection, pass cross-attention output directly (64dim)
-        self.z_local_out_size = self.z_local_gcn_feat_size  # 64 (no bottleneck)
-
-        # Self-attention: ego ↔ sur mutual interaction (UniAD/GameFormer style)
-        self.interaction_self_attn = nn.MultiheadAttention(
-            embed_dim=self.z_local_gcn_feat_size,
-            num_heads=self.cross_attn_heads,
-            batch_first=True,
-        )
-        self.interaction_self_attn_norm = nn.LayerNorm(self.z_local_gcn_feat_size)
-
-        # Ablation flag: set to False to force z_local=0 for ablation study
-        self.use_z_local = True
-
-        #
-        # Ego trajectory decoder components
-        #
-        z_combine_in_size = self.z_size + self.z_local_out_size  # 64 + 64 = 128
-        self.z_combine_mlp = MLP([z_combine_in_size, 64, 64])
-
-        ego_gru_in_size = 64 + self.map_feat_out_size + self.NC + self.att_feat_size
+        # 5. Ego decoder GRU
+        # Input: hist_ctx(D) + map_ctx(D) + z_global(z_size) + z_local(intent_dim) + lw(2) + sem(NC)
+        ego_gru_in_size = self.d_model + self.d_model + self.z_size + self.intent_dim + self.att_feat_size + self.NC
         self.ego_decoder_gru = nn.GRU(
-            ego_gru_in_size,
-            64,
-            self.num_memory_layers,
-            batch_first=True,
+            ego_gru_in_size, self.d_model, 3, batch_first=True,
+        )
+        self.ego_output_head = nn.Linear(self.d_model, self.traj_out_size)
+
+        # 6. Sur decoder GRU
+        # Input: hist_ctx(D) + map_ctx(D) + z_global(z_size) + lw(2) + sem(NC)
+        sur_gru_in_size = self.d_model + self.d_model + self.z_size + self.att_feat_size + self.NC
+        self.sur_decoder_gru = nn.GRU(
+            sur_gru_in_size, self.d_model, 3, batch_first=True,
+        )
+        self.sur_output_head = nn.Linear(self.d_model, self.traj_out_size)
+
+        # 7. Auxiliary loss heads (all Linear — no MLP, force modules to encode directly)
+        self.sur_pred_head = nn.Linear(self.d_model, self.sur_pred_dim)  # (B) ego→sur delta
+        self.ego_pred_head = nn.Linear(self.d_model, self.sur_pred_dim)  # (C) sur→ego delta
+        self.intent_ce_head = nn.Linear(self.intent_dim, 9)  # (A) intent → 3acc×3yaw = 9 classes
+
+        # 8. Ego warmup GRU for initializing ego_decoder_gru hidden state
+        self.ego_warmup_gru = nn.GRU(
+            gcn_hidden_dim, self.d_model, 3, batch_first=True,
         )
 
-        self.ego_output_mlp = MLP([64, 64, self.traj_out_size])
+        # 9. Sur warmup GRU for initializing sur_decoder_gru hidden state
+        self.sur_warmup_gru = nn.GRU(
+            gcn_hidden_dim, self.d_model, 3, batch_first=True,
+        )
 
+        # Phase control
+        self.phase = 1
+        self.gumbel_temperature = 1.0
+
+        # Ablation flag
+        self.use_z_local = True
 
 
     def set_normalizer(self, normalizer):
@@ -335,33 +393,20 @@ class TrafficPlannerModel(nn.Module):
         return self.att_normalizer
 
     def set_bicycle_params(self, bicycle_params):
-        '''
-        Set bicycle model params including: max speed, max hdot, dt, etc.. used during rollout
-        '''
         self.bicycle_params = bicycle_params
 
     def get_tf_segment_len(self, current_epoch):
-        '''
-        Compute Teacher Forcing segment length using cosine annealing curriculum.
-
-        Gradually increases segment length from tf_init_segment_len to FT (12) over tf_max_annealing_epoch.
-        Uses cosine schedule for smooth transition.
-
-        :param current_epoch: current training epoch
-        :return: segment length to use (int, between tf_init_segment_len and FT)
-        '''
+        """Cosine annealing for TF segment length: tf_init_segment_len → FT."""
         if current_epoch >= self.tf_max_annealing_epoch:
-            return self.FT  # Full sequence after annealing complete
-
-        # Cosine annealing: smooth transition from init to FT
-        # Slow start, fast end: segment length increases gradually then rapidly
-        progress = current_epoch / self.tf_max_annealing_epoch  # 0.0 → 1.0
-        cos_out = 1 - math.cos(math.pi / 2 * progress)  # 0.0 → 1.0 (slow then fast)
-
-        # Interpolate: init_len → FT as progress increases
+            return self.FT
+        progress = current_epoch / self.tf_max_annealing_epoch
+        cos_out = 1 - math.cos(math.pi / 2 * progress)
         segment_len = self.tf_init_segment_len + (self.FT - self.tf_init_segment_len) * cos_out
-
         return int(segment_len)
+
+    # ============================================================
+    # Forward / Reconstruct / Sample — public API (unchanged interface)
+    # ============================================================
 
     def forward(self, scene_graph, map_idx, map_env,
                 use_post_mean=False,
@@ -369,139 +414,91 @@ class TrafficPlannerModel(nn.Module):
                 teacher_forcing=False,
                 tf_segment_len=None,
                 current_epoch=0):
-        '''
-        Forward pass to be used during training (samples from posterior).
-        :param scene_graph: must contain past (NA x PT x 6), past_vis (NA x PT), future (NA x FT x 6), future_vis (NA x FT),
-                                 edge_index (2 x num_edges), lw (NA x 2), sem (NA x num_classes), batch (NA)
-        :param map_idx: size (B,) and indexes into the maps contained in map_env
-        :param map_env: map environment to query for map crop
-        :param use_post_mean: if True, uses the mean of the posterior for z, rather than sampling
-        :param future_sample: if True, samples the prior and decodes one possible future and returns
-        :param teacher_forcing: if True, reset decoder states to GT at segment boundaries during training
-        :param tf_segment_len: number of steps per segment (deprecated - use current_epoch instead)
-        :param current_epoch: current training epoch (for cosine annealing of segment length)
-        '''
         # Compute segment length using cosine annealing if not explicitly provided
         if tf_segment_len is None and teacher_forcing:
             tf_segment_len = self.get_tf_segment_len(current_epoch)
         elif tf_segment_len is None:
-            tf_segment_len = self.FT  # Not used if teacher_forcing=False
-        # extract map feature for each agent based on last frame of past
+            tf_segment_len = self.FT
+
+        # Map encoding (encoder-level 64dim + decoder-level tokens)
         scene_graph.pos = scene_graph.past[:, -1, :4]
-        map_feat = self.encode_map(scene_graph, map_idx, map_env)  # NA x map_feat
+        map_feat, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
 
-        # PRIOR: past → GCN per step → GRU → z_global
-        prior_mu, prior_var, past_seq_out = self.prior(scene_graph, map_feat)
-
-        # POSTERIOR: future → GCN per step → PE → Transformer → z_global
-        past_context = past_seq_out[:, -1, :]  # (NA, D) last step of GRU output
-        post_mu, post_var = self.encoder(scene_graph, map_feat, past_context)
-
-        # DECODER
-        if use_post_mean:
-            z_samp = post_mu
-        else:
-            # sample from posterior in training
-            z_samp = self.rsample(post_mu, post_var)
-        future_pred = self.decoder(scene_graph, map_feat, past_seq_out, z_samp, map_idx, map_env,
-                                   teacher_forcing=teacher_forcing,
-                                   tf_segment_len=tf_segment_len)
-
-        net_out = {
-            'prior_out' : (prior_mu, prior_var),
-            'posterior_out' : (post_mu, post_var),
-            'future_pred' : future_pred,
-            'past_seq_out' : past_seq_out
-        }
-
-        if future_sample:
-            prior_samp = self.rsample(prior_mu, prior_var)
-            # future_sample uses prior sampling, so teacher forcing is not applied
-            future_samp = self.decoder(scene_graph, map_feat, past_seq_out, prior_samp, map_idx, map_env)
-            net_out['future_samp'] = future_samp
-
-        return net_out
-
-    def reconstruct(self, scene_graph, map_idx, map_env, sur_gt_replay=False):
-        '''
-        Given both past and future, reconstruct using the encoder (posterior) by
-         taking the mean of the predicted distribution.
-
-        :param scene_graph: must contain past (NA x PT x 6), past_vis (NA x PT), future (NA x FT x 6), future_vis (NA x FT),
-                                 edge_index (2 x num_edges), lw (NA x 2), sem (NA x num_classes), batch (NA)
-        :param map_idx: is size (B,) and indexes into the maps contained in map_env
-        :param map_env: map environment to query for map crop
-        :param sur_gt_replay: if True, override sur predictions with GT future at each step
-
-        :returns: dict with future_pred and posterior_out
-        '''
-        # extract map feature for each agent based on last frame of past
-        scene_graph.pos = scene_graph.past[:, -1, :4]
-        map_feat = self.encode_map(scene_graph, map_idx, map_env)
-
-        # PRIOR: get past_seq_out for decoder
+        # PRIOR
         prior_mu, prior_var, past_seq_out = self.prior(scene_graph, map_feat)
 
         # POSTERIOR
         past_context = past_seq_out[:, -1, :]
         post_mu, post_var = self.encoder(scene_graph, map_feat, past_context)
 
-        # DECODER: use posterior mean
-        future_pred = self.decoder(scene_graph, map_feat, past_seq_out, post_mu, map_idx, map_env,
-                                   sur_gt_replay=sur_gt_replay)
+        # DECODER
+        if use_post_mean:
+            z_samp = post_mu
+        else:
+            z_samp = self.rsample(post_mu, post_var)
+        future_pred = self.decoder(scene_graph, map_feat, past_seq_out, z_samp, map_idx, map_env,
+                                   map_tokens=map_tokens,
+                                   teacher_forcing=teacher_forcing,
+                                   tf_segment_len=tf_segment_len)
 
         net_out = {
-            'prior_out' : (prior_mu, prior_var),
-            'posterior_out' : (post_mu, post_var),
-            'future_pred' : future_pred
+            'prior_out': (prior_mu, prior_var),
+            'posterior_out': (post_mu, post_var),
+            'future_pred': future_pred,
+            'past_seq_out': past_seq_out,
         }
+
+        if future_sample:
+            prior_samp = self.rsample(prior_mu, prior_var)
+            future_samp = self.decoder(scene_graph, map_feat, past_seq_out, prior_samp, map_idx, map_env,
+                                       map_tokens=map_tokens)
+            net_out['future_samp'] = future_samp
 
         return net_out
 
-    def sample(self, scene_graph, map_idx, map_env, num_samples,
-                include_mean=False,
-                nfuture=None,
-                sur_gt_replay=False):
-        '''
-        Given past trajectories, sample possible futures using the prior.
-        This is the serial version that loops through and samples decodes iteratively.
-        This is slow, but works for larger batch sizes b/c doesn't use any extra memory.
-
-        :param scene_graph: must contain past (NA x PT x 6), past_vis (NA x PT),
-                                 edge_index (2 x num_edges), lw (NA x 2), sem (NA x num_classes), batch (NA)
-        :param map_idx: is size (B,) and indexes into the maps contained in map_env
-        :param map_env: map environment to query for map crop
-        :param num_samples: the number of futures to sample
-
-        :param include_mean: if true, the Nth sample uses the mean z of the prior distribution
-        :param nfuture: number of steps into the future to roll out (if different than model self.nfuture)
-        :param sur_gt_replay: if True, override sur predictions with GT future at each step
-        '''
-        # extract map feature for each agent based on last frame of past
+    def reconstruct(self, scene_graph, map_idx, map_env, sur_gt_replay=False):
         scene_graph.pos = scene_graph.past[:, -1, :4]
-        map_feat = self.encode_map(scene_graph, map_idx, map_env)
+        map_feat, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
 
-        # PRIOR
+        prior_mu, prior_var, past_seq_out = self.prior(scene_graph, map_feat)
+        past_context = past_seq_out[:, -1, :]
+        post_mu, post_var = self.encoder(scene_graph, map_feat, past_context)
+
+        future_pred = self.decoder(scene_graph, map_feat, past_seq_out, post_mu, map_idx, map_env,
+                                   map_tokens=map_tokens,
+                                   sur_gt_replay=sur_gt_replay)
+
+        return {
+            'prior_out': (prior_mu, prior_var),
+            'posterior_out': (post_mu, post_var),
+            'future_pred': future_pred,
+        }
+
+    def sample(self, scene_graph, map_idx, map_env, num_samples,
+               include_mean=False, nfuture=None, sur_gt_replay=False):
+        scene_graph.pos = scene_graph.past[:, -1, :4]
+        map_feat, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
+
         prior_mu, prior_var, past_seq_out = self.prior(scene_graph, map_feat)
         prior_distrib = Normal(prior_mu, torch.sqrt(prior_var))
 
         net_out = {
-            'prior_out' : (prior_mu, prior_var),
-            'z_samp' : [],
-            'z_logprob' : [],
-            'z_mdist' : [],
-            'future_pred' : []
+            'prior_out': (prior_mu, prior_var),
+            'z_samp': [],
+            'z_logprob': [],
+            'z_mdist': [],
+            'future_pred': [],
         }
         for sidx in range(num_samples):
-            if include_mean and sidx == (num_samples-1):
+            if include_mean and sidx == (num_samples - 1):
                 z_samp = prior_mu
             else:
                 z_samp = self.rsample(prior_mu, prior_var)
             z_logprob = prior_distrib.log_prob(z_samp).sum(dim=-1)
             z_mdist = torch.norm((z_samp - prior_mu) / torch.sqrt(prior_var), dim=-1)
             future_pred = self.decoder(scene_graph, map_feat, past_seq_out, z_samp, map_idx, map_env,
-                                        nfuture=nfuture,
-                                        sur_gt_replay=sur_gt_replay)
+                                       map_tokens=map_tokens,
+                                       nfuture=nfuture, sur_gt_replay=sur_gt_replay)
             net_out['z_samp'].append(z_samp)
             net_out['z_logprob'].append(z_logprob)
             net_out['z_mdist'].append(z_mdist)
@@ -511,37 +508,17 @@ class TrafficPlannerModel(nn.Module):
         net_out['z_logprob'] = torch.stack(net_out['z_logprob'], dim=1)
         net_out['z_mdist'] = torch.stack(net_out['z_mdist'], dim=1)
         net_out['future_pred'] = torch.stack(net_out['future_pred'], dim=1)
-
         return net_out
 
     def sample_batched(self, scene_graph, map_idx, map_env, num_samples,
-                        include_mean=False,
-                        nfuture=None,
-                        sur_gt_replay=False):
-        '''
-        Given past trajectories, sample possible futures using the prior.
-        This is a batched version of sampling that uses a lot of memory, but is faster than serial.
-
-        :param scene_graph: must contain past (NA x PT x 6), past_vis (NA x PT),
-                                 edge_index (2 x num_edges), lw (NA x 2), sem (NA x num_classes), batch (NA)
-        :param map_idx: is size (B,) and indexes into the maps contained in map_env
-        :param map_env: map environment to query for map crop
-        :param num_samples: the number of futures to sample
-
-        :param include_mean: if true, the Nth sample uses the mean z of the prior distribution
-        :param nfuture: number of steps into the future to roll out (if different than model self.nfuture)
-        :param sur_gt_replay: if True, override sur predictions with GT future at each step
-        '''
+                       include_mean=False, nfuture=None, sur_gt_replay=False):
         NA = scene_graph.past.size(0)
         NS = num_samples
-        # extract map feature for each agent based on last frame of past
         scene_graph.pos = scene_graph.past[:, -1, :4]
-        map_feat = self.encode_map(scene_graph, map_idx, map_env)
+        map_feat, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
 
-        # PRIOR
         prior_mu, prior_var, past_seq_out = self.prior(scene_graph, map_feat)
 
-        # sample from prior
         samp_mu = prior_mu.view(1, NA, self.z_size).expand(NS, NA, self.z_size)
         samp_var = prior_var.view(1, NA, self.z_size).expand(NS, NA, self.z_size)
         prior_distrib = Normal(samp_mu, torch.sqrt(samp_var))
@@ -550,262 +527,962 @@ class TrafficPlannerModel(nn.Module):
         if include_mean:
             z_samp[-1, :, :] = prior_mu
         future_pred = self.decoder(scene_graph, map_feat, past_seq_out, z_samp.transpose(0, 1), map_idx, map_env,
-                                    nfuture=nfuture,
-                                    sur_gt_replay=sur_gt_replay)
+                                   map_tokens=map_tokens,
+                                   nfuture=nfuture, sur_gt_replay=sur_gt_replay)
         net_out = {
-            'prior_out' : (prior_mu, prior_var),
-            'z_samp' : z_samp.view(NS, NA, self.z_size).transpose(0, 1),
-            'future_pred' : future_pred
+            'prior_out': (prior_mu, prior_var),
+            'z_samp': z_samp.view(NS, NA, self.z_size).transpose(0, 1),
+            'future_pred': future_pred,
         }
-
         z_logprob = prior_distrib.log_prob(z_samp.view(NS, NA, self.z_size)).sum(dim=-1).transpose(0, 1)
         z_mdist = torch.norm((z_samp.view(NS, NA, self.z_size) - samp_mu) / torch.sqrt(samp_var), dim=-1).transpose(0, 1)
-
         net_out['z_logprob'] = z_logprob
         net_out['z_mdist'] = z_mdist
-
         return net_out
 
     def embed(self, scene_graph, map_idx, map_env):
-        '''
-        Given past and optionally future, embed the given trajectories
-        using the prior and (optionally) posterior.
-
-        returns dict with prior_out and (optionally) posterior_out as well as
-        other required values to decode (map feat etc..)
-        '''
-        # extract map feature for each agent based on last frame of past
         scene_graph.pos = scene_graph.past[:, -1, :4]
-        map_feat = self.encode_map(scene_graph, map_idx, map_env)
+        map_feat, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
 
-        # PRIOR
         prior_mu, prior_var, past_seq_out = self.prior(scene_graph, map_feat)
-
         embed_out = {
-            'prior_out' : (prior_mu, prior_var),
-            'map_feat' : map_feat,
-            'past_seq_out' : past_seq_out
+            'prior_out': (prior_mu, prior_var),
+            'map_feat': map_feat,
+            'map_tokens': map_tokens,
+            'past_seq_out': past_seq_out,
         }
-
         if 'future' in scene_graph:
-            # POSTERIOR
             past_context = past_seq_out[:, -1, :]
             post_mu, post_var = self.encoder(scene_graph, map_feat, past_context)
             embed_out['posterior_out'] = (post_mu, post_var)
-
         return embed_out
 
     def decode_embedding(self, z, embed_out, scene_graph, map_idx, map_env,
-                            ext_future=None,
-                            nfuture=None):
-        '''
-        Given inputs/outputs of embed function, decodes to predicted trajectory in world space.
-        '''
+                         ext_future=None, nfuture=None):
         future_pred = self.decoder(scene_graph, embed_out['map_feat'], embed_out['past_seq_out'],
-                                        z, map_idx, map_env, ext_future=ext_future,
-                                        nfuture=nfuture)
-        return {'future_pred' : future_pred}
+                                   z, map_idx, map_env,
+                                   map_tokens=embed_out.get('map_tokens'),
+                                   ext_future=ext_future, nfuture=nfuture)
+        return {'future_pred': future_pred}
+
+    # ============================================================
+    # Encoder methods — UNCHANGED
+    # ============================================================
 
     def _run_temporal_encoder(self, scene_graph, traj_data, vis_data, T, use_transformer=True):
-        """
-        Per-step GCN → Temporal encoding (GRU or PE+Transformer).
-
-        Prior: use_transformer=False → GCN per step → GRU → context
-        Posterior: use_transformer=True → GCN per step → PE → Transformer → context
-
-        :param traj_data: (NA, T, 6) trajectory data
-        :param vis_data: (NA, T) visibility data
-        :param T: time steps
-        :param use_transformer: if True, use PE+Transformer; if False, use GRU
-        :return: (sequence_output, context_vector)
-                 - sequence_output: (NA, T, D) temporal sequence output
-                 - context_vector: (NA, D) context (last step output)
-        """
         g_in_data = scene_graph
         ego_mask = self._get_ego_mask(scene_graph)
-
         all_gcn_features = []
 
-        # 1. Per-step GCN
         for t in range(T):
-            cur_state = traj_data[:, t, :]  # (NA, 6)
-            cur_vis = vis_data[:, t].unsqueeze(-1)  # (NA, 1)
-            cur_lw = scene_graph.lw  # (NA, 2)
-            cur_sem = scene_graph.sem  # (NA, NC)
+            cur_state = traj_data[:, t, :]
+            cur_vis = vis_data[:, t].unsqueeze(-1)
+            cur_lw = scene_graph.lw
+            cur_sem = scene_graph.sem
 
-            # Build step input: state(6) + lw(2) + vis(1) + sem(NC)
             step_in_feat = torch.cat([cur_state, cur_lw, cur_vis, cur_sem], dim=-1)
-            gcn_node_in = self.step_feature_extractor(step_in_feat)  # (NA, gcn_hidden_dim)
+            gcn_node_in = self.step_feature_extractor(step_in_feat)
 
-            # Update scene graph for this step
             g_in_data.x = gcn_node_in
-            g_in_data.pos = cur_state[:, :4]  # (x, y, hx, hy)
+            g_in_data.pos = cur_state[:, :4]
 
-            # Run GCN (IndividualSceneInteractionNet returns ego/other separately)
             ego_feat_t, other_feat_t = self.temporal_gcn_encoder(g_in_data, ego_mask)
-            gcn_feat_t = self._merge_ego_other_feat(ego_feat_t, other_feat_t, ego_mask)  # (NA, D)
+            gcn_feat_t = self._merge_ego_other_feat(ego_feat_t, other_feat_t, ego_mask)
             all_gcn_features.append(gcn_feat_t)
 
-        # Stack: (NA, T, D)
         sequence_features = torch.stack(all_gcn_features, dim=1)
 
-        # 2. Temporal encoding
         if use_transformer:
-            # Posterior path: PE + Transformer
             sequence_features = self.positional_encoding(sequence_features)
-
-            # Create padding mask: True where vis_data == 0 (not observed)
-            # src_key_padding_mask: (NA, T), True = ignore this position
-            padding_mask = (vis_data == 0)  # (NA, T)
-
-            transformer_out = self.transformer_encoder(
-                sequence_features,
-                src_key_padding_mask=padding_mask
-            )  # (NA, T, D)
-            context_vector = transformer_out[:, -1, :]  # (NA, D)
+            padding_mask = (vis_data == 0)
+            transformer_out = self.transformer_encoder(sequence_features, src_key_padding_mask=padding_mask)
+            context_vector = transformer_out[:, -1, :]
             return transformer_out, context_vector
         else:
-            # Prior path: GRU
-            gru_out, _ = self.prior_temporal_gru(sequence_features)  # (NA, T, D)
-            context_vector = gru_out[:, -1, :]  # (NA, D)
+            gru_out, _ = self.prior_temporal_gru(sequence_features)
+            context_vector = gru_out[:, -1, :]
             return gru_out, context_vector
 
-    def encode_map(self, scene_graph, map_idx, map_env):
-        '''
-        Encodes local map patch around each agent based on the .pos attribute.
-        NOTE: assumes the scene graph is NORMALIZED, so will unnormalize before doing the crop.
+    def encode_map(self, scene_graph, map_idx, map_env, return_tokens=False):
+        """
+        Encode map features. If return_tokens=True, also return spatial tokens from conv3.
 
-        :param scene_graph: makes use of .pos attribute (NA x 4) or (NA x NS x 4) with (x,y,hx,hy)
-        :param map_idx: index of the map to use (B, )
-        :param map_env: map environment to get crop with
-
-        :return: NA x feat_dim
-        '''
+        :return: map_feat (NA, 64) or (map_feat, map_tokens) if return_tokens=True
+                 map_tokens: (NA, num_tokens, map_token_ch)
+        """
         NA = scene_graph.pos.size(0)
         NS = None if len(scene_graph.pos.size()) != 3 else scene_graph.pos.size(1)
-        # first must unnormalize to get true world space state
-        normalize_scene_graph(scene_graph,
-                                self.normalizer,
-                                self.att_normalizer,
-                                unnorm=True)
-        # get local crops based on .pos
-        map_obs = map_env.get_map_crop(scene_graph, map_idx).to(torch.float) # NA x C x mapH x mapW
-        # encode
-        map_feat = self.map_conv(map_obs)
-        # print(map_feat.size())
-        bsize = NA if NS is None else NA*NS
-        map_feat = self.map_feature(map_feat.view(bsize, self.map_feat_in_size))
-        # print(map_feat.size())
+
+        normalize_scene_graph(scene_graph, self.normalizer, self.att_normalizer, unnorm=True)
+        map_obs = map_env.get_map_crop(scene_graph, map_idx).to(torch.float)  # NA x C x H x W
+        normalize_scene_graph(scene_graph, self.normalizer, self.att_normalizer, unnorm=False)
+
+        bsize = NA if NS is None else NA * NS
+        if NS is not None:
+            map_obs = map_obs.reshape(bsize, map_obs.size(-3), map_obs.size(-2), map_obs.size(-1))
+
+        # Early conv (conv1-3): spatial tokens
+        map_early = self.map_conv_early(map_obs)  # (bsize, ch, H', W')
+
+        # Late conv (conv4-6): encoder feature
+        map_late = self.map_conv_late(map_early)
+        map_feat = self.map_feature(map_late.reshape(bsize, self.map_feat_in_size))
 
         if NS is not None:
             map_feat = map_feat.reshape(NA, NS, -1)
 
-        # re-normalize scene graph
-        normalize_scene_graph(scene_graph,
-                                self.normalizer,
-                                self.att_normalizer,
-                                unnorm=False)
+        if return_tokens:
+            # Flatten spatial dims: (bsize, ch, H', W') → (bsize, H'*W', ch)
+            map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (bsize, num_tokens, ch)
+            if NS is not None:
+                map_tokens = map_tokens.reshape(NA, NS, self.map_num_tokens, self.map_token_ch)
+            return map_feat, map_tokens
         return map_feat
 
-    def encode_past(self, scene_graph):
-        '''
-        Extract per-agent feature based on past trajectories (in local reference frame of last past step).
-        Scene graph is assumed to be NORMALIZED.
+    def encoder(self, scene_graph, map_feat, past_context):
+        """Posterior: future → z_global."""
+        _, future_context = self._run_temporal_encoder(
+            scene_graph, scene_graph.future, scene_graph.future_vis, self.FT, use_transformer=True
+        )
+        posterior_in = torch.cat([past_context, future_context, map_feat, scene_graph.sem], dim=-1)
+        posterior_z = self.latent_posterior_net(posterior_in)
+        mean, logvar = posterior_z[:, :self.z_size], posterior_z[:, self.z_size:]
+        var = torch.exp(logvar)
+        return mean, var
 
-        :param scene_graph: must have .past (NA x PT x 6), .past_vis (NA x PT),
-                            .sem (NA x NC) and .lw (NA x 2) to encode
+    def prior(self, scene_graph, map_feat):
+        """Prior: past → z_global."""
+        past_seq_out, past_context = self._run_temporal_encoder(
+            scene_graph, scene_graph.past, scene_graph.past_vis, self.PT, use_transformer=False
+        )
+        prior_in = torch.cat([past_context, map_feat, scene_graph.sem], dim=-1)
+        prior_z = self.latent_prior_net(prior_in)
+        mean, logvar = prior_z[:, :self.z_size], prior_z[:, self.z_size:]
+        var = torch.exp(logvar)
+        return mean, var, past_seq_out
 
-        :return: NA x feat_dim
-        '''
-        NA, PT, _ = scene_graph.past.size()
-        # transform to local frame of last step of past
-        local_past_kin = transform2frame(scene_graph.past[:, -1, :4], scene_graph.past[:, :, :4])
-        local_past_traj = torch.cat([local_past_kin, scene_graph.past[:, :, 4:]], dim=2)
-        # zero out any frames that were not observed
-        local_past_traj[scene_graph.past_vis == 0.0] = 0.0
-        # and append the visibility to the state as input
-        local_past_traj = torch.cat([local_past_traj, scene_graph.past_vis.unsqueeze(-1)], dim=-1)
-        # also add vehicle attributes
-        veh_in_att = scene_graph.lw.unsqueeze(1).expand(NA, PT, self.att_feat_size) 
-        encoder_in = torch.cat([local_past_traj, veh_in_att], dim=-1)
-        if self.traj_encoder_type == 'mlp':
-            # append semantic class too
-            encoder_in = torch.cat([encoder_in.view(NA, -1), scene_graph.sem], dim=1)
-        elif self.traj_encoder_type == 'gru':
-            encoder_in = torch.cat([encoder_in, scene_graph.sem.view(NA, 1, self.NC).expand(NA, PT, self.NC)], dim=2)
-        # then encode
-        past_feat = self.past_encoder(encoder_in)
+    # ============================================================
+    # Decoder
+    # ============================================================
 
-        if self.traj_encoder_type == 'gru':
-            past_feat = past_feat[0][:, -1, :] # only want output of last step
-            past_feat = self.past_out_layer(past_feat)
+    def decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
+                map_tokens=None,
+                ext_future=None, nfuture=None,
+                teacher_forcing=False, tf_segment_len=3,
+                sur_gt_replay=False):
+        """
+        Decoder dispatcher.
+        If map_tokens not provided, compute them (slower path for backward compat).
+        """
+        if map_tokens is None:
+            # Fallback: compute map tokens (needed for decode_embedding with old embed format)
+            scene_graph_pos_backup = scene_graph.pos.clone()
+            scene_graph.pos = scene_graph.past[:, -1, :4]
+            _, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
+            scene_graph.pos = scene_graph_pos_backup
 
-        return past_feat
+        if teacher_forcing:
+            return self.teacher_forcing_decoder(scene_graph, map_feat, past_seq_out, z,
+                                                map_idx, map_env, map_tokens, tf_segment_len)
+        else:
+            return self.autoregressive_decoder(scene_graph, map_feat, past_seq_out, z,
+                                               map_idx, map_env, map_tokens,
+                                               ext_future=ext_future, nfuture=nfuture,
+                                               sur_gt_replay=sur_gt_replay)
 
-    def encode_future(self, scene_graph):
-        '''
-        Extract per-agent feature based on future trajectories (in local reference frame of last past setp).
-        Scene graph is assumed to be NORMALIZED.
+    def autoregressive_decoder(self, scene_graph, map_feat, past_seq_out, z,
+                                map_idx, map_env, map_tokens,
+                                ext_future=None, nfuture=None, sur_gt_replay=False):
+        """
+        Autoregressive decoder (Redesign).
 
-        :param scene_graph: must have .past (NA x PT x 6), .future (NA x FT x 6), .sem (NA x NC)
-                            .future_vis (NA x FT), and .lw (NA x 2) to encode.
+        6-step loop per timestep:
+        1. GCN → history buffer
+        2. History Attention (ego + sur)
+        3. Map Cross-Attention (ego + sur)
+        4. Intent Selection (ego only, Phase 2)
+        5. GRU + Output (ego + sur)
+        6. Scene graph update + bicycle model
+        """
+        NA = map_feat.size(0)
+        FT = self.FT if nfuture is None else nfuture
+        B = map_idx.size(0)
 
-        :return: NA x feat_dim
-        '''
-        NA, FT, _ = scene_graph.future.size()
-        PT = scene_graph.past.size(1)
-        # transform to local frame of last step of past
-        local_future_kin = transform2frame(scene_graph.past[:, -1, :4], scene_graph.future[:, :, :4])
-        local_future_traj = torch.cat([local_future_kin, scene_graph.future[:, :, 4:]], dim=2)
-        # zero out any frames that were not observed
-        local_future_traj[scene_graph.future_vis == 0.0] = 0.0
-        # and append the visibility to the state as input
-        local_future_traj = torch.cat([local_future_traj, scene_graph.future_vis.unsqueeze(-1)], dim=-1)
-        # also add vehicle attributes
-        veh_in_att = scene_graph.lw.unsqueeze(1).expand(NA, FT, self.att_feat_size)
-        encoder_in = torch.cat([local_future_traj, veh_in_att], dim=-1)
-        if self.traj_encoder_type == 'mlp':
-            # append semantic class too
-            encoder_in = torch.cat([encoder_in.view(NA, -1), scene_graph.sem], dim=1)
-        elif self.traj_encoder_type == 'gru':
-            encoder_in = torch.cat([encoder_in, scene_graph.sem.view(NA, 1, self.NC).expand(NA, FT, self.NC)], dim=2)
-        
-        # then encode
-        future_feat = self.future_encoder(encoder_in)
+        ego_inds = scene_graph.ptr[:-1]
+        ego_mask = self._get_ego_mask(scene_graph)
+        num_ego = int(ego_mask.sum())
+        num_sur = NA - num_ego
+        device = map_feat.device
 
-        if self.traj_encoder_type == 'gru':
-            future_feat = future_feat[0][:, -1, :] # only want output of last step
-            future_feat = self.future_out_layer(future_feat)
+        # Multi-sample check
+        zsize = z.size()
+        NS = None
+        mult_samp = len(zsize) == 3
+        if mult_samp:
+            NS = zsize[1]
 
-        return future_feat
+        # Initialize prev_state
+        prev_state = scene_graph.past[:, -1, :] if self.output_bicycle else scene_graph.past[:, -1, :4]
+
+        # Vehicle lengths for bicycle model
+        cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
+        cur_lw = scene_graph.lw
+        cur_sem = scene_graph.sem
+
+        # Map tokens: initial tokens (used for mult_samp fallback)
+        # For single-sample (training): re-cropped every step inside loop
+        # For mult_samp (inference): use initial tokens (re-crop too expensive)
+        ego_map_tokens = map_tokens[ego_mask]  # (num_ego, num_tokens, ch) or (num_ego, NS, ...)
+        sur_map_tokens = map_tokens[~ego_mask]
+
+        # z_global per agent type
+        z_ego = z[ego_mask]  # (num_ego, z_size) or (num_ego, NS, z_size)
+        z_sur = z[~ego_mask]
+
+        # Pre-allocate history buffers
+        ego_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
+        sur_history_buffer = torch.zeros(num_sur, FT, self.d_model, device=device)
+
+        # Initialize GRU hidden states via warmup
+        ego_gru_hidden = self._warmup_gru_hidden(
+            scene_graph, ego_mask, is_ego=True, gt_future=None, target_t=0)
+        sur_gru_hidden = self._warmup_gru_hidden(
+            scene_graph, ego_mask, is_ego=False, gt_future=None, target_t=0)
+
+        # Handle multi-sample expansion
+        if mult_samp:
+            prev_state = prev_state.unsqueeze(1).expand(NA, NS, -1).reshape(NA * NS, -1)
+            cur_veh_len = cur_veh_len.unsqueeze(1).expand(NA, NS, 1).reshape(NA * NS, 1)
+            ego_gru_hidden = ego_gru_hidden.unsqueeze(2).expand(-1, -1, NS, -1).contiguous().reshape(3, num_ego * NS, self.d_model)
+            sur_gru_hidden = sur_gru_hidden.unsqueeze(2).expand(-1, -1, NS, -1).contiguous().reshape(3, num_sur * NS, self.d_model)
+            ego_map_tokens = ego_map_tokens.unsqueeze(1).expand(-1, NS, -1, -1).reshape(num_ego * NS, self.map_num_tokens, self.map_token_ch)
+            sur_map_tokens = sur_map_tokens.unsqueeze(1).expand(-1, NS, -1, -1).reshape(num_sur * NS, self.map_num_tokens, self.map_token_ch)
+            ego_history_buffer = ego_history_buffer.unsqueeze(1).expand(-1, NS, -1, -1).reshape(num_ego * NS, FT, self.d_model).contiguous()
+            sur_history_buffer = sur_history_buffer.unsqueeze(1).expand(-1, NS, -1, -1).reshape(num_sur * NS, FT, self.d_model).contiguous()
+            z_ego = z_ego.reshape(num_ego * NS, self.z_size)
+            z_sur = z_sur.reshape(num_sur * NS, self.z_size)
+            if ext_future is not None:
+                ext_future = ext_future.unsqueeze(1).expand(NA, NS, -1, 4).reshape(NA * NS, -1, 4)
+            scene_graph.pos = scene_graph.past[:, -1, :4].unsqueeze(1).expand(NA, NS, -1)
+
+        # Initialize analysis storage
+        self._z_local_outputs = []
+        self._intent_weights_outputs = []
+        self._ego_map_attn_weights_outputs = []
+        self._sur_map_attn_weights_outputs = []
+        self._sur_pred_outputs = []
+        self._ego_pred_outputs = []
+
+        traj_dim = 4  # global state dim (x, y, heading, speed or similar)
+        if mult_samp:
+            traj_out = torch.zeros(NA * NS, FT, traj_dim, device=device)
+        else:
+            traj_out = torch.zeros(NA, FT, traj_dim, device=device)
+
+        for t in range(FT):
+            # ============================================================
+            # STEP 1: GCN → History Buffer
+            # ============================================================
+            cur_state_6d = self._get_6d_state(prev_state, mult_samp, NA, NS)
+
+            if mult_samp:
+                cur_state_for_gcn = cur_state_6d.reshape(NA, NS, -1)
+                gcn_in = torch.cat([cur_state_for_gcn,
+                                    cur_lw.unsqueeze(1).expand(-1, NS, -1),
+                                    cur_sem.unsqueeze(1).expand(-1, NS, -1)], dim=-1)
+                scene_graph.x = gcn_in
+                scene_graph.pos = cur_state_for_gcn[..., :4]
+            else:
+                gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
+                scene_graph.x = gcn_in
+                scene_graph.pos = cur_state_6d[:, :4]
+
+            ego_gcn_feat, sur_gcn_feat = self.interaction_gcn(scene_graph, ego_mask)
+            # ego_gcn_feat: (num_ego, D) or (num_ego, NS, D)
+            # sur_gcn_feat: (num_sur, D) or (num_sur, NS, D)
+
+            if mult_samp:
+                ego_gcn_feat_flat = ego_gcn_feat.reshape(num_ego * NS, self.d_model)
+                sur_gcn_feat_flat = sur_gcn_feat.reshape(num_sur * NS, self.d_model)
+            else:
+                ego_gcn_feat_flat = ego_gcn_feat
+                sur_gcn_feat_flat = sur_gcn_feat
+
+            # In-place history buffer update
+            ego_history_buffer[:, t, :] = ego_gcn_feat_flat
+            sur_history_buffer[:, t, :] = sur_gcn_feat_flat
+
+            # ============================================================
+            # STEP 2: History Attention
+            # ============================================================
+            ego_gru_h_last = ego_gru_hidden[-1]  # (num_ego[*NS], D)
+            sur_gru_h_last = sur_gru_hidden[-1]
+
+            ego_hist_ctx = self.ego_history_attn(ego_gru_h_last, ego_history_buffer, t)  # (num_ego[*NS], D)
+            sur_hist_ctx = self.sur_history_attn(sur_gru_h_last, sur_history_buffer, t)
+
+            # Auxiliary: predicted sur delta from ego history context
+            predicted_sur_delta = self.sur_pred_head(ego_hist_ctx)  # (num_ego[*NS], sur_pred_dim)
+            predicted_ego_delta = self.ego_pred_head(sur_hist_ctx)  # (num_sur[*NS], sur_pred_dim)
+
+            self._sur_pred_outputs.append(predicted_sur_delta.detach())
+            self._ego_pred_outputs.append(predicted_ego_delta.detach())
+
+            # ============================================================
+            # STEP 3: Map Cross-Attention
+            # ============================================================
+            if self.map_recrop and not mult_samp:
+                cur_map_tokens = self._recompute_map_tokens(
+                    cur_state_6d[:, :4], map_idx, map_env, scene_graph)
+                ego_map_tokens = cur_map_tokens[ego_mask]
+                sur_map_tokens = cur_map_tokens[~ego_mask]
+
+            ego_map_ctx, ego_map_attn_w = self.ego_map_attn(ego_gru_h_last, ego_map_tokens)
+            sur_map_ctx, sur_map_attn_w = self.sur_map_attn(sur_gru_h_last, sur_map_tokens)
+
+            self._ego_map_attn_weights_outputs.append(ego_map_attn_w)
+            self._sur_map_attn_weights_outputs.append(sur_map_attn_w)
+
+            # ============================================================
+            # STEP 4: Intent Selection (ego only)
+            # ============================================================
+            if mult_samp:
+                ego_state_for_intent = cur_state_6d.reshape(NA, NS, -1)[ego_mask].reshape(num_ego * NS, -1)
+            else:
+                ego_state_for_intent = cur_state_6d[ego_mask]
+
+            intent_input = torch.cat([
+                ego_state_for_intent,
+                predicted_sur_delta,
+                ego_map_ctx.detach(),  # detach: prevent intent CE from affecting map attn
+            ], dim=-1)
+
+            z_local, intent_weights = self.intent_codebook(
+                intent_input, temperature=self.gumbel_temperature, phase=self.phase)
+
+            if not self.use_z_local:
+                z_local = torch.zeros_like(z_local)
+
+            self._z_local_outputs.append(z_local.detach())
+            self._intent_weights_outputs.append(intent_weights.detach())
+
+            # ============================================================
+            # STEP 5: GRU + Output
+            # ============================================================
+            if mult_samp:
+                ego_lw_flat = cur_lw[ego_mask].unsqueeze(1).expand(-1, NS, -1).reshape(num_ego * NS, -1)
+                ego_sem_flat = cur_sem[ego_mask].unsqueeze(1).expand(-1, NS, -1).reshape(num_ego * NS, -1)
+                sur_lw_flat = cur_lw[~ego_mask].unsqueeze(1).expand(-1, NS, -1).reshape(num_sur * NS, -1)
+                sur_sem_flat = cur_sem[~ego_mask].unsqueeze(1).expand(-1, NS, -1).reshape(num_sur * NS, -1)
+            else:
+                ego_lw_flat = cur_lw[ego_mask]
+                ego_sem_flat = cur_sem[ego_mask]
+                sur_lw_flat = cur_lw[~ego_mask]
+                sur_sem_flat = cur_sem[~ego_mask]
+
+            # Ego GRU
+            ego_gru_in = torch.cat([
+                ego_hist_ctx, ego_map_ctx, z_ego, z_local, ego_lw_flat, ego_sem_flat
+            ], dim=-1).unsqueeze(1)  # (num_ego[*NS], 1, ego_gru_in_size)
+
+            ego_gru_out, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
+            ego_traj_out = self.ego_output_head(ego_gru_out[:, 0])  # (num_ego[*NS], traj_out_size)
+
+            # Sur GRU
+            sur_gru_in = torch.cat([
+                sur_hist_ctx, sur_map_ctx, z_sur, sur_lw_flat, sur_sem_flat
+            ], dim=-1).unsqueeze(1)
+
+            sur_gru_out, sur_gru_hidden = self.sur_decoder_gru(sur_gru_in, sur_gru_hidden)
+            sur_traj_out = self.sur_output_head(sur_gru_out[:, 0])
+
+            # ============================================================
+            # STEP 6: Merge + Bicycle Model + State Update
+            # ============================================================
+            if mult_samp:
+                ego_traj_out = ego_traj_out.reshape(num_ego, NS, -1)
+                sur_traj_out = sur_traj_out.reshape(num_sur, NS, -1)
+
+            decoder_out = self._merge_ego_other_feat(ego_traj_out, sur_traj_out, ego_mask)
+
+            if mult_samp:
+                decoder_out = decoder_out.reshape(NA * NS, -1)
+
+            cur_state_global, cur_state_local, cur_bike_state = self._apply_dynamics(
+                decoder_out, prev_state, cur_veh_len, NA, NS, mult_samp)
+
+            # Handle external future
+            if ext_future is not None:
+                cur_state_global = cur_state_global.clone()
+                if mult_samp:
+                    ext_ego_inds = ego_inds.unsqueeze(1).expand(B, NS).reshape(B * NS)
+                    cur_state_global[ext_ego_inds] = ext_future[:, t]
+                else:
+                    cur_state_global[ego_inds] = ext_future[:, t]
+                cur_state_local = cur_state_local.clone()
+                if mult_samp:
+                    cur_state_local[ext_ego_inds] = transform2frame(
+                        prev_state[ext_ego_inds][:, :4], cur_state_global[ext_ego_inds].unsqueeze(1))[:, 0, :]
+                else:
+                    cur_state_local[ego_inds] = transform2frame(
+                        prev_state[ego_inds][:, :4], cur_state_global[ego_inds].unsqueeze(1))[:, 0, :]
+
+            # Handle sur GT replay
+            if sur_gt_replay and hasattr(scene_graph, 'future_gt'):
+                cur_state_global, cur_state_local, cur_bike_state = self._apply_sur_gt_replay(
+                    scene_graph, cur_state_global, cur_state_local, cur_bike_state,
+                    prev_state, ego_mask, t, mult_samp, NA, NS, num_sur)
+
+            traj_out[:, t, :] = cur_state_global
+
+            # Update prev_state
+            if self.output_bicycle and cur_bike_state is not None:
+                prev_state = cur_bike_state
+            else:
+                prev_state = cur_state_global
+
+            # Update scene_graph.pos for next step GCN
+            if t < FT - 1:
+                if mult_samp:
+                    scene_graph.pos = cur_state_global.detach().reshape(NA, NS, -1)
+                else:
+                    scene_graph.pos = cur_state_global.detach()
+
+        if mult_samp:
+            traj_out = traj_out.reshape(NA, NS, FT, traj_dim)
+        return traj_out
+
+    def teacher_forcing_decoder(self, scene_graph, map_feat, past_seq_out, z,
+                                 map_idx, map_env, map_tokens, tf_segment_len=3):
+        """
+        Dual-loop Teacher Forcing decoder (Redesign).
+
+        Loop 1: Sur (ego=GT, sur=autoregressive with new decoder)
+        Loop 2: Ego (sur=GT, ego=TF segmented with new decoder)
+
+        Returns: list of FT segments for loss computation
+        """
+        NA = map_feat.size(0)
+        FT = self.FT
+        B = map_idx.size(0)
+
+        ego_mask = self._get_ego_mask(scene_graph)
+        num_ego = int(ego_mask.sum())
+        num_sur = NA - num_ego
+        device = map_feat.device
+
+        gt_future = scene_graph.future_gt[:, :, :]
+
+        # Initialize analysis storage
+        self._z_local_outputs = []
+        self._intent_weights_outputs = []
+        self._ego_map_attn_weights_outputs = []
+        self._sur_map_attn_weights_outputs = []
+        self._sur_pred_outputs = []
+        self._ego_pred_outputs = []
+
+        # Map tokens
+        ego_map_tokens = map_tokens[ego_mask]
+        sur_map_tokens = map_tokens[~ego_mask]
+
+        # z_global
+        z_ego = z[ego_mask]
+        z_sur = z[~ego_mask]
+
+        cur_lw = scene_graph.lw
+        cur_sem = scene_graph.sem
+        cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
+
+        # ====================================================================
+        # Loop 1: Sur prediction (ego=GT, sur=autoregressive)
+        # ====================================================================
+        sur_traj_all = self._sur_loop_decoder(
+            scene_graph, z_sur, ego_mask, gt_future,
+            sur_map_tokens, cur_lw, cur_sem, cur_veh_len,
+            map_idx, map_env)
+
+        # ====================================================================
+        # Loop 2: Ego prediction (sur=GT, ego=TF segmented)
+        # ====================================================================
+        ego_segments = self._ego_loop_decoder(
+            scene_graph, z_ego, ego_mask, gt_future,
+            ego_map_tokens, cur_lw, cur_sem, cur_veh_len, tf_segment_len,
+            map_idx, map_env)
+
+        # ====================================================================
+        # Merge
+        # ====================================================================
+        all_segment_preds = []
+        for seg_idx, ego_seg in enumerate(ego_segments):
+            segment_preds = []
+            for step, ego_pred in enumerate(ego_seg):
+                actual_t = seg_idx + step
+                if actual_t >= FT:
+                    break
+                full_pred = torch.zeros(NA, 4, device=device)
+                full_pred[ego_mask] = ego_pred
+                full_pred[~ego_mask] = sur_traj_all[:, actual_t, :]
+                segment_preds.append(full_pred)
+            all_segment_preds.append(segment_preds)
+
+        return all_segment_preds
+
+    def _sur_loop_decoder(self, scene_graph, z_sur, ego_mask, gt_future,
+                              sur_map_tokens, cur_lw, cur_sem, cur_veh_len,
+                              map_idx=None, map_env=None):
+        """Sur loop: ego=GT fixed, sur=autoregressive with new symmetric decoder."""
+        NA = ego_mask.size(0)
+        FT = self.FT
+        num_ego = int(ego_mask.sum())
+        num_sur = NA - num_ego
+        device = z_sur.device
+
+        # Pre-allocate
+        sur_history_buffer = torch.zeros(num_sur, FT, self.d_model, device=device)
+        sur_traj_all = torch.zeros(num_sur, FT, 4, device=device)
+
+        # Init GRU hidden via warmup
+        sur_gru_hidden = self._warmup_gru_hidden(scene_graph, ego_mask, is_ego=False, gt_future=None, target_t=0)
+
+        # Init prev_state (full NA, needed for GCN)
+        sur_prev_state = scene_graph.past[:, -1, :] if self.output_bicycle else scene_graph.past[:, -1, :4]
+
+        for t in range(FT):
+            # Build combined position: ego=GT, sur=predicted/initial
+            combined_state = sur_prev_state.clone()
+            if t == 0:
+                ego_gt_state = scene_graph.past[:, -1, :][ego_mask]
+            else:
+                ego_gt_state = gt_future[:, t - 1, :][ego_mask]
+            combined_state[ego_mask] = ego_gt_state
+
+            # GCN on combined state
+            cur_state_6d = combined_state if combined_state.size(-1) >= 6 else \
+                torch.cat([combined_state, torch.zeros(NA, 6 - combined_state.size(-1), device=device)], dim=-1)
+            gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
+            scene_graph.x = gcn_in
+            scene_graph.pos = cur_state_6d[:, :4]
+            _, sur_gcn_feat = self.interaction_gcn(scene_graph, ego_mask)
+
+            # History buffer
+            sur_history_buffer[:, t, :] = sur_gcn_feat
+
+            # History Attention
+            sur_gru_h_last = sur_gru_hidden[-1]
+            sur_hist_ctx = self.sur_history_attn(sur_gru_h_last, sur_history_buffer, t)
+
+            # Auxiliary: ego prediction from sur history context
+            predicted_ego_delta = self.ego_pred_head(sur_hist_ctx)
+            self._ego_pred_outputs.append(predicted_ego_delta.detach())
+
+            # Re-crop map tokens at current positions (if enabled)
+            if self.map_recrop and map_idx is not None and map_env is not None:
+                cur_map_tokens = self._recompute_map_tokens(
+                    cur_state_6d[:, :4], map_idx, map_env, scene_graph)
+                sur_map_tokens = cur_map_tokens[~ego_mask]
+
+            # Map Attention
+            sur_map_ctx, sur_map_attn_w = self.sur_map_attn(sur_gru_h_last, sur_map_tokens)
+            self._sur_map_attn_weights_outputs.append(sur_map_attn_w)
+
+            # Sur GRU
+            sur_lw_flat = cur_lw[~ego_mask]
+            sur_sem_flat = cur_sem[~ego_mask]
+            sur_gru_in = torch.cat([sur_hist_ctx, sur_map_ctx, z_sur, sur_lw_flat, sur_sem_flat], dim=-1).unsqueeze(1)
+            sur_gru_out, sur_gru_hidden = self.sur_decoder_gru(sur_gru_in, sur_gru_hidden)
+            sur_traj_step = self.sur_output_head(sur_gru_out[:, 0])
+
+            # Bicycle model for sur
+            sur_prev = sur_prev_state[~ego_mask]
+            sur_state_global, sur_bike_state = self._apply_dynamics_single(
+                sur_traj_step, sur_prev, cur_veh_len[~ego_mask])
+
+            sur_traj_all[:, t, :] = sur_state_global
+
+            # Update states
+            if t < FT - 1:
+                new_prev = sur_prev_state.clone()
+                if self.output_bicycle and sur_bike_state is not None:
+                    new_prev[~ego_mask] = sur_bike_state
+                else:
+                    # Pad to 6d for next step
+                    if sur_state_global.size(-1) < 6:
+                        new_prev[~ego_mask, :4] = sur_state_global
+                    else:
+                        new_prev[~ego_mask] = sur_state_global
+                ego_gt_next = gt_future[:, t, :][ego_mask]
+                new_prev[ego_mask] = ego_gt_next
+                sur_prev_state = new_prev
+
+        return sur_traj_all  # (num_sur, FT, 4)
+
+    def _ego_loop_decoder(self, scene_graph, z_ego, ego_mask, gt_future,
+                              ego_map_tokens, cur_lw, cur_sem, cur_veh_len, tf_segment_len,
+                              map_idx=None, map_env=None):
+        """Ego loop: sur=GT fixed, ego=TF segmented (sliding window).
+
+        Sliding window: segment_len=3, FT=12 → segments at target_t=0,1,...,9
+        Each segment: step 0 uses GT GCN cache, steps 1+ use predicted position.
+
+        구조:
+        Step A: GT GCN 사전계산 (future FT)
+        Step B: GT forward pass → 매 시점 decoder GRU hidden 스냅샷 저장 (no_grad)
+        Step C: Sliding window — segment 경계에서 GT 상태 복원, 내에서만 예측 누적
+
+        Segment 경계 리셋: ego position, history buffer, GRU hidden 모두 GT 복원
+        Segment 내부: 예측 기반 position/history/hidden 누적
+        """
+        NA = ego_mask.size(0)
+        FT = self.FT
+        num_ego = int(ego_mask.sum())
+        device = z_ego.device
+
+        # ================================================================
+        # Step A: Pre-compute GT GCN features for future FT timesteps
+        # ================================================================
+        gt_gcn_cache = torch.zeros(num_ego, FT, self.d_model, device=device)
+        for t in range(FT):
+            if t == 0:
+                gt_state = scene_graph.past[:, -1, :]
+            else:
+                gt_state = gt_future[:, t - 1, :]
+
+            cur_state_6d = gt_state if gt_state.size(-1) >= 6 else \
+                torch.cat([gt_state, torch.zeros(NA, 6 - gt_state.size(-1), device=device)], dim=-1)
+            gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
+            scene_graph.x = gcn_in
+            scene_graph.pos = cur_state_6d[:, :4]
+            ego_gcn_feat, _ = self.interaction_gcn(scene_graph, ego_mask)
+            gt_gcn_cache[:, t, :] = ego_gcn_feat
+
+        # Also pre-compute GT map tokens if re-crop enabled
+        gt_map_tokens_cache = None
+        if self.map_recrop and map_idx is not None and map_env is not None:
+            gt_map_tokens_cache = []
+            for t in range(FT):
+                if t == 0:
+                    gt_pos = scene_graph.past[:, -1, :4]
+                else:
+                    gt_pos = gt_future[:, t - 1, :4]
+                cur_map_tokens = self._recompute_map_tokens(
+                    gt_pos, map_idx, map_env, scene_graph)
+                gt_map_tokens_cache.append(cur_map_tokens[ego_mask])
+
+        # ================================================================
+        # Step B: GT forward pass → hidden 스냅샷 저장 (no_grad)
+        # warmup 1회 후, 매 스텝 GT 기반 full pipeline으로 decoder GRU hidden 누적
+        # 각 시점의 hidden을 저장해두고, segment 시작 시 복원
+        # loss에 직접 기여하지 않으므로 gradient 불필요
+        # ================================================================
+        with torch.no_grad():
+            ego_gru_hidden = self._warmup_gru_hidden(
+                scene_graph, ego_mask, is_ego=True, gt_future=gt_future, target_t=0)
+
+            gt_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
+            gt_hidden_snapshots = [ego_gru_hidden.clone()]
+
+            for t in range(FT):
+                gt_history_buffer[:, t, :] = gt_gcn_cache[:, t, :]
+
+                ego_gru_h_last = ego_gru_hidden[-1]
+                ego_hist_ctx = self.ego_history_attn(ego_gru_h_last, gt_history_buffer, t)
+
+                predicted_sur_delta = self.sur_pred_head(ego_hist_ctx)
+
+                cur_ego_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else ego_map_tokens
+                ego_map_ctx, _ = self.ego_map_attn(ego_gru_h_last, cur_ego_map_tokens)
+
+                if t == 0:
+                    ego_state_for_intent = scene_graph.past[:, -1, :][ego_mask]
+                else:
+                    ego_state_for_intent = gt_future[:, t - 1, :][ego_mask]
+                if ego_state_for_intent.size(-1) < 6:
+                    ego_state_for_intent = torch.cat([ego_state_for_intent,
+                        torch.zeros(num_ego, 6 - ego_state_for_intent.size(-1), device=device)], dim=-1)
+
+                intent_input = torch.cat([ego_state_for_intent, predicted_sur_delta, ego_map_ctx.detach()], dim=-1)
+                z_local, _ = self.intent_codebook(intent_input, self.gumbel_temperature, self.phase)
+                if not self.use_z_local:
+                    z_local = torch.zeros_like(z_local)
+
+                ego_lw_flat = cur_lw[ego_mask]
+                ego_sem_flat = cur_sem[ego_mask]
+                ego_gru_in = torch.cat([
+                    ego_hist_ctx, ego_map_ctx, z_ego, z_local, ego_lw_flat, ego_sem_flat
+                ], dim=-1).unsqueeze(1)
+
+                _, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
+                gt_hidden_snapshots.append(ego_gru_hidden.clone())
+
+        # ================================================================
+        # Step C: Sliding window segments
+        # segment 시작 시 GT hidden/history/position 복원
+        # segment 내에서만 예측 기반 누적
+        # ================================================================
+        ego_segments = []
+        ego_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
+
+        for target_t in range(FT):
+            if target_t + tf_segment_len > FT:
+                break
+
+            # TF: segment 경계에서 모든 상태를 GT 기반으로 리셋
+            # 1) ego position → GT
+            if target_t == 0:
+                ego_prev_state = scene_graph.past[:, -1, :][ego_mask] if self.output_bicycle else scene_graph.past[:, -1, :4][ego_mask]
+            else:
+                ego_prev_state = gt_future[:, target_t - 1, :][ego_mask] if self.output_bicycle else gt_future[:, target_t - 1, :4][ego_mask]
+
+            # 2) history buffer → GT GCN 캐시로 교정 (0~target_t)
+            ego_history_buffer[:, :target_t + 1, :] = gt_gcn_cache[:, :target_t + 1, :]
+
+            # 3) GRU hidden → GT 스냅샷 복원
+            ego_gru_hidden = gt_hidden_snapshots[target_t].clone()
+
+            segment_preds = []
+
+            for step in range(tf_segment_len):
+                actual_t = target_t + step
+                if actual_t >= FT:
+                    break
+
+                if step == 0:
+                    # Step 0: use cached GT GCN feature
+                    ego_gcn_feat = gt_gcn_cache[:, actual_t, :]
+                    cur_ego_map_tokens = gt_map_tokens_cache[actual_t] if gt_map_tokens_cache is not None else ego_map_tokens
+                else:
+                    # Step 1+: ego at predicted position, sur at GT → new GCN
+                    sur_gt_state = gt_future[:, actual_t - 1, :][~ego_mask]
+                    combined_state = torch.zeros(NA, ego_prev_state.size(-1), device=device)
+                    combined_state[ego_mask] = ego_prev_state
+                    combined_state[~ego_mask] = sur_gt_state
+                    cur_state_6d = combined_state if combined_state.size(-1) >= 6 else \
+                        torch.cat([combined_state, torch.zeros(NA, 6 - combined_state.size(-1), device=device)], dim=-1)
+                    gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
+                    scene_graph.x = gcn_in
+                    scene_graph.pos = cur_state_6d[:, :4]
+                    ego_gcn_feat, _ = self.interaction_gcn(scene_graph, ego_mask)
+
+                    # Re-crop map tokens at predicted position (if enabled)
+                    if self.map_recrop and map_idx is not None and map_env is not None:
+                        cur_map_tokens = self._recompute_map_tokens(
+                            cur_state_6d[:, :4], map_idx, map_env, scene_graph)
+                        cur_ego_map_tokens = cur_map_tokens[ego_mask]
+                    else:
+                        cur_ego_map_tokens = ego_map_tokens
+
+                # History buffer
+                ego_history_buffer[:, actual_t, :] = ego_gcn_feat
+
+                # History Attention
+                ego_gru_h_last = ego_gru_hidden[-1]
+                ego_hist_ctx = self.ego_history_attn(ego_gru_h_last, ego_history_buffer, actual_t)
+
+                # Auxiliary: sur prediction
+                predicted_sur_delta = self.sur_pred_head(ego_hist_ctx)
+                if step == 0:
+                    self._sur_pred_outputs.append(predicted_sur_delta.detach())
+
+                # Map Attention
+                ego_map_ctx, ego_map_attn_w = self.ego_map_attn(ego_gru_h_last, cur_ego_map_tokens)
+                if step == 0:
+                    self._ego_map_attn_weights_outputs.append(ego_map_attn_w)
+
+                # Intent
+                if step == 0:
+                    if actual_t == 0:
+                        ego_state_for_intent = scene_graph.past[:, -1, :][ego_mask]
+                    else:
+                        ego_state_for_intent = gt_future[:, actual_t - 1, :][ego_mask]
+                else:
+                    ego_state_for_intent = ego_prev_state
+
+                if ego_state_for_intent.size(-1) < 6:
+                    ego_state_for_intent = torch.cat([ego_state_for_intent,
+                        torch.zeros(num_ego, 6 - ego_state_for_intent.size(-1), device=device)], dim=-1)
+
+                intent_input = torch.cat([ego_state_for_intent, predicted_sur_delta, ego_map_ctx.detach()], dim=-1)
+                z_local, intent_weights = self.intent_codebook(intent_input, self.gumbel_temperature, self.phase)
+
+                if not self.use_z_local:
+                    z_local = torch.zeros_like(z_local)
+
+                if step == 0:
+                    self._z_local_outputs.append(z_local.detach())
+                    self._intent_weights_outputs.append(intent_weights.detach())
+
+                # Ego GRU
+                ego_lw_flat = cur_lw[ego_mask]
+                ego_sem_flat = cur_sem[ego_mask]
+                ego_gru_in = torch.cat([
+                    ego_hist_ctx, ego_map_ctx, z_ego, z_local, ego_lw_flat, ego_sem_flat
+                ], dim=-1).unsqueeze(1)
+
+                ego_gru_out, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
+                ego_traj_out = self.ego_output_head(ego_gru_out[:, 0])
+
+                # Bicycle model
+                ego_state_global, ego_bike_state = self._apply_dynamics_single(
+                    ego_traj_out, ego_prev_state, cur_veh_len[ego_mask])
+
+                segment_preds.append(ego_state_global)
+
+                # Update ego state for next step within segment
+                if step < tf_segment_len - 1 and actual_t < FT - 1:
+                    if self.output_bicycle and ego_bike_state is not None:
+                        ego_prev_state = ego_bike_state
+                    else:
+                        ego_prev_state = ego_state_global
+
+            ego_segments.append(segment_preds)
+
+        return ego_segments
+
+    # ============================================================
+    # Dynamics helpers
+    # ============================================================
+
+    def _get_6d_state(self, prev_state, mult_samp, NA, NS):
+        """Get 6-dim state (pad if needed)."""
+        if prev_state.size(-1) >= 6:
+            return prev_state
+        pad = torch.zeros(prev_state.size(0), 6 - prev_state.size(-1), device=prev_state.device)
+        return torch.cat([prev_state, pad], dim=-1)
+
+    def _apply_dynamics(self, decoder_out, prev_state, cur_veh_len, NA, NS, mult_samp):
+        """Apply bicycle model and return (global_state, local_state, bike_state)."""
+        bsize = NA if not mult_samp else NA * NS
+
+        if self.output_bicycle:
+            dynamics_out = decoder_out.view(bsize, 1, 1, 2)
+            a_out = dynamics_out[:, :, :, 0] * self.bicycle_params['a_stats'][1] + self.bicycle_params['a_stats'][0]
+            ddh_out = dynamics_out[:, :, :, 1] * self.bicycle_params['ddh_stats'][1] + self.bicycle_params['ddh_stats'][0]
+            init_state = self.normalizer.unnormalize(prev_state)
+            cur_bike_state = self.sim_traj(init_state.unsqueeze(1), a_out, ddh_out, cur_veh_len)[:, 0, 0]
+            cur_bike_state = self.normalizer.normalize(cur_bike_state)
+            cur_state_global = cur_bike_state[:, :4]
+            cur_state_local = transform2frame(prev_state[:, :4], cur_state_global.unsqueeze(1))[:, 0]
+            return cur_state_global, cur_state_local, cur_bike_state
+        else:
+            heading_mag = torch.norm(decoder_out[:, 2:], dim=-1, keepdim=True)
+            cur_state_local = torch.cat([decoder_out[:, :2], decoder_out[:, 2:] / heading_mag], dim=-1)
+            cur_state_global = transform2frame(prev_state, cur_state_local.unsqueeze(1), inverse=True)[:, 0, :]
+            return cur_state_global, cur_state_local, None
+
+    def _apply_dynamics_single(self, traj_out, prev_state, veh_len):
+        """Apply dynamics for a single agent group (ego or sur only)."""
+        N = traj_out.size(0)
+        if self.output_bicycle:
+            dynamics_out = traj_out.view(N, 1, 1, 2)
+            a_out = dynamics_out[:, :, :, 0] * self.bicycle_params['a_stats'][1] + self.bicycle_params['a_stats'][0]
+            ddh_out = dynamics_out[:, :, :, 1] * self.bicycle_params['ddh_stats'][1] + self.bicycle_params['ddh_stats'][0]
+            init_state = self.normalizer.unnormalize(prev_state)
+            bike_state = self.sim_traj(init_state.unsqueeze(1), a_out, ddh_out, veh_len)[:, 0, 0]
+            bike_state = self.normalizer.normalize(bike_state)
+            state_global = bike_state[:, :4]
+            return state_global, bike_state
+        else:
+            heading_mag = torch.norm(traj_out[:, 2:], dim=-1, keepdim=True).clamp(min=1e-6)
+            state_local = torch.cat([traj_out[:, :2], traj_out[:, 2:] / heading_mag], dim=-1)
+            state_global = transform2frame(prev_state, state_local.unsqueeze(1), inverse=True)[:, 0, :]
+            return state_global, None
+
+    def _apply_sur_gt_replay(self, scene_graph, cur_state_global, cur_state_local, cur_bike_state,
+                              prev_state, ego_mask, t, mult_samp, NA, NS, num_sur):
+        """Override sur predictions with GT future for testing."""
+        gt_future = scene_graph.future_gt
+        sur_gt_state = gt_future[:, t, :4][~ego_mask]
+        cur_state_global = cur_state_global.clone()
+        cur_state_local = cur_state_local.clone()
+
+        if mult_samp:
+            cur_state_global_reshaped = cur_state_global.reshape(NA, NS, -1)
+            cur_state_global_reshaped[~ego_mask] = sur_gt_state.unsqueeze(1).expand(-1, NS, -1)
+            cur_state_global = cur_state_global_reshaped.reshape(NA * NS, -1)
+            cur_state_local_reshaped = cur_state_local.reshape(NA, NS, -1)
+            sur_prev = prev_state.reshape(NA, NS, -1)[~ego_mask].reshape(num_sur * NS, -1)
+            sur_gt_expanded = sur_gt_state.unsqueeze(1).expand(-1, NS, -1).reshape(num_sur * NS, -1)
+            sur_local = transform2frame(sur_prev[:, :4], sur_gt_expanded.unsqueeze(1))[:, 0, :]
+            cur_state_local_reshaped[~ego_mask] = sur_local.reshape(num_sur, NS, -1)
+            cur_state_local = cur_state_local_reshaped.reshape(NA * NS, -1)
+        else:
+            cur_state_global[~ego_mask] = sur_gt_state
+            sur_prev = prev_state[~ego_mask]
+            cur_state_local[~ego_mask] = transform2frame(sur_prev[:, :4], sur_gt_state.unsqueeze(1))[:, 0, :]
+
+        if self.output_bicycle and cur_bike_state is not None:
+            sur_gt_6d = gt_future[:, t, :][~ego_mask]
+            cur_bike_state = cur_bike_state.clone()
+            if mult_samp:
+                cur_bike_state_reshaped = cur_bike_state.reshape(NA, NS, -1)
+                cur_bike_state_reshaped[~ego_mask] = sur_gt_6d.unsqueeze(1).expand(-1, NS, -1)
+                cur_bike_state = cur_bike_state_reshaped.reshape(NA * NS, -1)
+            else:
+                cur_bike_state[~ego_mask] = sur_gt_6d
+
+        return cur_state_global, cur_state_local, cur_bike_state
+
+    # ============================================================
+    # Warmup & utility methods
+    # ============================================================
+
+    def _warmup_gru_hidden(self, scene_graph, ego_mask, is_ego, gt_future=None, target_t=0):
+        """
+        Warm-up GRU hidden state using past (+ GT future if TF mode).
+        Uses interaction_gcn (same as decode loop) for consistency.
+
+        :param is_ego: True for ego warmup, False for sur warmup
+        :return: gru_hidden (3, N_agent, D)
+        """
+        NA = ego_mask.size(0)
+        device = scene_graph.past.device
+        cur_lw = scene_graph.lw
+        cur_sem = scene_graph.sem
+
+        gcn_features = []
+
+        for pt in range(self.PT):
+            t_window = target_t - self.PT + pt
+
+            if t_window < 0:
+                cur_state = scene_graph.past[:, self.PT + t_window, :]
+            else:
+                cur_state = gt_future[:, t_window, :]
+
+            cur_state_6d = cur_state if cur_state.size(-1) >= 6 else \
+                torch.cat([cur_state, torch.zeros(NA, 6 - cur_state.size(-1), device=device)], dim=-1)
+            gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
+            scene_graph.x = gcn_in
+            scene_graph.pos = cur_state_6d[:, :4]
+
+            ego_feat_t, sur_feat_t = self.interaction_gcn(scene_graph, ego_mask)
+            if is_ego:
+                gcn_features.append(ego_feat_t)
+            else:
+                gcn_features.append(sur_feat_t)
+
+        sequence = torch.stack(gcn_features, dim=1)  # (N_agent, PT, D)
+
+        if is_ego:
+            _, gru_hidden = self.ego_warmup_gru(sequence)
+        else:
+            _, gru_hidden = self.sur_warmup_gru(sequence)
+
+        return gru_hidden
 
     def _get_ego_mask(self, scene_graph):
-        """
-        Create boolean mask for ego agents.
-        Ego is always the first agent in each batch (at ptr[:-1] indices).
-
-        :param scene_graph: pytorch geom Batch of graphs
-        :return: (NA,) boolean tensor, True for ego agents
-        """
-        NA = scene_graph.x.size(0)
-        ego_mask = torch.zeros(NA, dtype=torch.bool, device=scene_graph.x.device)
+        """Boolean mask for ego agents (first in each batch)."""
+        NA = scene_graph.x.size(0) if hasattr(scene_graph, 'x') and scene_graph.x is not None else scene_graph.past.size(0)
+        ego_mask = torch.zeros(NA, dtype=torch.bool, device=scene_graph.past.device)
         ego_inds = scene_graph.ptr[:-1]
         ego_mask[ego_inds] = True
         return ego_mask
 
     def _merge_ego_other_feat(self, ego_feat, other_feat, ego_mask):
-        """
-        Merge ego and other features back into (NA, D) or (NA, NS, D) tensor.
-
-        :param ego_feat: (num_ego, D) or (num_ego, NS, D)
-        :param other_feat: (num_other, D) or (num_other, NS, D)
-        :param ego_mask: (NA,) boolean tensor
-        :return: (NA, D) or (NA, NS, D) merged features
-        """
+        """Merge ego and other features back into (NA, ...) tensor."""
         NA = ego_mask.size(0)
         device = ego_feat.device
 
-        # Handle multi-sample case: (num_ego, NS, D)
         if len(ego_feat.size()) == 3:
             NS = ego_feat.size(1)
             D = ego_feat.size(-1)
@@ -819,1196 +1496,98 @@ class TrafficPlannerModel(nn.Module):
             merged[~ego_mask] = other_feat
         return merged
 
-    def encoder(self, scene_graph, map_feat, past_context):
-        '''
-        Posterior: future trajectory → per-step GCN → PE → Transformer → context → z_global
-
-        :param scene_graph: pytorch geom Batch of graphs
-        :param map_feat: (NA x map_feat_size)
-        :param past_context: (NA, D) from prior's GRU output
-
-        :return: mean, var both (NA, z_size)
-        '''
-        # Run temporal encoder on future (PE + Transformer)
-        _, future_context = self._run_temporal_encoder(
-            scene_graph, scene_graph.future, scene_graph.future_vis, self.FT, use_transformer=True
-        )
-
-        # Generate z_global from past_context + future_context
-        posterior_in = torch.cat([past_context, future_context, map_feat, scene_graph.sem], dim=-1)
-        posterior_z = self.latent_posterior_net(posterior_in)  # (NA, z_size * 2)
-
-        # split into mu and sigma
-        mean, logvar = posterior_z[:, :self.z_size], posterior_z[:, self.z_size:]
-        var = torch.exp(logvar)
-        return mean, var
-
-    def prior(self, scene_graph, map_feat):
-        '''
-        Prior: past trajectory → per-step GCN → GRU → context → z_global
-
-        :param scene_graph: pytorch geom Batch of graphs
-        :param map_feat: (NA x map_feat_size)
-
-        :return: (mean, var, past_seq_out)
-                 - mean, var: (NA, z_size)
-                 - past_seq_out: (NA, PT, D) for decoder cross-attention
-        '''
-        # Run temporal encoder on past (GRU, no transformer)
-        past_seq_out, past_context = self._run_temporal_encoder(
-            scene_graph, scene_graph.past, scene_graph.past_vis, self.PT, use_transformer=False
-        )
-
-        # Generate z_global from context
-        prior_in = torch.cat([past_context, map_feat, scene_graph.sem], dim=-1)
-        prior_z = self.latent_prior_net(prior_in)  # (NA, z_size * 2)
-
-        # split into mu and sigma
-        mean, logvar = prior_z[:, :self.z_size], prior_z[:, self.z_size:]
-        var = torch.exp(logvar)
-        return mean, var, past_seq_out
-
-    def decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-                ext_future=None,
-                nfuture=None,
-                teacher_forcing=False,
-                tf_segment_len=3,
-                sur_gt_replay=False):
-        '''
-        :param scene_graph: pytorch geom Batch of graphs (NOTE will be used in place...)
-        :param map_feat: (NA x map_feat_size) of past[-1] viewpoint
-        :param past_seq_out: (NA x PT x D) temporal sequence from prior GRU
-        :param z: (NA x z_size) or (NA x NS x z_size) if wanting to decode multiple samples
-        :param map_idx: (B,) indices of map used for each sub graph
-        :param map_env: MapEnv object to query map crops from
-        :param ext_future: if not None, size (B x FT x 4), indicates that the first node in each graph
-                            is an external agent with the given true observed future. This means rollout
-                            will use this external future rather than its own predictions at each step.
-                            Assumed all entires are non-null. NORMALIZED
-        :param nfuture: if not None, overrides self.FT and rolls out future for nfuture steps
-        :param teacher_forcing: if True, reset states to GT at segment boundaries during training
-        :param tf_segment_len: number of steps per segment before resetting to GT (default: 3)
-        :param sur_gt_replay: if True, override sur predictions with GT future at each step.
-                               Used for testing ego reactive ability against adversarial trajectories.
-
-        :return: if teacher_forcing=False: future predicted trajectories (NA x FT x 4) in GLOBAL frame
-                 if teacher_forcing=True: list of 12 segments, each segment is list of predictions
-                     all_segment_preds[seg_idx] = [pred_t, pred_t+1, ...] for loss computation
-        '''
-        if teacher_forcing:
-            # Use teacher forcing decoder (12 segments, each with tf_segment_len steps)
-            return self.teacher_forcing_decoder(scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-                                                tf_segment_len=tf_segment_len)
-        else:
-            return self.autoregressive_decoder(scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-                                                ext_future=ext_future,
-                                                nfuture=nfuture,
-                                                sur_gt_replay=sur_gt_replay)
-
-    def autoregressive_decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-                                ext_future=None,
-                                nfuture=None,
-                                sur_gt_replay=False):
+    def _recompute_map_tokens(self, pos_normalized, map_idx, map_env, scene_graph):
         """
-        Autoregressive decoder with separate ego/other processing paths.
+        Re-crop and re-encode map tokens at given normalized positions.
 
-        - Other agents: GCN → trajectory directly (STRIVE style)
-        - Ego agent: z_global + z_local → MLP → GRU → MLP → trajectory
-        - z_local: computed per step from cross-attention over sliding window of other_feat
-
-        :param past_seq_out: (NA x PT x D) temporal sequence from prior GRU
-        :param z: z_global (NA x z_size) or (NA x NS x z_size)
-        :param sur_gt_replay: if True, override sur predictions with GT future (scene_graph.future_gt)
-                               at each step. Ego still predicts autoregressively.
+        :param pos_normalized: (NA, 4) normalized positions (x, y, hx, hy)
+        :param map_idx: (B,) map index per batch
+        :param map_env: map environment for cropping
+        :param scene_graph: scene graph (for .batch attribute)
+        :return: map_tokens (NA, num_tokens, map_token_ch)
         """
-        NA = map_feat.size(0)
-        FT = self.FT if nfuture is None else nfuture
-        B = map_idx.size(0)  # batch size (number of scenes)
-
-        # Get ego indices and mask
-        ego_inds = scene_graph.ptr[:-1]  # (B,) indices of ego in flattened NA
-        ego_mask = self._get_ego_mask(scene_graph)  # (NA,) boolean
-        num_ego = int(ego_mask.sum())
-        num_other = NA - num_ego
-
-        # Initialize with last step of input sequence (in global frame)
-        prev_state = scene_graph.past[:, -1, :] if self.output_bicycle else scene_graph.past[:, -1, :4]
-
-        # Extract past_feat from last timestep of past_seq_out
-        # past_seq_out: (NA, PT, gcn_hidden_dim=64)
-        # past_feat: (NA, 64) - used for decoder GCN input and GRU hidden state init
-        past_feat = past_seq_out[:, -1, :]
-
-        traj_out = []
-        cur_map_feat = map_feat
-        cur_past_feat = past_feat
-        cur_sem = scene_graph.sem
-        cur_lw = scene_graph.lw
-        cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
-
-        # init positions to last frame of past
-        scene_graph.pos = scene_graph.past[:, -1, :4]
-
-        # Handle multiple samples
-        zsize = z.size()
-        NS = None
-        if len(z.size()) == 3:
-            NS = zsize[1]
-            scene_graph.pos = scene_graph.pos.unsqueeze(1).expand(NA, NS, scene_graph.pos.size(1))
-            cur_past_feat = cur_past_feat.unsqueeze(1).expand(NA, NS, past_feat.size(1))
-            cur_map_feat = cur_map_feat.unsqueeze(1).expand(NA, NS, map_feat.size(1))
-            cur_sem = cur_sem.unsqueeze(1).expand(NA, NS, scene_graph.sem.size(1))
-            cur_lw = cur_lw.unsqueeze(1).expand(NA, NS, scene_graph.lw.size(1))
-            cur_veh_len = cur_veh_len.unsqueeze(1).expand(NA, NS, 1).reshape(NA * NS, 1)
-            prev_state = prev_state.unsqueeze(1).expand(NA, NS, prev_state.size(1)).reshape(NA * NS, -1)
-            if ext_future is not None:
-                ext_future = ext_future.unsqueeze(1).expand(NA, NS, -1, 4).reshape(NA * NS, -1, 4)
-        mult_samp = NS is not None
-
-        # Initialize memory states for past_feat update (shared decoder_memory for all agents)
-        # Other agents: STRIVE-style decoder memory
-        if mult_samp:
-            other_mem_state = cur_past_feat[~ego_mask].reshape(-1, past_feat.size(1)).unsqueeze(0).expand(
-                self.num_memory_layers, num_other * NS, self.past_feat_size).contiguous()
-            ego_mem_state = cur_past_feat[ego_mask].reshape(-1, past_feat.size(1)).unsqueeze(0).expand(
-                self.num_memory_layers, num_ego * NS, self.past_feat_size).contiguous()
-        else:
-            other_mem_state = past_feat[~ego_mask].unsqueeze(0).expand(
-                self.num_memory_layers, num_other, self.past_feat_size).contiguous()
-            ego_mem_state = past_feat[ego_mask].unsqueeze(0).expand(
-                self.num_memory_layers, num_ego, self.past_feat_size).contiguous()
-
-        # z_local sliding window buffers (window_size steps of GCN features)
-        # Stores per-step GCN features from InstantIndividualSceneInteractionNet
-        ego_feat_window = []    # for ego: only use current step (last one)
-        other_feat_window = []  # for other: use all steps with GRU temporal encoding
-
-        # Store z_local for analysis
-        self._z_local_outputs = []
-        self._attn_weights_outputs = []
-
-        #
-        # WARM-UP PHASE: Initialize sliding window from past states (t=1,2,3,4)
-        # Run z_local GCN (InstantIndividualSceneInteractionNet) for each past timestep
-        #
-        for pt in range(self.PT):
-            # Get state at past timestep pt
-            past_state_t = scene_graph.past[:, pt, :]  # (NA, 6)
-
-            if mult_samp:
-                # Expand to 3D: (NA, 6) -> (NA, NS, 6)
-                past_state_t = past_state_t.unsqueeze(1).expand(NA, NS, -1)
-                # Keep 3D tensors - AgentInteractionConv handles this internally
-                z_local_gcn_in_feat = torch.cat([past_state_t, cur_lw, cur_sem], dim=-1)  # (NA, NS, 6+2+NC)
-                scene_graph.x = z_local_gcn_in_feat  # 3D: (NA, NS, D)
-                scene_graph.pos = past_state_t[..., :4]  # 3D: (NA, NS, 4)
-            else:
-                z_local_gcn_in_feat = torch.cat([past_state_t, cur_lw, cur_sem], dim=-1)  # (NA, 6+2+NC)
-                scene_graph.x = z_local_gcn_in_feat  # 2D: (NA, D)
-                scene_graph.pos = past_state_t[..., :4]  # 2D: (NA, 4)
-
-            # Run InstantIndividualSceneInteractionNet (per-step GCN, no internal GRU)
-            # ego_mask is always (NA,) - no expansion needed, GCN handles mult_samp internally
-            ego_gcn_feat, other_gcn_feat = self.z_local_gcn(scene_graph, ego_mask)
-
-            ego_feat_window.append(ego_gcn_feat)
-            other_feat_window.append(other_gcn_feat)
-
-        # Reset scene_graph.pos to last past step for future decoding
-        scene_graph.pos = scene_graph.past[:, -1, :4]
-        if mult_samp:
-            scene_graph.pos = scene_graph.pos.unsqueeze(1).expand(NA, NS, -1)
-
-        # ============================================================
-        # Warm-up ego GRU hidden with past window (once at initialization)
-        # Pass PT (4) past states through GCN+GRU to initialize hidden with temporal context
-        # ============================================================
-        ego_gru_hidden = self._warmup_ego_gru_hidden(
-            scene_graph, ego_mask, gt_future=None, target_t=0)
-
-        # Handle multi-sample: expand ego_gru_hidden from (layers, num_ego, 64) to (layers, num_ego*NS, 64)
-        if mult_samp:
-            ego_gru_hidden = ego_gru_hidden.unsqueeze(2).expand(
-                self.num_memory_layers, num_ego, NS, 64
-            ).contiguous().reshape(self.num_memory_layers, num_ego * NS, 64)
-
-        # Reset scene_graph.pos after warm-up
-        scene_graph.pos = scene_graph.past[:, -1, :4]
-        if mult_samp:
-            scene_graph.pos = scene_graph.pos.unsqueeze(1).expand(NA, NS, -1)
-
-        for t in range(FT):
-
-            #
-            # Step 1: Compute z_local from current window
-            # ego: use only the last step feature
-            # other: use full window with GRU temporal encoding
-            #
-            ego_current_feat = ego_feat_window[-1]  # (num_ego, feat) or (num_ego, NS, feat)
-
-            # Compute z_local (deterministic, 2-layer cross-attention)
-            z_local = self._compute_z_local(
-                ego_current_feat, other_feat_window, mult_samp, NS, scene_graph,
-                ego_feat_window=ego_feat_window if self.ego_full_query else None
-            )
-            # z_local: (num_ego, z_local_size) or (num_ego, NS, z_local_size)
-
-            # Ablation: zero out z_local if disabled
-            if not self.use_z_local:
-                z_local = torch.zeros_like(z_local)
-
-            # Store for analysis
-            self._z_local_outputs.append(z_local)
-
-            #
-            # Step 3: Decode other agents (STRIVE style - GCN → trajectory)
-            #
-            decoder_in_feat = torch.cat([cur_past_feat, cur_map_feat, cur_sem, z, cur_lw], dim=-1)
-            scene_graph.x = decoder_in_feat
-            _, other_traj_out = self.decoder_net(scene_graph, ego_mask)
-            # other_traj_out: (num_other, traj_out_size) or (num_other, NS, traj_out_size)
-
-            #
-            # Step 4: Decode ego agent (z_global + z_local → MLP → GRU → MLP → trajectory)
-            #
-            # Get ego's z_global
-            z_global_ego = z[ego_mask]  # (num_ego, z_size) or (num_ego, NS, z_size)
-
-            # Combine z_global and z_local
-            z_combined = self.z_combine_mlp(torch.cat([z_global_ego, z_local], dim=-1))
-            # z_combined: (num_ego, 64) or (num_ego, NS, 64)
-
-            # Prepare ego GRU input: z_combined + map_feat + sem + lw (NO past_feat)
-            ego_map_feat = cur_map_feat[ego_mask]
-            ego_sem = cur_sem[ego_mask]
-            ego_lw = cur_lw[ego_mask]
-            ego_gru_in = torch.cat([z_combined, ego_map_feat, ego_sem, ego_lw], dim=-1)
-
-            if mult_samp:
-                ego_gru_in = ego_gru_in.reshape(num_ego * NS, -1).unsqueeze(1)
-            else:
-                ego_gru_in = ego_gru_in.unsqueeze(1)  # (num_ego, 1, input_size)
-
-            ego_gru_out, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
-            ego_gru_out = ego_gru_out[:, 0]  # (num_ego, 64) or (num_ego*NS, 64)
-
-            ego_traj_out = self.ego_output_mlp(ego_gru_out)
-            # ego_traj_out: (num_ego, traj_out_size) or (num_ego*NS, traj_out_size)
-
-            if mult_samp:
-                ego_traj_out = ego_traj_out.reshape(num_ego, NS, -1)
-
-            #
-            # Step 5: Merge ego and other outputs and convert to global frame
-            #
-            decoder_out = self._merge_ego_other_feat(ego_traj_out, other_traj_out, ego_mask)
-
-            if mult_samp:
-                decoder_out = decoder_out.reshape(NA * NS, -1)
-
-            cur_state_local = None
-            cur_state_global = None
-            cur_bike_state = None
-
-            if self.output_bicycle:
-                bsize = NA if not mult_samp else NA * NS
-                dynamics_out = decoder_out.view(bsize, 1, 1, 2)
-                a_out = dynamics_out[:, :, :, 0] * self.bicycle_params['a_stats'][1] + self.bicycle_params['a_stats'][0]
-                ddh_out = dynamics_out[:, :, :, 1] * self.bicycle_params['ddh_stats'][1] + self.bicycle_params['ddh_stats'][0]
-                init_state = self.normalizer.unnormalize(prev_state)
-                cur_bike_state = self.sim_traj(init_state.unsqueeze(1), a_out, ddh_out, cur_veh_len)[:, 0, 0]
-                cur_bike_state = self.normalizer.normalize(cur_bike_state)
-                cur_state_global = cur_bike_state[:, :4]
-                cur_state_local = transform2frame(prev_state[:, :4], cur_state_global.unsqueeze(1))[:, 0]
-            else:
-                heading_mag = torch.norm(decoder_out[:, 2:], dim=-1, keepdim=True)
-                cur_state_local = torch.cat([decoder_out[:, :2], decoder_out[:, 2:] / heading_mag], dim=-1)
-                cur_state_global = transform2frame(prev_state,
-                                                   cur_state_local.unsqueeze(1),
-                                                   inverse=True)[:, 0, :]
-
-            # Handle external future (for ego with observed trajectory)
-            if ext_future is not None:
-                cur_state_global = cur_state_global.clone()
-                if mult_samp:
-                    ext_ego_inds = ego_inds.unsqueeze(1).expand(B, NS).reshape(B * NS)
-                    cur_state_global[ext_ego_inds] = ext_future[:, t]
-                else:
-                    cur_state_global[ego_inds] = ext_future[:, t]
-                cur_state_local = cur_state_local.clone()
-                if mult_samp:
-                    cur_state_local[ext_ego_inds] = transform2frame(
-                        prev_state[ext_ego_inds][:, :4],
-                        cur_state_global[ext_ego_inds].unsqueeze(1))[:, 0, :]
-                else:
-                    cur_state_local[ego_inds] = transform2frame(
-                        prev_state[ego_inds][:, :4],
-                        cur_state_global[ego_inds].unsqueeze(1))[:, 0, :]
-
-            # Handle sur GT replay (override sur predictions with GT future)
-            if sur_gt_replay and hasattr(scene_graph, 'future_gt'):
-                gt_future = scene_graph.future_gt  # (NA, FT, 6) normalized
-                sur_gt_state = gt_future[:, t, :4][~ego_mask]  # (num_other, 4)
-                cur_state_global = cur_state_global.clone()
-                cur_state_local = cur_state_local.clone()
-                if mult_samp:
-                    cur_state_global_reshaped = cur_state_global.reshape(NA, NS, -1)
-                    cur_state_global_reshaped[~ego_mask] = sur_gt_state.unsqueeze(1).expand(-1, NS, -1)
-                    cur_state_global = cur_state_global_reshaped.reshape(NA * NS, -1)
-                    cur_state_local_reshaped = cur_state_local.reshape(NA, NS, -1)
-                    sur_prev = prev_state.reshape(NA, NS, -1)[~ego_mask].reshape(num_other * NS, -1)
-                    sur_gt_expanded = sur_gt_state.unsqueeze(1).expand(-1, NS, -1).reshape(num_other * NS, -1)
-                    sur_local = transform2frame(sur_prev[:, :4], sur_gt_expanded.unsqueeze(1))[:, 0, :]
-                    cur_state_local_reshaped[~ego_mask] = sur_local.reshape(num_other, NS, -1)
-                    cur_state_local = cur_state_local_reshaped.reshape(NA * NS, -1)
-                else:
-                    cur_state_global[~ego_mask] = sur_gt_state
-                    sur_prev = prev_state[~ego_mask]
-                    cur_state_local[~ego_mask] = transform2frame(
-                        sur_prev[:, :4], sur_gt_state.unsqueeze(1))[:, 0, :]
-                # Also override bike_state for sur if bicycle model
-                if self.output_bicycle and cur_bike_state is not None:
-                    sur_gt_6d = gt_future[:, t, :][~ego_mask]  # (num_other, 6)
-                    cur_bike_state = cur_bike_state.clone()
-                    if mult_samp:
-                        cur_bike_state_reshaped = cur_bike_state.reshape(NA, NS, -1)
-                        cur_bike_state_reshaped[~ego_mask] = sur_gt_6d.unsqueeze(1).expand(-1, NS, -1)
-                        cur_bike_state = cur_bike_state_reshaped.reshape(NA * NS, -1)
-                    else:
-                        cur_bike_state[~ego_mask] = sur_gt_6d
-
-            traj_out.append(cur_state_global)
-
-            # Update prev state
-            if self.output_bicycle:
-                prev_state = cur_bike_state
-            else:
-                prev_state = cur_state_global
-
-            if t < FT - 1:
-                # Update other agents' past feat using memory (STRIVE style)
-                other_state_local = cur_state_local.reshape(NA, -1)[~ego_mask] if not mult_samp else \
-                                    cur_state_local.reshape(NA, NS, -1)[~ego_mask].reshape(num_other * NS, -1)
-                other_past_feat_new, other_mem_state = self.decoder_memory(
-                    other_state_local.unsqueeze(1), other_mem_state)
-                other_past_feat_new = other_past_feat_new[:, 0]
-
-                # Update ego agents' past feat using same memory (for GCN message passing consistency)
-                ego_state_local = cur_state_local.reshape(NA, -1)[ego_mask] if not mult_samp else \
-                                  cur_state_local.reshape(NA, NS, -1)[ego_mask].reshape(num_ego * NS, -1)
-                ego_past_feat_new, ego_mem_state = self.decoder_memory(
-                    ego_state_local.unsqueeze(1), ego_mem_state)
-                ego_past_feat_new = ego_past_feat_new[:, 0]
-
-                # Update cur_past_feat for both ego and other agents
-                if mult_samp:
-                    other_past_feat_new = other_past_feat_new.reshape(num_other, NS, self.past_feat_size)
-                    ego_past_feat_new = ego_past_feat_new.reshape(num_ego, NS, self.past_feat_size)
-                    new_past_feat = cur_past_feat.clone()
-                    new_past_feat[~ego_mask] = other_past_feat_new
-                    new_past_feat[ego_mask] = ego_past_feat_new
-                    cur_past_feat = new_past_feat
-                else:
-                    new_past_feat = cur_past_feat.clone()
-                    new_past_feat[~ego_mask] = other_past_feat_new
-                    new_past_feat[ego_mask] = ego_past_feat_new
-                    cur_past_feat = new_past_feat
-
-                # Crop and encode map around new position
-                scene_graph.pos = cur_state_global.detach() if not mult_samp else cur_state_global.detach().reshape(NA, NS, -1)
-                cur_map_feat = self.encode_map(scene_graph, map_idx, map_env)
-
-                # Update positions for relative transformations during next GNN pass
-                scene_graph.pos = cur_state_global if not mult_samp else cur_state_global.reshape(NA, NS, -1)
-
-                #
-                # Update z_local sliding window with new predicted state
-                # Run InstantIndividualSceneInteractionNet on predicted state
-                #
-                # Use 6-dim state for z_local GCN (same as warm-up phase)
-                # cur_bike_state has full 6-dim (x,y,hx,hy,s,hdot), cur_state_global has only 4-dim
-                if self.output_bicycle and cur_bike_state is not None:
-                    cur_state_6dim = cur_bike_state
-                else:
-                    # Fallback: pad cur_state_global with zeros for s and hdot
-                    cur_state_6dim = torch.cat([cur_state_global,
-                                                torch.zeros(cur_state_global.size(0), 2, device=cur_state_global.device)], dim=-1)
-
-                if mult_samp:
-                    # Reshape to 3D: cur_state_6dim is (NA*NS, 6) -> (NA, NS, 6)
-                    cur_state_for_gcn = cur_state_6dim.reshape(NA, NS, -1)
-                    # Keep 3D tensors - AgentInteractionConv handles this internally
-                    z_local_gcn_in_feat = torch.cat([cur_state_for_gcn, cur_lw, cur_sem], dim=-1)  # (NA, NS, 6+2+NC)
-                    scene_graph.x = z_local_gcn_in_feat  # 3D: (NA, NS, D)
-                    scene_graph.pos = cur_state_for_gcn[..., :4]  # 3D: (NA, NS, 4)
-                else:
-                    cur_state_for_gcn = cur_state_6dim
-                    z_local_gcn_in_feat = torch.cat([cur_state_for_gcn, cur_lw, cur_sem], dim=-1)  # (NA, 6+2+NC)
-                    scene_graph.x = z_local_gcn_in_feat  # 2D: (NA, D)
-                    scene_graph.pos = cur_state_for_gcn[..., :4]  # 2D: (NA, 4)
-
-                # Run InstantIndividualSceneInteractionNet
-                # ego_mask is always (NA,) - no expansion needed, GCN handles mult_samp internally
-                new_ego_gcn_feat, new_other_gcn_feat = self.z_local_gcn(scene_graph, ego_mask)
-
-                # Window update: grow or slide depending on flag
-                if self.growing_window:
-                    ego_feat_window.append(new_ego_gcn_feat)
-                    other_feat_window.append(new_other_gcn_feat)
-                else:
-                    if len(ego_feat_window) >= self.z_local_window:
-                        ego_feat_window.pop(0)
-                        other_feat_window.pop(0)
-                    ego_feat_window.append(new_ego_gcn_feat)
-                    other_feat_window.append(new_other_gcn_feat)
-
-        # Return all outputs in global frame
-        traj_out = torch.stack(traj_out, dim=1)
-        if mult_samp:
-            traj_out = traj_out.reshape(NA, NS, FT, -1)
-        return traj_out
-
-    def teacher_forcing_decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-                                  tf_segment_len=3):
-        """
-        Dual-loop Teacher Forcing Decoder for separated ego/sur training.
-
-        Two independent loops to prevent error propagation between ego and sur:
-
-        1. Sur Loop (ego=GT fixed, sur=autoregressive, NO TF):
-           - Ego positions come from GT at every step
-           - Sur agents predict autoregressively (their predictions feed back)
-           - This isolates z_global learning from ego prediction errors
-
-        2. Ego Loop (sur=GT fixed, ego=TF segmented):
-           - Sur positions come from GT at every step
-           - Ego uses Teacher Forcing: reset to GT at segment boundaries
-           - This isolates ego decoder learning from sur prediction errors
-
-        Returns: list of FT segments for loss computation (same format as before)
-            all_segment_preds[seg_idx] = [pred_t, pred_t+1, ...] each (NA, 4)
-            - Sur predictions come from Sur Loop
-            - Ego predictions come from Ego Loop
-        """
-        NA = map_feat.size(0)
-        FT = self.FT
-        B = map_idx.size(0)
-
-        ego_mask = self._get_ego_mask(scene_graph)
-        num_ego = int(ego_mask.sum())
-        num_other = NA - num_ego
-
-        gt_future = scene_graph.future[:, :, :] if self.output_bicycle else scene_graph.future[:, :, :4]
-
-        # Store z_local for analysis
-        self._z_local_outputs = []
-        self._attn_weights_outputs = []
-
-        # ====================================================================
-        # Run two independent loops in parallel (conceptually)
-        # ====================================================================
-
-        # Loop 1: Sur prediction (ego=GT, sur=autoregressive, NO TF)
-        sur_traj_all = self._sur_loop_decoder(
-            scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-            ego_mask, gt_future)
-        # sur_traj_all: (num_other, FT, 4)
-
-        # Loop 2: Ego prediction (sur=GT, ego=TF segmented)
-        ego_segments, z_local_outputs = self._ego_loop_decoder(
-            scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-            ego_mask, gt_future, tf_segment_len)
-        # ego_segments: list of FT segments, each segment is list of (num_ego, 4)
-
-        # Store z_local outputs
-        self._z_local_outputs = z_local_outputs
-
-        # ====================================================================
-        # Merge: combine sur predictions with ego predictions per segment
-        # ====================================================================
-        all_segment_preds = []
-
-        for seg_idx, ego_seg in enumerate(ego_segments):
-            segment_preds = []
-            for step, ego_pred in enumerate(ego_seg):
-                actual_t = seg_idx + step
-                if actual_t >= FT:
-                    break
-
-                # Merge: ego from ego_loop, sur from sur_loop
-                full_pred = torch.zeros(NA, 4, device=ego_pred.device)
-                full_pred[ego_mask] = ego_pred
-                full_pred[~ego_mask] = sur_traj_all[:, actual_t, :]
-
-                segment_preds.append(full_pred)
-
-            all_segment_preds.append(segment_preds)
-
-        return all_segment_preds
-
-    def _sur_loop_decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-                          ego_mask, gt_future):
-        """
-        Sur Loop: ego=GT fixed, sur=autoregressive (NO Teacher Forcing)
-
-        Purpose: Learn z_global without ego prediction error propagation.
-        - Ego positions come from GT at every step
-        - Sur agents predict autoregressively (their predictions feed back)
-        - Both ego and sur past_feat are updated each step for proper GCN message passing
-
-        :return: sur_traj_all (num_other, FT, 4) - sur predictions for all timesteps
-        """
-        NA = map_feat.size(0)
-        FT = self.FT
-        num_ego = int(ego_mask.sum())
-        num_other = NA - num_ego
-
-        cur_sem = scene_graph.sem
-        cur_lw = scene_graph.lw
-        cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
-        past_feat = past_seq_out[:, -1, :]
-
-        sur_traj_out = []
-
-        # Initialize states from past
-        sur_prev_state = scene_graph.past[:, -1, :] if self.output_bicycle else scene_graph.past[:, -1, :4]
-
-        # Memory states for both ego and sur (needed for past_feat update)
-        sur_mem_state = past_feat[~ego_mask].unsqueeze(0).expand(
-            self.num_memory_layers, num_other, self.past_feat_size).contiguous()
-        ego_mem_state = past_feat[ego_mask].unsqueeze(0).expand(
-            self.num_memory_layers, num_ego, self.past_feat_size).contiguous()
-
-        # past_feat for all agents (both updated each step)
-        cur_past_feat = past_feat.clone()
-
-        for t in range(FT):
-            # Build combined position: ego=GT, sur=predicted/initial
-            combined_pos = sur_prev_state[:, :4].clone()
-
-            # Set ego position to GT for this timestep
-            if t == 0:
-                ego_gt_pos = scene_graph.past[:, -1, :4][ego_mask]
-            else:
-                ego_gt_pos = gt_future[:, t-1, :4][ego_mask]
-            combined_pos[ego_mask] = ego_gt_pos
-
-            # Get map_feat at combined positions
-            scene_graph.pos = combined_pos
-            cur_map_feat = self.encode_map(scene_graph, map_idx, map_env)
-
-            # Decode sur agents via GCN (uses combined past_feat with both ego and sur)
-            decoder_in_feat = torch.cat([cur_past_feat, cur_map_feat, cur_sem, z, cur_lw], dim=-1)
-            scene_graph.x = decoder_in_feat
-            _, sur_traj_step = self.decoder_net(scene_graph, ego_mask)
-            # sur_traj_step: (num_other, traj_out_size)
-
-            # Convert sur output to global frame
-            sur_prev = sur_prev_state[~ego_mask]
-            if self.output_bicycle:
-                dynamics_out = sur_traj_step.view(num_other, 1, 1, 2)
-                a_out = dynamics_out[:, :, :, 0] * self.bicycle_params['a_stats'][1] + self.bicycle_params['a_stats'][0]
-                ddh_out = dynamics_out[:, :, :, 1] * self.bicycle_params['ddh_stats'][1] + self.bicycle_params['ddh_stats'][0]
-                init_state = self.normalizer.unnormalize(sur_prev)
-                sur_veh_len = cur_veh_len[~ego_mask]
-                sur_bike_state = self.sim_traj(init_state.unsqueeze(1), a_out, ddh_out, sur_veh_len)[:, 0, 0]
-                sur_bike_state = self.normalizer.normalize(sur_bike_state)
-                sur_state_global = sur_bike_state[:, :4]
-                sur_state_local = transform2frame(sur_prev[:, :4], sur_state_global.unsqueeze(1))[:, 0]
-            else:
-                heading_mag = torch.norm(sur_traj_step[:, 2:], dim=-1, keepdim=True).clamp(min=1e-6)
-                sur_state_local = torch.cat([sur_traj_step[:, :2], sur_traj_step[:, 2:] / heading_mag], dim=-1)
-                sur_state_global = transform2frame(sur_prev, sur_state_local.unsqueeze(1), inverse=True)[:, 0, :]
-
-            sur_traj_out.append(sur_state_global)
-
-            # Update states for next step
-            if t < FT - 1:
-                # Update sur prev_state with prediction
-                new_prev_state = sur_prev_state.clone()
-                if self.output_bicycle:
-                    new_prev_state[~ego_mask] = sur_bike_state
-                else:
-                    new_prev_state[~ego_mask] = sur_state_global
-
-                # Update ego prev_state to GT
-                ego_gt_next = gt_future[:, t, :][ego_mask] if self.output_bicycle else gt_future[:, t, :4][ego_mask]
-                new_prev_state[ego_mask] = ego_gt_next
-                sur_prev_state = new_prev_state
-
-                # Update sur past_feat using prediction
-                sur_past_feat_new, sur_mem_state = self.decoder_memory(
-                    sur_state_local.unsqueeze(1), sur_mem_state)
-
-                # Update ego past_feat using GT
-                # Compute ego local state from GT
-                if t == 0:
-                    ego_prev_gt = scene_graph.past[:, -1, :4][ego_mask]
-                else:
-                    ego_prev_gt = gt_future[:, t-1, :4][ego_mask]
-                ego_cur_gt = gt_future[:, t, :4][ego_mask]
-                ego_gt_local = transform2frame(ego_prev_gt, ego_cur_gt.unsqueeze(1))[:, 0, :]
-                ego_past_feat_new, ego_mem_state = self.decoder_memory(
-                    ego_gt_local.unsqueeze(1), ego_mem_state)
-
-                # Update cur_past_feat for both
-                cur_past_feat = cur_past_feat.clone()
-                cur_past_feat[~ego_mask] = sur_past_feat_new[:, 0]
-                cur_past_feat[ego_mask] = ego_past_feat_new[:, 0]
-
-        # Stack: list of (num_other, 4) -> (num_other, FT, 4)
-        sur_traj_all = torch.stack(sur_traj_out, dim=1)
-        return sur_traj_all
-
-    def _warmup_ego_gru_hidden(self, scene_graph, ego_mask, gt_future=None, target_t=0):
-        """
-        Warm-up ego GRU hidden state using window (past + GT).
-
-        Uses temporal_gcn_encoder + ego_warmup_gru to initialize ego_decoder_gru hidden state.
-        Process window without z (similar to how past_feat is initialized from past_seq_out).
-
-        Two modes:
-        1. Autoregressive (gt_future=None, target_t=0): Use only past states
-        2. Teacher Forcing (gt_future provided): Use past + GT up to target_t
-
-        Window composition for each pt in range(PT=4):
-        - t_window = target_t - PT + pt
-        - if t_window < 0: use past[PT + t_window]
-        - else: use gt_future[t_window]
-
-        :param scene_graph: scene graph with past, sem, lw, etc.
-        :param ego_mask: (NA,) boolean mask for ego agents
-        :param gt_future: (NA, FT, 6) GT future trajectory (TF mode) or None (Auto mode)
-        :param target_t: segment start timestep (0 for autoregressive)
-        :return: ego_gru_hidden (num_memory_layers, num_ego, 64)
-        """
-        NA = ego_mask.size(0)
-        device = scene_graph.past.device
-
-        ego_gcn_features = []
-
-        # Per-step GCN processing for window
-        for pt in range(self.PT):
-            # Determine window timestep
-            t_window = target_t - self.PT + pt
-
-            if t_window < 0:
-                # Use past
-                cur_state = scene_graph.past[:, self.PT + t_window, :]  # (NA, 6)
-                cur_vis = scene_graph.past_vis[:, self.PT + t_window]  # (NA,)
-            else:
-                # Use GT future (TF mode)
-                cur_state = gt_future[:, t_window, :]  # (NA, 6)
-                cur_vis = torch.ones(NA, device=device)  # GT is always visible
-
-            # Build GCN input: state(6) + lw(2) + vis(1) + sem(NC)
-            cur_lw = scene_graph.lw  # (NA, 2)
-            cur_sem = scene_graph.sem  # (NA, NC)
-            step_in_feat = torch.cat([cur_state, cur_lw, cur_vis.unsqueeze(-1), cur_sem], dim=-1)
-            gcn_node_in = self.step_feature_extractor(step_in_feat)  # (NA, 64)
-
-            # Update scene graph for this step
-            g_in_data = scene_graph
-            g_in_data.x = gcn_node_in
-            g_in_data.pos = cur_state[:, :4]  # (x, y, hx, hy)
-
-            # Run GCN - extract ego features only
-            ego_feat_t, _ = self.temporal_gcn_encoder(g_in_data, ego_mask)  # (num_ego, 64)
-            ego_gcn_features.append(ego_feat_t)
-
-        # Stack and pass through ego_warmup_gru
-        ego_sequence = torch.stack(ego_gcn_features, dim=1)  # (num_ego, PT, 64)
-        _, ego_gru_hidden = self.ego_warmup_gru(ego_sequence)  # (num_memory_layers, num_ego, 64)
-
-        return ego_gru_hidden
-
-    def _ego_loop_decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
-                          ego_mask, gt_future, tf_segment_len):
-        """
-        Ego Loop: sur=GT fixed, ego=TF segmented
-
-        Purpose: Learn ego decoder without sur prediction error propagation.
-        - Sur positions come from GT at every step
-        - Ego uses Teacher Forcing: reset to GT at segment boundaries
-        - GRU hidden warm-up: initialize hidden with window states for temporal context
-
-        :return: (ego_segments, z_local_outputs)
-            - ego_segments: list of FT segments, each segment is list of (num_ego, 4)
-            - z_local_outputs: list of z_local tensors (deterministic)
-        """
-        NA = map_feat.size(0)
-        FT = self.FT
-        num_ego = int(ego_mask.sum())
-        num_other = NA - num_ego
-
-        cur_sem = scene_graph.sem
-        cur_lw = scene_graph.lw
-        cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
-
-        z_local_outputs = []
-
-        # Initialize z_local window from past (GT positions)
-        ego_feat_window = []
-        other_feat_window = []
-
-        for pt in range(self.PT):
-            past_state_t = scene_graph.past[:, pt, :]
-            z_local_gcn_in_feat = torch.cat([past_state_t, cur_lw, cur_sem], dim=-1)
-            scene_graph.x = z_local_gcn_in_feat
-            scene_graph.pos = past_state_t[..., :4]
-            ego_gcn_feat, other_gcn_feat = self.z_local_gcn(scene_graph, ego_mask)
-            ego_feat_window.append(ego_gcn_feat)
-            other_feat_window.append(other_gcn_feat)
-
-        ego_segments = []
-
-        for target_t in range(FT):
-            # Early termination: ensure consistent segment size
-            if target_t + tf_segment_len > FT:
-                break
-
-            # ============================================================
-            # Reset ego state to GT at segment start (Teacher Forcing)
-            # ============================================================
-            if target_t == 0:
-                ego_prev_state = scene_graph.past[:, -1, :][ego_mask] if self.output_bicycle else scene_graph.past[:, -1, :4][ego_mask]
-            else:
-                ego_prev_state = gt_future[:, target_t-1, :][ego_mask] if self.output_bicycle else gt_future[:, target_t-1, :4][ego_mask]
-
-            # Warm-up ego GRU hidden at segment start using window (past + GT)
-            # This provides temporal context instead of starting from zeros
-            ego_gru_hidden = self._warmup_ego_gru_hidden(
-                scene_graph, ego_mask, gt_future=gt_future, target_t=target_t)
-
-            # Reset z_local window to GT-based at segment start
-            if target_t > 0:
-                ego_feat_window = []
-                other_feat_window = []
-
-                if self.growing_window:
-                    # Growing window: rebuild full history (past 4 + GT future 0..target_t-1)
-                    # 1) All past steps
-                    for pt in range(self.PT):
-                        state_t = scene_graph.past[:, pt, :]
-                        z_local_gcn_in_feat = torch.cat([state_t, cur_lw, cur_sem], dim=-1)
-                        scene_graph.x = z_local_gcn_in_feat
-                        scene_graph.pos = state_t[..., :4]
-                        ego_gcn_feat, other_gcn_feat = self.z_local_gcn(scene_graph, ego_mask)
-                        ego_feat_window.append(ego_gcn_feat)
-                        other_feat_window.append(other_gcn_feat)
-
-                    # 2) GT future steps 0..target_t-1
-                    for ft in range(target_t):
-                        state_t = gt_future[:, ft, :]
-                        if not self.output_bicycle and state_t.size(-1) < 6:
-                            state_t = torch.cat([state_t, torch.zeros(NA, 2, device=state_t.device)], dim=-1)
-                        z_local_gcn_in_feat = torch.cat([state_t, cur_lw, cur_sem], dim=-1)
-                        scene_graph.x = z_local_gcn_in_feat
-                        scene_graph.pos = state_t[..., :4]
-                        ego_gcn_feat, other_gcn_feat = self.z_local_gcn(scene_graph, ego_mask)
-                        ego_feat_window.append(ego_gcn_feat)
-                        other_feat_window.append(other_gcn_feat)
-                else:
-                    # Fixed window: rebuild last z_local_window steps ending at target_t-1
-                    # Clamp start so we don't go before the earliest past step
-                    win_start = max(target_t - self.z_local_window, -self.PT)
-                    for t_for_window in range(win_start, target_t):
-                        if t_for_window < 0:
-                            # Use from past sequence (t_for_window in [-PT, -1])
-                            state_t = scene_graph.past[:, self.PT + t_for_window, :]
-                        else:
-                            # Use from GT future
-                            state_t = gt_future[:, t_for_window, :]
-                            if not self.output_bicycle and state_t.size(-1) < 6:
-                                state_t = torch.cat([state_t, torch.zeros(NA, 2, device=state_t.device)], dim=-1)
-
-                        z_local_gcn_in_feat = torch.cat([state_t, cur_lw, cur_sem], dim=-1)
-                        scene_graph.x = z_local_gcn_in_feat
-                        scene_graph.pos = state_t[..., :4]
-                        ego_gcn_feat, other_gcn_feat = self.z_local_gcn(scene_graph, ego_mask)
-                        ego_feat_window.append(ego_gcn_feat)
-                        other_feat_window.append(other_gcn_feat)
-
-            segment_preds = []
-
-            for step in range(tf_segment_len):
-                actual_t = target_t + step
-                if actual_t >= FT:
-                    break
-
-                # Build combined position: ego=current (predicted or GT-reset), sur=GT
-                if actual_t == 0:
-                    sur_gt_state = scene_graph.past[:, -1, :][~ego_mask] if self.output_bicycle else scene_graph.past[:, -1, :4][~ego_mask]
-                else:
-                    sur_gt_state = gt_future[:, actual_t-1, :][~ego_mask] if self.output_bicycle else gt_future[:, actual_t-1, :4][~ego_mask]
-
-                combined_prev = torch.zeros(NA, ego_prev_state.size(-1), device=ego_prev_state.device)
-                combined_prev[ego_mask] = ego_prev_state
-                combined_prev[~ego_mask] = sur_gt_state
-
-                scene_graph.pos = combined_prev[:, :4]
-
-                # Get map_feat
-                cur_map_feat = self.encode_map(scene_graph, map_idx, map_env)
-
-                # Compute z_local (deterministic, 2-layer cross-attention)
-                ego_current_feat = ego_feat_window[-1]
-                z_local = self._compute_z_local(
-                    ego_current_feat, other_feat_window, False, None, scene_graph,
-                    ego_feat_window=ego_feat_window if self.ego_full_query else None
-                )
-
-                # Ablation: zero out z_local if disabled
-                if not self.use_z_local:
-                    z_local = torch.zeros_like(z_local)
-
-                # Store z_local only for first step of each segment
-                if step == 0:
-                    z_local_outputs.append(z_local)
-
-                # Decode ego
-                z_global_ego = z[ego_mask]
-                z_combined = self.z_combine_mlp(torch.cat([z_global_ego, z_local], dim=-1))
-
-                ego_map_feat = cur_map_feat[ego_mask]
-                ego_sem = cur_sem[ego_mask]
-                ego_lw = cur_lw[ego_mask]
-                ego_gru_in = torch.cat([z_combined, ego_map_feat, ego_sem, ego_lw], dim=-1)
-                ego_gru_in = ego_gru_in.unsqueeze(1)
-
-                ego_gru_out, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
-                ego_gru_out = ego_gru_out[:, 0]
-                ego_traj_out = self.ego_output_mlp(ego_gru_out)
-
-                # Convert ego output to global frame
-                if self.output_bicycle:
-                    dynamics_out = ego_traj_out.view(num_ego, 1, 1, 2)
-                    a_out = dynamics_out[:, :, :, 0] * self.bicycle_params['a_stats'][1] + self.bicycle_params['a_stats'][0]
-                    ddh_out = dynamics_out[:, :, :, 1] * self.bicycle_params['ddh_stats'][1] + self.bicycle_params['ddh_stats'][0]
-                    init_state = self.normalizer.unnormalize(ego_prev_state)
-                    ego_veh_len = cur_veh_len[ego_mask]
-                    ego_bike_state = self.sim_traj(init_state.unsqueeze(1), a_out, ddh_out, ego_veh_len)[:, 0, 0]
-                    ego_bike_state = self.normalizer.normalize(ego_bike_state)
-                    ego_state_global = ego_bike_state[:, :4]
-                else:
-                    heading_mag = torch.norm(ego_traj_out[:, 2:], dim=-1, keepdim=True).clamp(min=1e-6)
-                    ego_state_local = torch.cat([ego_traj_out[:, :2], ego_traj_out[:, 2:] / heading_mag], dim=-1)
-                    ego_state_global = transform2frame(ego_prev_state, ego_state_local.unsqueeze(1), inverse=True)[:, 0, :]
-
-                segment_preds.append(ego_state_global)
-
-                # Update ego state for next step within segment
-                if step < tf_segment_len - 1 and actual_t < FT - 1:
-                    if self.output_bicycle:
-                        ego_prev_state = ego_bike_state
-                    else:
-                        ego_prev_state = ego_state_global
-
-                    # Update z_local window: ego=predicted, sur=GT
-                    sur_gt_next = gt_future[:, actual_t, :]
-                    combined_state_6dim = torch.zeros(NA, 6, device=ego_state_global.device)
-                    if self.output_bicycle:
-                        combined_state_6dim[ego_mask] = ego_bike_state
-                    else:
-                        combined_state_6dim[ego_mask, :4] = ego_state_global
-                    combined_state_6dim[~ego_mask] = sur_gt_next[~ego_mask]
-
-                    z_local_gcn_in_feat = torch.cat([combined_state_6dim, cur_lw, cur_sem], dim=-1)
-                    scene_graph.x = z_local_gcn_in_feat
-                    scene_graph.pos = combined_state_6dim[..., :4]
-
-                    new_ego_gcn_feat, new_other_gcn_feat = self.z_local_gcn(scene_graph, ego_mask)
-
-                    # Window update: grow or slide depending on flag
-                    if self.growing_window:
-                        ego_feat_window.append(new_ego_gcn_feat)
-                        other_feat_window.append(new_other_gcn_feat)
-                    else:
-                        if len(ego_feat_window) >= self.z_local_window:
-                            ego_feat_window.pop(0)
-                            other_feat_window.pop(0)
-                        ego_feat_window.append(new_ego_gcn_feat)
-                        other_feat_window.append(new_other_gcn_feat)
-
-            ego_segments.append(segment_preds)
-
-        return ego_segments, z_local_outputs
-
-    def _compute_z_local(self, ego_feat, other_feat_window, mult_samp, NS, scene_graph, ego_feat_window=None):
-        """
-        Compute z_local deterministically from ego_feat (query) and other_feat_window (key/value).
-        Uses 2-layer cross-attention with residual + LayerNorm (UniAD/GameFormer style).
-
-        :param ego_feat: (num_ego, feat_size) or (num_ego, NS, feat_size)
-        :param other_feat_window: list of other_feat tensors, each (num_other, feat_size) or (num_other, NS, feat_size)
-        :param ego_feat_window: list of ego_feat tensors (if ego_full_query=True)
-        :return: z_local (num_ego, z_local_out_size) or (num_ego, NS, z_local_out_size) — deterministic, 64dim
-        """
-        num_ego = ego_feat.size(0)
-        device = ego_feat.device
-
-        if len(other_feat_window) == 0:
-            if mult_samp:
-                return torch.zeros(num_ego, NS, self.z_local_out_size, device=device)
-            else:
-                return torch.zeros(num_ego, self.z_local_out_size, device=device)
-
-        # GPU optimization: fetch ptr to CPU once before loop
-        ptr_cpu = scene_graph.ptr.cpu().tolist()
-        B = len(ptr_cpu) - 1
-
-        if not mult_samp:
-            window_stack = torch.stack(other_feat_window, dim=0)  # (W, num_other, D)
-            W, num_other_total, D = window_stack.size()
-
-            z_local_list = []
-            other_start = 0
-            for b in range(B):
-                num_agents_in_scene = ptr_cpu[b + 1] - ptr_cpu[b]
-                num_other_in_scene = num_agents_in_scene - 1
-
-                if num_other_in_scene == 0:
-                    z_local_list.append(torch.zeros(self.z_local_out_size, device=device))
-                    self._attn_weights_outputs.append(torch.zeros(1, 1, 1, device=device))
-                    continue
-
-                # Get other_feat for this scene: (W, num_other_in_scene, D)
-                other_feat_scene = window_stack[:, other_start:other_start + num_other_in_scene, :]
-                other_start += num_other_in_scene
-
-                # Temporal encoding: (num_other, W, D) → GRU → (num_other*W, D)
-                other_feat_seq = other_feat_scene.permute(1, 0, 2)
-                temporal_out, _ = self.z_local_temporal_gru(other_feat_seq)
-                temporal_encoded = temporal_out.reshape(-1, D)  # (num_other*W, D)
-
-                # Build Q
-                if self.ego_full_query and ego_feat_window is not None:
-                    ego_window_stack = torch.stack(ego_feat_window, dim=0)  # (W, num_ego, D)
-                    ego_feat_seq = ego_window_stack[:, b, :].unsqueeze(0)  # (1, W, D)
-                    ego_temporal_out, _ = self.z_local_ego_temporal_gru(ego_feat_seq)
-                    Q = ego_temporal_out  # (1, W, D)
-                else:
-                    Q = ego_feat[b:b + 1].unsqueeze(0)  # (1, 1, D)
-
-                KV = temporal_encoded.unsqueeze(0)  # (1, num_other*W, D)
-
-                # 2-layer cross-attention with residual + LayerNorm
-                attn1_out, _ = self.cross_attn_1(Q, KV, KV)
-                attn1_out = self.cross_attn_norm_1(attn1_out + Q)  # residual + norm
-
-                attn2_out, attn_w = self.cross_attn_2(attn1_out, KV, KV)
-                attn2_out = self.cross_attn_norm_2(attn2_out + attn1_out)  # residual + norm
-
-                self._attn_weights_outputs.append(attn_w.detach())
-
-                # Pool over Q_len if using full query
-                if self.ego_full_query and ego_feat_window is not None:
-                    attn2_out = attn2_out.mean(dim=1, keepdim=True)  # (1, 1, D)
-
-                # Self-attention: ego ↔ sur mutual interaction
-                # ego_token: attn2_out (1, 1, D), sur_tokens: mean-pooled per agent from temporal_encoded
-                sur_tokens = other_feat_seq.mean(dim=1)  # (num_other, D) — mean over temporal dim
-                sur_tokens = sur_tokens.unsqueeze(0)  # (1, num_other, D)
-                # Concat: [ego_token, sur_tokens] along seq dim
-                all_tokens = torch.cat([attn2_out, sur_tokens], dim=1)  # (1, 1+num_other, D)
-                sa_out, _ = self.interaction_self_attn(all_tokens, all_tokens, all_tokens)
-                sa_out = self.interaction_self_attn_norm(sa_out + all_tokens)  # residual + norm
-                # Extract ego token (index 0)
-                ego_out = sa_out[:, 0, :]  # (1, D)
-                ego_out = ego_out.squeeze(0)  # (D,)
-
-                # No projection — pass 64dim directly as z_local
-                z_local_list.append(ego_out)
-
-            z_local_out = torch.stack(z_local_list, dim=0)  # (num_ego, z_local_out_size)
-
-        else:
-            # Multiple samples case
-            window_stack = torch.stack(other_feat_window, dim=0)  # (W, num_other, NS, D)
-            W, num_other_total, _, D = window_stack.size()
-
-            z_local_list = []
-            other_start = 0
-            for b in range(B):
-                num_agents_in_scene = ptr_cpu[b + 1] - ptr_cpu[b]
-                num_other_in_scene = num_agents_in_scene - 1
-
-                if num_other_in_scene == 0:
-                    z_local_list.append(torch.zeros(NS, self.z_local_out_size, device=device))
-                    for _ in range(NS):
-                        self._attn_weights_outputs.append(torch.zeros(1, 1, 1, device=device))
-                    continue
-
-                other_feat_scene = window_stack[:, other_start:other_start + num_other_in_scene, :, :]
-                other_start += num_other_in_scene
-
-                z_local_samples = []
-                for s in range(NS):
-                    other_feat_s = other_feat_scene[:, :, s, :]  # (W, num_other, D)
-                    other_feat_seq = other_feat_s.permute(1, 0, 2)
-
-                    temporal_out, _ = self.z_local_temporal_gru(other_feat_seq)
-                    temporal_encoded = temporal_out.reshape(-1, D)
-
-                    if self.ego_full_query and ego_feat_window is not None:
-                        ego_window_stack = torch.stack(ego_feat_window, dim=0)
-                        ego_feat_seq = ego_window_stack[:, b, s, :].unsqueeze(0)
-                        ego_temporal_out, _ = self.z_local_ego_temporal_gru(ego_feat_seq)
-                        Q = ego_temporal_out
-                    else:
-                        Q = ego_feat[b, s:s + 1, :].unsqueeze(0)
-
-                    KV = temporal_encoded.unsqueeze(0)
-
-                    # 2-layer cross-attention with residual + LayerNorm
-                    attn1_out, _ = self.cross_attn_1(Q, KV, KV)
-                    attn1_out = self.cross_attn_norm_1(attn1_out + Q)
-
-                    attn2_out, attn_w = self.cross_attn_2(attn1_out, KV, KV)
-                    attn2_out = self.cross_attn_norm_2(attn2_out + attn1_out)
-
-                    self._attn_weights_outputs.append(attn_w.detach())
-
-                    if self.ego_full_query and ego_feat_window is not None:
-                        attn2_out = attn2_out.mean(dim=1, keepdim=True)  # (1, 1, D)
-
-                    # Self-attention: ego ↔ sur mutual interaction
-                    sur_tokens = other_feat_seq.mean(dim=1)  # (num_other, D)
-                    sur_tokens = sur_tokens.unsqueeze(0)  # (1, num_other, D)
-                    all_tokens = torch.cat([attn2_out, sur_tokens], dim=1)  # (1, 1+num_other, D)
-                    sa_out, _ = self.interaction_self_attn(all_tokens, all_tokens, all_tokens)
-                    sa_out = self.interaction_self_attn_norm(sa_out + all_tokens)
-                    ego_out = sa_out[:, 0, :].squeeze(0)  # (D,)
-
-                    z_local_samples.append(ego_out)
-
-                z_local_list.append(torch.stack(z_local_samples, dim=0))  # (NS, z_local_out_size)
-
-            z_local_out = torch.stack(z_local_list, dim=0)  # (num_ego, NS, z_local_out_size)
-
-        return z_local_out
+        pos_unnorm = self.normalizer.unnormalize(pos_normalized)
+        mapixes = map_idx[scene_graph.batch]
+        map_obs = map_env.get_map_crop_pos(pos_unnorm, mapixes).to(torch.float)  # (NA, C, H, W)
+        map_early = self.map_conv_early(map_obs)  # (NA, ch, H', W')
+        map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (NA, num_tokens, ch)
+        return map_tokens
 
     def rsample(self, mean, var):
-        '''
-        Return gaussian sample of (mu, var) using reparameterization trick.
-        '''
         eps = torch.randn_like(mean)
-        z = mean + eps*torch.sqrt(var)
-        return z
-
-    # def sim_traj(self, init_state, a, ddh, vehicle_len):
-    #     '''
-    #     Everything is assumed to be UNNORMALIZED.
-    #     :param init_state: (B, NA, 6)
-    #     :param a: acceleration profile (B, NA, FT)
-    #     :param ddh: yaw accel profile (B, NA, FT)
-    #     :param vehicle_len: length of vehicles (B, NA)
-    #     '''
-    #     cur_kinematics = kinematics2angle(init_state)
-    #     sim_steps = a.size(-1)
-    #     kin_seq = []
-    #     for t in range(sim_steps):
-    #         cur_kinematics = car_dynamics(cur_kinematics, a[:,:,t], ddh[:,:,t],
-    #                                     self.bicycle_params['dt'], 0, 1, 2, 3,
-    #                                     4, vehicle_len, self.bicycle_params['maxhdot'],
-    #                                     self.bicycle_params['maxs'])
-    #         kin_seq.append(kinematics2vec(cur_kinematics))
-        
-    #     traj_out = torch.stack(kin_seq, dim=2)
-    #     return traj_out
-
+        return mean + eps * torch.sqrt(var)
 
     def sim_traj(self, init_state, a, ddh, vehicle_len):
-        '''
-        Everything is assumed to be UNNORMALIZED.
-        :param init_state: (B, NA, 6)
-        :param a: acceleration profile (B, NA, FT)
-        :param ddh: yaw accel profile (B, NA, FT)
-        :param vehicle_len: length of vehicles (B, NA)
-        '''
+        """Bicycle model simulation. Everything is UNNORMALIZED."""
         cur_kinematics = kinematics2angle(init_state)
         sim_steps = a.size(-1)
         kin_seq = []
         for t in range(sim_steps):
-            cur_kinematics = car_dynamics(cur_kinematics, a[:,:,t], ddh[:,:,t],
-                                        self.dt, 0, 1, 2, 3,
-                                        4, vehicle_len, self.bicycle_params['maxhdot'],
-                                        self.bicycle_params['maxs'])
+            cur_kinematics = car_dynamics(cur_kinematics, a[:, :, t], ddh[:, :, t],
+                                          self.dt, 0, 1, 2, 3,
+                                          4, vehicle_len, self.bicycle_params['maxhdot'],
+                                          self.bicycle_params['maxs'])
             kin_seq.append(kinematics2vec(cur_kinematics))
-        
-        traj_out = torch.stack(kin_seq, dim=2)
-        return traj_out
+        return torch.stack(kin_seq, dim=2)
 
-    #
-    # Phase 2 training utilities
-    #
+    # ============================================================
+    # Phase control & freeze/unfreeze
+    # ============================================================
+
+    def set_phase(self, phase):
+        """Set training phase: 1=pretrain, 2=finetune."""
+        self.phase = phase
 
     def freeze_z_global(self):
-        """
-        Freeze z_global encoder for Phase 2 training.
-        After Phase 1, freeze these to only train z_local.
-        """
+        """Freeze z_global encoder for Phase 2."""
         frozen_modules = [
-            self.latent_prior_net,
-            self.latent_posterior_net,
-            self.step_feature_extractor,
-            self.temporal_gcn_encoder,
-            self.prior_temporal_gru,
-            self.positional_encoding,
-            self.transformer_encoder,
-            self.map_conv,
-            self.map_feature,
+            self.latent_prior_net, self.latent_posterior_net,
+            self.step_feature_extractor, self.temporal_gcn_encoder,
+            self.prior_temporal_gru, self.positional_encoding, self.transformer_encoder,
+            self.map_conv_early, self.map_conv_late, self.map_feature,
         ]
         for module in frozen_modules:
             for param in module.parameters():
                 param.requires_grad = False
-
         Logger.log('Frozen z_global encoder (prior, posterior, GCN, temporal, map encoders)')
 
     def unfreeze_z_global(self):
-        """
-        Unfreeze z_global encoder for joint training or fine-tuning.
-        """
+        """Unfreeze z_global encoder."""
         unfrozen_modules = [
-            self.latent_prior_net,
-            self.latent_posterior_net,
-            self.step_feature_extractor,
-            self.temporal_gcn_encoder,
-            self.prior_temporal_gru,
-            self.positional_encoding,
-            self.transformer_encoder,
-            self.map_conv,
-            self.map_feature,
+            self.latent_prior_net, self.latent_posterior_net,
+            self.step_feature_extractor, self.temporal_gcn_encoder,
+            self.prior_temporal_gru, self.positional_encoding, self.transformer_encoder,
+            self.map_conv_early, self.map_conv_late, self.map_feature,
         ]
         for module in unfrozen_modules:
             for param in module.parameters():
                 param.requires_grad = True
-
         Logger.log('Unfrozen z_global encoder')
 
     def freeze_for_finetuning(self):
         """
-        Freeze all modules EXCEPT z_local components and ego decoder.
-        For fine-tuning with adversarial solution data.
+        Freeze all EXCEPT ego decoder components + intent codebook.
 
-        FROZEN: z_global encoder + GCN + map + sur decoder
-        TRAINABLE: z_local + ego decoder + ego warmup
+        FROZEN: encoder, z_global, sur decoder, interaction GCN, map CNN, sur history/map attn
+        TRAINABLE: ego history attn, ego map attn, ego GRU, ego output head,
+                   intent codebook, intent CE head, sur pred head,
+                   ego warmup GRU
         """
         frozen_modules = [
-            # z_global encoder
-            self.latent_prior_net,
-            self.latent_posterior_net,
-            self.step_feature_extractor,
-            self.temporal_gcn_encoder,
-            self.prior_temporal_gru,
-            self.positional_encoding,
-            self.transformer_encoder,
-            # Map encoder
-            self.map_conv,
-            self.map_feature,
+            # Encoder
+            self.latent_prior_net, self.latent_posterior_net,
+            self.step_feature_extractor, self.temporal_gcn_encoder,
+            self.prior_temporal_gru, self.positional_encoding, self.transformer_encoder,
+            # Map
+            self.map_conv_early, self.map_conv_late, self.map_feature,
+            # Interaction GCN
+            self.interaction_gcn,
             # Sur decoder
-            self.decoder_net,
-            self.decoder_memory,
+            self.sur_history_attn, self.sur_map_attn,
+            self.sur_decoder_gru, self.sur_output_head,
+            self.sur_warmup_gru,
+            # Ego pred head (sur→ego, Phase 1 only)
+            self.ego_pred_head,
         ]
         for module in frozen_modules:
             for param in module.parameters():
@@ -2016,67 +1595,70 @@ class TrafficPlannerModel(nn.Module):
 
         num_frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)
         num_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        Logger.log('Frozen for fine-tuning: %d params frozen, %d params trainable' % (num_frozen, num_trainable))
+        Logger.log(f'Frozen for fine-tuning: {num_frozen} params frozen, {num_trainable} params trainable')
+
+    # ============================================================
+    # Analysis getters
+    # ============================================================
 
     def get_z_local(self):
-        """
-        Get z_local from the last forward pass.
-        Returns stacked z_local across all timesteps (deterministic values).
-
-        :return: (FT, num_ego, z_local_out_size=64) or (FT, num_ego, NS, z_local_out_size=64) if batched
-        """
+        """Get z_local from last forward pass. (FT, num_ego, intent_dim)"""
         if not hasattr(self, '_z_local_outputs') or len(self._z_local_outputs) == 0:
             return None
         return torch.stack(self._z_local_outputs, dim=0)
 
     def get_z_local_mean(self):
-        """
-        Backward-compatible alias for get_z_local().
-        z_local is now deterministic, so mean == actual value.
-        """
+        """Backward-compatible alias."""
         return self.get_z_local()
 
     def get_z_local_var(self):
-        """
-        z_local is now deterministic — no variance.
-        Returns None for backward compatibility.
-        """
+        """z_local is discrete — no variance."""
         return None
 
-    def get_attn_weights(self):
-        """
-        Get cross-attention weights from the last forward pass.
-        Each element: (1, num_heads, Q_len, KV_len) per timestep.
-
-        :return: list of tensors, length = FT (12 timesteps)
-        """
-        if not hasattr(self, '_attn_weights_outputs') or len(self._attn_weights_outputs) == 0:
+    def get_intent_weights(self):
+        """Get intent selection weights. (FT, num_ego, K)"""
+        if not hasattr(self, '_intent_weights_outputs') or len(self._intent_weights_outputs) == 0:
             return None
-        return self._attn_weights_outputs
+        return torch.stack(self._intent_weights_outputs, dim=0)
+
+    def get_ego_map_attn_weights(self):
+        """Get ego map attention weights (with gradient). List of (num_ego, 1, num_tokens)."""
+        if not hasattr(self, '_ego_map_attn_weights_outputs') or len(self._ego_map_attn_weights_outputs) == 0:
+            return None
+        return self._ego_map_attn_weights_outputs
+
+    def get_sur_map_attn_weights(self):
+        """Get sur map attention weights (with gradient). List of (num_sur, 1, num_tokens)."""
+        if not hasattr(self, '_sur_map_attn_weights_outputs') or len(self._sur_map_attn_weights_outputs) == 0:
+            return None
+        return self._sur_map_attn_weights_outputs
+
+    def get_map_attn_weights(self):
+        """Get ego map attention weights (detached, for analysis)."""
+        w = self.get_ego_map_attn_weights()
+        if w is None:
+            return None
+        return [x.detach() for x in w]
+
+    def get_attn_weights(self):
+        return self.get_map_attn_weights()
+
+    def get_sur_pred_outputs(self):
+        """Get predicted sur deltas. List of (num_ego, sur_pred_dim) per timestep."""
+        if not hasattr(self, '_sur_pred_outputs') or len(self._sur_pred_outputs) == 0:
+            return None
+        return self._sur_pred_outputs
+
+    def get_ego_pred_outputs(self):
+        """Get predicted ego deltas. List of (num_sur, sur_pred_dim) per timestep."""
+        if not hasattr(self, '_ego_pred_outputs') or len(self._ego_pred_outputs) == 0:
+            return None
+        return self._ego_pred_outputs
 
     def get_z_local_sparsity_loss(self, target_sparsity=0.1):
-        """
-        Compute sparsity loss for z_local to encourage minimal deviation from z_global.
-
-        The idea: z_local should only activate when necessary (reactive maneuvers),
-        otherwise it should be close to zero (relying on z_global).
-
-        :param target_sparsity: target fraction of active z_local dimensions
-        :return: sparsity loss scalar
-        """
+        """Backward-compatible sparsity loss (unused in redesign but kept for interface)."""
         z_local = self.get_z_local()
         if z_local is None:
             return torch.tensor(0.0)
-
-        # L1 sparsity: encourage z_local to be sparse
         l1_loss = torch.mean(torch.abs(z_local))
-
-        # Optional: KL divergence to encourage specific sparsity level
-        # Using mean activation as proxy for sparsity
-        mean_activation = torch.mean(torch.abs(z_local), dim=-1)  # per ego per timestep
-        sparsity_target = torch.full_like(mean_activation, target_sparsity)
-        kl_loss = torch.mean((sparsity_target * torch.log(sparsity_target / (mean_activation + 1e-8) + 1e-8) +
-                              (1 - sparsity_target) * torch.log((1 - sparsity_target) / (1 - mean_activation + 1e-8) + 1e-8)))
-
-        return l1_loss + 0.1 * kl_loss
-
+        return l1_loss
