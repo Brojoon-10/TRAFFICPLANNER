@@ -162,12 +162,13 @@ def test_forward_pass(model, device):
     assert pred['posterior_out'][0].shape == (NA, 32), f"Expected post_mu (NA, 32), got {pred['posterior_out'][0].shape}"
 
     # Check analysis outputs
-    z_local = model.get_z_local()
+    z_local = model.get_z_local_stacked()
     assert z_local is not None, "z_local should be available after forward"
     assert z_local.shape == (12, B, 32), f"Expected z_local (12, B, 32), got {z_local.shape}"
 
-    intent_w = model.get_intent_weights()
-    assert intent_w is not None, "intent_weights should be available"
+    intent_w_raw = model.get_intent_weights()
+    assert intent_w_raw is not None, "intent_weights should be available"
+    intent_w = torch.stack(intent_w_raw, dim=0)
     assert intent_w.shape == (12, B, 8), f"Expected intent_weights (12, B, 8), got {intent_w.shape}"
 
     map_attn = model.get_map_attn_weights()
@@ -441,8 +442,9 @@ def test_phase2_forward(model, device):
     model.train()
     pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
 
-    z_local = model.get_z_local()
-    intent_w = model.get_intent_weights()
+    z_local = model.get_z_local_stacked()
+    intent_w_raw = model.get_intent_weights()
+    intent_w = torch.stack(intent_w_raw, dim=0)
 
     # In Phase 2, z_local should be non-zero (intent codebook active)
     z_local_norm = z_local.norm().item()

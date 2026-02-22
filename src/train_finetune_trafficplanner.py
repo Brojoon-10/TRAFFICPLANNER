@@ -71,10 +71,16 @@ def parse_cfg():
 
     # TrafficPlannerModel architecture (must match pretrained)
     parser.add_argument('--z_local_size', type=int, default=32)
-    parser.add_argument('--z_local_window', type=int, default=4)
-    parser.add_argument('--ego_full_query', type=str2bool, default=False)
-    parser.add_argument('--growing_window', type=str2bool, default=False,
-                        help='If True, accumulate all history for z_local; if False, use fixed z_local_window size')
+    parser.add_argument('--num_intents', type=int, default=8,
+                        help='Number of intent codebook entries (K)')
+    parser.add_argument('--hist_attn_nhead', type=int, default=4,
+                        help='Number of heads for decoder history attention')
+    parser.add_argument('--map_attn_nhead', type=int, default=4,
+                        help='Number of heads for decoder map cross-attention')
+    parser.add_argument('--sur_pred_dim', type=int, default=2,
+                        help='Predicted surrounding agent delta dimension (dx, dy)')
+    parser.add_argument('--map_recrop', type=str2bool, default=False,
+                        help='Re-crop map tokens at each decode step')
 
     # Loss weights
     parser.add_argument('--loss_recon', type=float, default=1.0)
@@ -273,17 +279,20 @@ def main():
         future_feat_size=cfg.future_feat_size,
         latent_size=cfg.latent_size,
         z_local_size=cfg.z_local_size,
-        z_local_window=cfg.z_local_window,
         output_bicycle=cfg.model_output_bicycle,
         dt=cfg.dt,
         conv_channel_in=map_env.num_layers,
         conv_kernel_list=cfg.conv_kernel_list,
         conv_stride_list=cfg.conv_stride_list,
         conv_filter_list=cfg.conv_filter_list,
-        ego_full_query=cfg.ego_full_query,
-        growing_window=cfg.growing_window,
         tf_max_annealing_epoch=cfg.tf_max_annealing_epoch,
-        tf_init_segment_len=cfg.tf_init_segment_len
+        tf_init_segment_len=cfg.tf_init_segment_len,
+        # Redesign params
+        num_intents=cfg.num_intents,
+        hist_attn_nhead=cfg.hist_attn_nhead,
+        map_attn_nhead=cfg.map_attn_nhead,
+        sur_pred_dim=cfg.sur_pred_dim,
+        map_recrop=cfg.map_recrop,
     ).to(device)
 
     # Load pre-trained checkpoint

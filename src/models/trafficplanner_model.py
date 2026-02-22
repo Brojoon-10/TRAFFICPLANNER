@@ -1240,6 +1240,10 @@ class TrafficPlannerModel(nn.Module):
             ego_gru_hidden = gt_hidden_snapshots[target_t].clone()
 
             segment_preds = []
+            seg_sur_pred = []
+            seg_map_attn = []
+            seg_z_local = []
+            seg_intent_w = []
 
             for step in range(tf_segment_len):
                 actual_t = target_t + step
@@ -1280,13 +1284,11 @@ class TrafficPlannerModel(nn.Module):
 
                 # Auxiliary: sur prediction
                 predicted_sur_delta = self.sur_pred_head(ego_hist_ctx)
-                if step == 0:
-                    self._sur_pred_outputs.append(predicted_sur_delta.detach())
+                seg_sur_pred.append(predicted_sur_delta.detach())
 
                 # Map Attention
                 ego_map_ctx, ego_map_attn_w = self.ego_map_attn(ego_gru_h_last, cur_ego_map_tokens)
-                if step == 0:
-                    self._ego_map_attn_weights_outputs.append(ego_map_attn_w)
+                seg_map_attn.append(ego_map_attn_w)
 
                 # Intent
                 if step == 0:
@@ -1307,9 +1309,8 @@ class TrafficPlannerModel(nn.Module):
                 if not self.use_z_local:
                     z_local = torch.zeros_like(z_local)
 
-                if step == 0:
-                    self._z_local_outputs.append(z_local.detach())
-                    self._intent_weights_outputs.append(intent_weights.detach())
+                seg_z_local.append(z_local.detach())
+                seg_intent_w.append(intent_weights.detach())
 
                 # Ego GRU
                 ego_lw_flat = cur_lw[ego_mask]
@@ -1335,6 +1336,10 @@ class TrafficPlannerModel(nn.Module):
                         ego_prev_state = ego_state_global
 
             ego_segments.append(segment_preds)
+            self._sur_pred_outputs.append(seg_sur_pred)
+            self._ego_map_attn_weights_outputs.append(seg_map_attn)
+            self._z_local_outputs.append(seg_z_local)
+            self._intent_weights_outputs.append(seg_intent_w)
 
         return ego_segments
 
@@ -1602,24 +1607,39 @@ class TrafficPlannerModel(nn.Module):
     # ============================================================
 
     def get_z_local(self):
-        """Get z_local from last forward pass. (FT, num_ego, intent_dim)"""
+        """Get z_local from last forward pass.
+        AR mode: list of FT tensors (num_ego, intent_dim)
+        TF mode: list of segments, each segment is list of tensors
+        """
         if not hasattr(self, '_z_local_outputs') or len(self._z_local_outputs) == 0:
             return None
-        return torch.stack(self._z_local_outputs, dim=0)
+        return self._z_local_outputs
+
+    def get_z_local_stacked(self):
+        """Get z_local stacked as (FT, num_ego, intent_dim). AR mode only."""
+        raw = self.get_z_local()
+        if raw is None:
+            return None
+        if isinstance(raw[0], list):
+            return None  # TF mode — cannot stack
+        return torch.stack(raw, dim=0)
 
     def get_z_local_mean(self):
         """Backward-compatible alias."""
-        return self.get_z_local()
+        return self.get_z_local_stacked()
 
     def get_z_local_var(self):
         """z_local is discrete — no variance."""
         return None
 
     def get_intent_weights(self):
-        """Get intent selection weights. (FT, num_ego, K)"""
+        """Get intent selection weights.
+        AR mode: list of FT tensors (num_ego, K)
+        TF mode: list of segments, each segment is list of tensors
+        """
         if not hasattr(self, '_intent_weights_outputs') or len(self._intent_weights_outputs) == 0:
             return None
-        return torch.stack(self._intent_weights_outputs, dim=0)
+        return self._intent_weights_outputs
 
     def get_ego_map_attn_weights(self):
         """Get ego map attention weights (with gradient). List of (num_ego, 1, num_tokens)."""
@@ -1638,6 +1658,9 @@ class TrafficPlannerModel(nn.Module):
         w = self.get_ego_map_attn_weights()
         if w is None:
             return None
+        # Handle both flat list (AR) and segmented list (TF)
+        if len(w) > 0 and isinstance(w[0], list):
+            return [[x.detach() for x in seg] for seg in w]
         return [x.detach() for x in w]
 
     def get_attn_weights(self):

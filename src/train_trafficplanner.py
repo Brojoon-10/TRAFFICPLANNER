@@ -160,6 +160,10 @@ def parse_cfg():
                         help='Intent classification CE loss weight (Phase 2 only)')
     parser.add_argument('--loss_map_attn', type=float, default=0.0,
                         help='Map attention guidance loss weight')
+    parser.add_argument('--map_gt_steps', type=int, default=6,
+                        help='Number of future GT steps for map attention soft label')
+    parser.add_argument('--map_gt_decay_lambda', type=float, default=0.3,
+                        help='Exponential decay lambda for map attention GT weights: w_t = exp(-lambda*t) / sum')
 
     args = parser.parse_args()
     config_dict = vars(args)
@@ -488,6 +492,11 @@ def main():
     #
     # Initialize TrafficPlannerLoss
     #
+    aux_cfg = {
+        'map_gt_steps': getattr(cfg, 'map_gt_steps', 6),
+        'map_gt_decay_lambda': getattr(cfg, 'map_gt_decay_lambda', 0.3),
+    }
+
     loss_fn = TrafficPlannerLoss(
         loss_weights,
         train_dataset.get_state_normalizer(),
@@ -497,7 +506,8 @@ def main():
         use_potential_loss=cfg.use_potential_loss,
         use_veh_potential=cfg.use_veh_potential,
         potential_cfg=potential_cfg,
-        sparsity_cfg=sparsity_cfg
+        sparsity_cfg=sparsity_cfg,
+        aux_cfg=aux_cfg
     ).to(device)
 
     Logger.log('Num model params: %d' % (count_params(model)))

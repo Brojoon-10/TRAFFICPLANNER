@@ -371,8 +371,8 @@ class TrafficPlannerLoss(nn.Module):
         :param loss_weights: dict of weightings for loss terms
         :param aux_cfg: dict of auxiliary loss config (optional)
             - sur_pred_dim: 2 (dx, dy)
-            - map_gt_steps: 4
-            - map_gt_weights: [0.4, 0.3, 0.2, 0.1]
+            - map_gt_steps: 6
+            - map_gt_decay_lambda: 0.3 (exponential decay rate for GT step weights)
             - acc_bins: [-1.0, 1.0]  (3 bins: decel, maintain, accel)
             - yaw_bins: [-0.1, 0.1]  (3 bins: left, straight, right)
         """
@@ -390,7 +390,7 @@ class TrafficPlannerLoss(nn.Module):
         default_aux_cfg = {
             'sur_pred_dim': 2,
             'map_gt_steps': 6,
-            'map_gt_weights': [0.3, 0.25, 0.2, 0.15, 0.07, 0.03],
+            'map_gt_decay_lambda': 0.3,  # exponential decay: w_t = exp(-λt) / Σexp(-λt)
             'acc_bins': [-1.0, 1.0],   # normalized thresholds
             'yaw_bins': [-0.1, 0.1],
         }
@@ -501,21 +501,45 @@ class TrafficPlannerLoss(nn.Module):
             if sur_pred_list is not None and len(sur_pred_list) > 0:
                 sur_pred_loss = torch.tensor(0.0, device=device)
                 count = 0
-                for t, pred_delta in enumerate(sur_pred_list):
-                    if t >= FT:
-                        break
-                    # GT sur delta: gt_future[sur_idx, t, :2] - gt_future[sur_idx, t-1, :2]
-                    sur_gt_state = gt_future[~ego_mask]  # (num_sur, FT, 6)
-                    if t == 0:
-                        sur_prev = scene_graph.past[:, -1, :2][~ego_mask]  # (num_sur, 2)
-                    else:
-                        sur_prev = sur_gt_state[:, t - 1, :2]
-                    gt_sur_delta = sur_gt_state[:, t, :2] - sur_prev  # (num_sur, 2)
-                    # pred_delta is (num_ego, 2) — each ego predicts its paired sur's delta
-                    # For simplicity, use mean across all sur agents if multiple
-                    gt_delta_per_ego = gt_sur_delta.mean(dim=0, keepdim=True).expand_as(pred_delta)
-                    sur_pred_loss = sur_pred_loss + nn.functional.mse_loss(pred_delta, gt_delta_per_ego)
-                    count += 1
+                sur_gt_state = gt_future[~ego_mask]  # (num_sur, FT, 6)
+
+                # Determine format: segment structure (list of lists) or flat list
+                is_segmented = isinstance(sur_pred_list[0], list)
+
+                if is_segmented:
+                    # TF mode: sur_pred_list[seg_idx] = [pred_step0, pred_step1, ...]
+                    for seg_idx, seg_preds in enumerate(sur_pred_list):
+                        seg_loss = torch.tensor(0.0, device=device)
+                        seg_count = 0
+                        for step, pred_delta in enumerate(seg_preds):
+                            actual_t = seg_idx + step
+                            if actual_t >= FT:
+                                break
+                            if actual_t == 0:
+                                sur_prev = scene_graph.past[:, -1, :2][~ego_mask]
+                            else:
+                                sur_prev = sur_gt_state[:, actual_t - 1, :2]
+                            gt_sur_delta = sur_gt_state[:, actual_t, :2] - sur_prev
+                            gt_delta_per_ego = gt_sur_delta.mean(dim=0, keepdim=True).expand_as(pred_delta)
+                            seg_loss = seg_loss + nn.functional.mse_loss(pred_delta, gt_delta_per_ego)
+                            seg_count += 1
+                        if seg_count > 0:
+                            sur_pred_loss = sur_pred_loss + seg_loss / seg_count
+                            count += 1
+                else:
+                    # AR mode: flat list [t=0, t=1, ..., t=11]
+                    for t, pred_delta in enumerate(sur_pred_list):
+                        if t >= FT:
+                            break
+                        if t == 0:
+                            sur_prev = scene_graph.past[:, -1, :2][~ego_mask]
+                        else:
+                            sur_prev = sur_gt_state[:, t - 1, :2]
+                        gt_sur_delta = sur_gt_state[:, t, :2] - sur_prev
+                        gt_delta_per_ego = gt_sur_delta.mean(dim=0, keepdim=True).expand_as(pred_delta)
+                        sur_pred_loss = sur_pred_loss + nn.functional.mse_loss(pred_delta, gt_delta_per_ego)
+                        count += 1
+
                 if count > 0:
                     sur_pred_loss = sur_pred_loss / count
                     aux_loss = aux_loss + sur_pred_w * sur_pred_loss
@@ -548,11 +572,10 @@ class TrafficPlannerLoss(nn.Module):
         # ---- (A) Intent CE Loss (Phase 2 only) ----
         intent_ce_w = self.loss_weights.get('intent_ce', 0.0)
         if intent_ce_w > 0.0 and self.phase == 2 and model is not None:
-            z_local = model.get_z_local()  # (FT, num_ego, intent_dim)
-            if z_local is not None and hasattr(model, 'intent_ce_head'):
+            z_local_raw = model.get_z_local()
+            if z_local_raw is not None and hasattr(model, 'intent_ce_head'):
                 # Compute GT acc/yaw classes from GT future
                 ego_gt = gt_future[ego_mask]  # (num_ego, FT, 6)
-                # speed at each step, compute acceleration
                 ego_speed = ego_gt[:, :, 4]  # (num_ego, FT)
                 ego_prev_speed = torch.cat([scene_graph.past[:, -1, 4:5][ego_mask], ego_speed[:, :-1]], dim=1)
                 ego_acc = (ego_speed - ego_prev_speed) / 0.5  # (num_ego, FT)
@@ -561,30 +584,50 @@ class TrafficPlannerLoss(nn.Module):
                 acc_bins = self.aux_cfg['acc_bins']
                 yaw_bins = self.aux_cfg['yaw_bins']
 
-                # Bin: 0=decel, 1=maintain, 2=accel
                 acc_class = torch.zeros_like(ego_acc, dtype=torch.long)
                 acc_class[ego_acc > acc_bins[1]] = 2
                 acc_class[(ego_acc >= acc_bins[0]) & (ego_acc <= acc_bins[1])] = 1
 
-                # Bin: 0=left, 1=straight, 2=right
                 yaw_class = torch.zeros_like(ego_yaw_rate, dtype=torch.long)
                 yaw_class[ego_yaw_rate > yaw_bins[1]] = 2
                 yaw_class[(ego_yaw_rate >= yaw_bins[0]) & (ego_yaw_rate <= yaw_bins[1])] = 1
 
-                # Combined class: 3*acc + yaw → 9 classes
                 gt_class = acc_class * 3 + yaw_class  # (num_ego, FT)
 
                 intent_ce_loss = torch.tensor(0.0, device=device)
-                num_steps = min(z_local.size(0), FT)
-                for t in range(num_steps):
-                    z_t = z_local[t]  # (num_ego, intent_dim)
-                    logits = model.intent_ce_head(z_t)  # (num_ego, 9)
-                    intent_ce_loss = intent_ce_loss + nn.functional.cross_entropy(logits, gt_class[:, t])
+                is_segmented = isinstance(z_local_raw[0], list)
 
-                if num_steps > 0:
-                    intent_ce_loss = intent_ce_loss / num_steps
-                    aux_loss = aux_loss + intent_ce_w * intent_ce_loss
-                    loss_out_dict['intent_ce_loss'] = intent_ce_loss.detach().view((1,))
+                if is_segmented:
+                    # TF mode: z_local_raw[seg_idx] = [z_step0, z_step1, ...]
+                    count = 0
+                    for seg_idx, seg_z in enumerate(z_local_raw):
+                        seg_loss = torch.tensor(0.0, device=device)
+                        seg_count = 0
+                        for step, z_t in enumerate(seg_z):
+                            actual_t = seg_idx + step
+                            if actual_t >= FT:
+                                break
+                            logits = model.intent_ce_head(z_t)
+                            seg_loss = seg_loss + nn.functional.cross_entropy(logits, gt_class[:, actual_t])
+                            seg_count += 1
+                        if seg_count > 0:
+                            intent_ce_loss = intent_ce_loss + seg_loss / seg_count
+                            count += 1
+                    if count > 0:
+                        intent_ce_loss = intent_ce_loss / count
+                        aux_loss = aux_loss + intent_ce_w * intent_ce_loss
+                        loss_out_dict['intent_ce_loss'] = intent_ce_loss.detach().view((1,))
+                else:
+                    # AR mode: flat list [t=0, t=1, ..., t=11]
+                    num_steps = min(len(z_local_raw), FT)
+                    for t in range(num_steps):
+                        z_t = z_local_raw[t]
+                        logits = model.intent_ce_head(z_t)
+                        intent_ce_loss = intent_ce_loss + nn.functional.cross_entropy(logits, gt_class[:, t])
+                    if num_steps > 0:
+                        intent_ce_loss = intent_ce_loss / num_steps
+                        aux_loss = aux_loss + intent_ce_w * intent_ce_loss
+                        loss_out_dict['intent_ce_loss'] = intent_ce_loss.detach().view((1,))
 
         # ---- (D) Map Attn Guidance Loss: attn_weights vs GT future position ----
         # Phase 1: ego + sur, Phase 2: ego only (sur frozen)
@@ -617,7 +660,12 @@ class TrafficPlannerLoss(nn.Module):
             return None
 
         map_gt_steps = self.aux_cfg['map_gt_steps']
-        map_gt_weights = self.aux_cfg['map_gt_weights']
+        # Generate weights via exponential decay: w_t = exp(-λt) / Σexp(-λt)
+        # λ=0.3 → [0.311, 0.230, 0.170, 0.126, 0.094, 0.069]
+        decay_lambda = self.aux_cfg['map_gt_decay_lambda']
+        t_arr = np.arange(map_gt_steps, dtype=np.float64)
+        map_gt_weights = np.exp(-decay_lambda * t_arr)
+        map_gt_weights = (map_gt_weights / map_gt_weights.sum()).tolist()
         grid_size = model.map_token_spatial  # 29
         num_tokens = grid_size * grid_size  # 841
 
@@ -634,53 +682,106 @@ class TrafficPlannerLoss(nn.Module):
         total_loss = torch.tensor(0.0, device=device)
         count = 0
 
-        num_steps = min(len(ego_attn_list), FT)
+        # Determine format: segment structure (list of lists) or flat list (AR mode)
+        is_segmented = len(ego_attn_list) > 0 and isinstance(ego_attn_list[0], list)
 
-        for t in range(num_steps):
-            remaining = min(map_gt_steps, FT - t - 1)
-            if remaining <= 0:
-                continue
+        if is_segmented:
+            # TF mode: ego_attn_list[seg_idx] = [attn_step0, attn_step1, ...]
+            for seg_idx, seg_attn in enumerate(ego_attn_list):
+                seg_loss = torch.tensor(0.0, device=device)
+                seg_count = 0
+                for step, ego_attn_w in enumerate(seg_attn):
+                    actual_t = seg_idx + step
+                    remaining = min(map_gt_steps, FT - actual_t - 1)
+                    if remaining <= 0:
+                        continue
 
-            # --- Ego map attn guidance ---
-            ego_attn_w = ego_attn_list[t]  # (num_ego, 1, num_tokens)
-            ego_attn_dist = ego_attn_w.squeeze(1)  # (num_ego, num_tokens)
+                    ego_attn_dist = ego_attn_w.squeeze(1)
+                    if actual_t == 0:
+                        ego_frame = scene_graph.past[:, -1, :4][ego_mask]
+                    else:
+                        ego_frame = gt_future[ego_mask][:, actual_t - 1, :4]
 
-            # Current ego position (frame for local transform)
-            if t == 0:
-                ego_frame = scene_graph.past[:, -1, :4][ego_mask]  # (num_ego, 4) normalized
-            else:
-                ego_frame = gt_future[ego_mask][:, t - 1, :4]
+                    ego_soft_label = self._make_soft_label(
+                        ego_frame, gt_future[ego_mask], actual_t, remaining,
+                        map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
+                        pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
 
-            ego_soft_label = self._make_soft_label(
-                ego_frame, gt_future[ego_mask], t, remaining,
-                map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
-                pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
+                    if ego_soft_label is not None:
+                        ego_kl = self._kl_with_epsilon(ego_soft_label, ego_attn_dist)
+                        seg_loss = seg_loss + ego_kl
+                        seg_count += 1
 
-            if ego_soft_label is not None:
-                # KL(soft_label || attn_dist) — soft_label is target
-                ego_kl = self._kl_with_epsilon(ego_soft_label, ego_attn_dist)
-                total_loss = total_loss + ego_kl
-                count += 1
+                if seg_count > 0:
+                    total_loss = total_loss + seg_loss / seg_count
+                    count += 1
 
-            # --- Sur map attn guidance (Phase 1 only) ---
-            if self.phase == 1 and sur_attn_list is not None and t < len(sur_attn_list):
-                sur_attn_w = sur_attn_list[t]  # (num_sur, 1, num_tokens)
-                sur_attn_dist = sur_attn_w.squeeze(1)
+            # Sur attn is always flat (sur_loop is full AR)
+            if self.phase == 1 and sur_attn_list is not None and len(sur_attn_list) > 0:
+                sur_loss = torch.tensor(0.0, device=device)
+                sur_count = 0
+                for t in range(min(len(sur_attn_list), FT)):
+                    remaining = min(map_gt_steps, FT - t - 1)
+                    if remaining <= 0:
+                        continue
+                    sur_attn_w = sur_attn_list[t]
+                    sur_attn_dist = sur_attn_w.squeeze(1)
+                    if t == 0:
+                        sur_frame = scene_graph.past[:, -1, :4][~ego_mask]
+                    else:
+                        sur_frame = gt_future[~ego_mask][:, t - 1, :4]
+                    sur_soft_label = self._make_soft_label(
+                        sur_frame, gt_future[~ego_mask], t, remaining,
+                        map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
+                        pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
+                    if sur_soft_label is not None:
+                        sur_kl = self._kl_with_epsilon(sur_soft_label, sur_attn_dist)
+                        sur_loss = sur_loss + sur_kl
+                        sur_count += 1
+                if sur_count > 0:
+                    total_loss = total_loss + sur_loss / sur_count
+                    count += 1
+        else:
+            # AR mode: flat list [t=0, t=1, ..., t=11]
+            num_steps = min(len(ego_attn_list), FT)
+            for t in range(num_steps):
+                remaining = min(map_gt_steps, FT - t - 1)
+                if remaining <= 0:
+                    continue
+
+                ego_attn_w = ego_attn_list[t]
+                ego_attn_dist = ego_attn_w.squeeze(1)
 
                 if t == 0:
-                    sur_frame = scene_graph.past[:, -1, :4][~ego_mask]
+                    ego_frame = scene_graph.past[:, -1, :4][ego_mask]
                 else:
-                    sur_frame = gt_future[~ego_mask][:, t - 1, :4]
+                    ego_frame = gt_future[ego_mask][:, t - 1, :4]
 
-                sur_soft_label = self._make_soft_label(
-                    sur_frame, gt_future[~ego_mask], t, remaining,
+                ego_soft_label = self._make_soft_label(
+                    ego_frame, gt_future[ego_mask], t, remaining,
                     map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
                     pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
 
-                if sur_soft_label is not None:
-                    sur_kl = self._kl_with_epsilon(sur_soft_label, sur_attn_dist)
-                    total_loss = total_loss + sur_kl
+                if ego_soft_label is not None:
+                    ego_kl = self._kl_with_epsilon(ego_soft_label, ego_attn_dist)
+                    total_loss = total_loss + ego_kl
                     count += 1
+
+                if self.phase == 1 and sur_attn_list is not None and t < len(sur_attn_list):
+                    sur_attn_w = sur_attn_list[t]
+                    sur_attn_dist = sur_attn_w.squeeze(1)
+                    if t == 0:
+                        sur_frame = scene_graph.past[:, -1, :4][~ego_mask]
+                    else:
+                        sur_frame = gt_future[~ego_mask][:, t - 1, :4]
+                    sur_soft_label = self._make_soft_label(
+                        sur_frame, gt_future[~ego_mask], t, remaining,
+                        map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
+                        pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
+                    if sur_soft_label is not None:
+                        sur_kl = self._kl_with_epsilon(sur_soft_label, sur_attn_dist)
+                        total_loss = total_loss + sur_kl
+                        count += 1
 
         if count > 0:
             return total_loss / count
@@ -802,8 +903,14 @@ class TrafficPlannerLoss(nn.Module):
         # z_local sparsity loss
         sparse_loss = None
         if self.use_sparse_loss and self.loss_weights.get('sparse', 0.0) > 0.0 and model is not None:
-            z_local = model.get_z_local()
-            if z_local is not None:
+            z_local_raw = model.get_z_local()
+            if z_local_raw is not None:
+                # Handle both flat list (AR) and segmented list (TF)
+                if isinstance(z_local_raw[0], list):
+                    flat = [z for seg in z_local_raw for z in seg]
+                else:
+                    flat = z_local_raw
+                z_local = torch.stack(flat, dim=0)
                 sparse_loss = self.sparsity_loss(z_local)
                 loss = loss + self.loss_weights['sparse'] * sparse_loss
 
@@ -966,8 +1073,14 @@ class TrafficPlannerLoss(nn.Module):
         # z_local sparsity loss
         sparse_loss = None
         if self.use_sparse_loss and self.loss_weights.get('sparse', 0.0) > 0.0 and model is not None:
-            z_local = model.get_z_local()
-            if z_local is not None:
+            z_local_raw = model.get_z_local()
+            if z_local_raw is not None:
+                # Handle both flat list (AR) and segmented list (TF)
+                if isinstance(z_local_raw[0], list):
+                    flat = [z for seg in z_local_raw for z in seg]
+                else:
+                    flat = z_local_raw
+                z_local = torch.stack(flat, dim=0)
                 sparse_loss = self.sparsity_loss(z_local)
                 loss = loss + self.loss_weights['sparse'] * sparse_loss
 

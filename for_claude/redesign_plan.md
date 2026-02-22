@@ -1,7 +1,7 @@
 # TrafficPlanner Model Redesign Plan (v6)
 
 > 작성일: 2026-02-22
-> 최종 수정: 2026-02-22
+> 최종 수정: 2026-02-23
 > 상태: Phase 1 구현 완료 (test_forward_pass 11개 전체 통과)
 
 ---
@@ -93,7 +93,7 @@ Level 3: Action Generation (step-level, 매 스텝)
   GCN → history buffer (상호작용 인코딩)
   History Attention (GCN feature 누적 + PE)
   Map Cross-Attention (29×29=841 spatial tokens @256pix, 2.66m 해상도)
-  GRU + output MLP → (acc, yaw_rate) → bicycle model
+  GRU + output_head (Linear) → (acc, yaw_rate) → bicycle model
 ```
 
 ### 2b. Decoder 전체 흐름
@@ -131,11 +131,11 @@ map_tokens = map_CNN_partial(map_crop)          # (NA, 841, ch) — conv3에서 
 
 5. GRU + Output:
    ego_gru_input = [ego_hist_ctx, ego_map_ctx, z_global, z_local, lw, sem]
-   Ego GRU → output_MLP → (acc, yaw_rate) → bicycle model
+   Ego GRU → output_head → (acc, yaw_rate) → bicycle model
    → Recon MSE Loss
 
    sur_gru_input = [sur_hist_ctx, sur_map_ctx, z_global, lw, sem]
-   Sur GRU → output_MLP → (acc, yaw_rate) → bicycle model
+   Sur GRU → output_head → (acc, yaw_rate) → bicycle model
 
 6. Scene Graph Update:
    scene_graph.pos = new_states  # in-place, 다음 스텝 GCN용
@@ -148,7 +148,7 @@ map_tokens = map_CNN_partial(map_crop)          # (NA, 841, ch) — conv3에서 
   - Ego History Attention / Sur History Attention
   - Ego Map Cross-Attention / Sur Map Cross-Attention
   - Ego GRU / Sur GRU
-  - Ego output MLP / Sur output MLP
+  - Ego output_head (Linear) / Sur output_head (Linear)
   - Intent Codebook (ego만)
 
 공유:
@@ -158,7 +158,7 @@ map_tokens = map_CNN_partial(map_crop)          # (NA, 841, ch) — conv3에서 
 
 Phase 2 학습 시:
   Freeze: encoder 전체, z_global, sur 모듈 전체, 상호작용 GCN, map CNN
-  Train:  ego history attn, ego map attn, ego GRU, ego output MLP, intent codebook
+  Train:  ego history attn, ego map attn, ego GRU, ego output_head (Linear), intent codebook
   → sur에 영향 zero
 ```
 
@@ -365,7 +365,7 @@ sur_gru_input = concat([
 │  sur_pred_dim               = 2 (dx, dy)            │
 │  intent_ce_nclass           = 9 (3acc × 3yaw)      │
 │  map_gt_steps               = 6 (전방 예측 토큰)    │
-│  map_gt_weights             = [0.3, 0.25, 0.2, 0.15, 0.07, 0.03] │
+│  map_gt_decay_lambda        = 0.3 (exponential decay)│
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -557,7 +557,7 @@ Step 5: Decoder (아래 상세 다이어그램 참조)
 │  │  │                                                             │ │ │
 │  │  │  ┌─ Auxiliary (D): Map Attn Guidance ──────────────────┐  │ │ │
 │  │  │  │  GT: 전방 6스텝 GT 토큰 위치 → soft label (841,)     │  │ │ │
-│  │  │  │  가중치: [0.3, 0.25, 0.2, 0.15, 0.07, 0.03]          │  │ │ │
+│  │  │  │  가중치: exp(-λt)/Σexp(-λt), λ=0.3                   │  │ │ │
 │  │  │  │  Loss = KL(ego_attn_w.squeeze() || soft_label)       │  │ │ │
 │  │  │  │  ※ t=11이면 제외 (전방 없음)                           │  │ │ │
 │  │  │  └──────────────────────────────────────────────────────┘  │ │ │
@@ -1034,6 +1034,14 @@ segment 경계: GT state, GT GCN cache, GT GRU hidden 복원
   Step C: Sliding window — segment 경계에서 GT 스냅샷 복원, 내에서만 예측
 
   GCN 총 호출: 12(사전) + segment 내 예측용 ≈ 최적화 완료
+
+Auxiliary output 저장: segment별 리스트 구조 (recon과 동일)
+  _sur_pred_outputs[seg_idx] = [pred_step0, pred_step1, ...]
+  _ego_map_attn_weights_outputs[seg_idx] = [attn_step0, attn_step1, ...]
+  _z_local_outputs[seg_idx] = [z_step0, z_step1, ...]
+  _intent_weights_outputs[seg_idx] = [w_step0, w_step1, ...]
+  → loss에서 segment별 평균 후 전체 segment 평균 (recon loss와 동일 방식)
+  → AR 모드에서는 flat list 유지 (loss에서 자동 분기)
 ```
 
 LR warmup (10 epochs) + gradient clipping (max_norm=1.0) 추가.
@@ -1138,14 +1146,16 @@ map_attn_weights (N, 841) vs GT soft label (N, 841) → KL divergence
 
 **GT soft label 생성 방식:**
 
-가까운 미래일수록 중요하므로 차등 가중치 적용 (6스텝 lookahead, 3초 전방):
+가까운 미래일수록 중요하므로 exponential decay 가중치 적용 (6스텝 lookahead, 3초 전방):
 ```
 가중치: [0.3, 0.25, 0.2, 0.15, 0.07, 0.03]  (t+1 ~ t+6)
 ```
 
 ```python
 # 매 스텝 t에서, 전방 최대 6스텝 GT 위치를 map grid 좌표로 변환
-weights = [0.3, 0.25, 0.2, 0.15, 0.07, 0.03]  # 가까울수록 중요
+# Exponential decay: w_k = exp(-λk) / Σexp(-λk), λ=0.3 (config 조절 가능)
+# λ=0.3 → [0.311, 0.230, 0.170, 0.126, 0.094, 0.069]
+weights = exp(-lambda * arange(6)) / sum(exp(-lambda * arange(6)))
 soft_label = zeros(29, 29)  # @256pix
 remaining = min(6, total_steps - t - 1)
 for k in range(remaining):
@@ -1156,7 +1166,7 @@ soft_label = soft_label / soft_label.sum()  # normalize → 확률 분포
 soft_label = soft_label.flatten()            # (841,)
 
 # 남은 스텝이 없으면 (t=11) 이 loss 제외
-# 남은 스텝 < 6이면 남은 만큼만 계산 후 re-normalize
+# 남은 스텝 < 6이면 남은 만큼만 계산 후 re-normalize (가까운 미래 비중 자동 유지)
 ```
 
 **시각적 예시 (29×29 grid에서 직진 시):**
@@ -1166,8 +1176,8 @@ attention weight (841개에 대한 확률 분포):
                       ↑    ↑    ↑    ↑    ↑    ↑
                      t+6  t+5  t+4  t+3  t+2  t+1   ← 모델이 보는 곳
 
-GT soft label (차등 가중치):
-[ 0,   0,   0,  ..., .03, .07, .15, .20, .25, .30, ...,  0 ]
+GT soft label (exponential decay, λ=0.3):
+[ 0,   0,   0,  ..., .07, .09, .13, .17, .23, .31, ...,  0 ]
                       ↑    ↑    ↑    ↑    ↑    ↑
                      t+6  t+5  t+4  t+3  t+2  t+1   ← 봐야 할 곳
 
@@ -1243,7 +1253,7 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 
 5. GRU + Output:
    ego_gru_input = [ego_hist_ctx, ego_map_ctx, z_global, z_local, lw, sem]
-   ego_gru_out → output_MLP → (acc, yaw_rate) → bicycle model
+   ego_gru_out → output_head → (acc, yaw_rate) → bicycle model
    → Recon MSE Loss
 
    sur_gru_input = [sur_hist_ctx, sur_map_ctx, z_global, lw, sem]
@@ -1262,7 +1272,7 @@ t=11:   Map Attn → 제외 (전방 없음), Sur/Ego Pred → 활성 (마지막 
 
 ### Phase 2: Adversarial Reactive (Finetune)
 - Freeze: encoder 전체, z_global, sur 모듈 전체, 상호작용 GCN, map CNN
-- Train: ego history attn, ego map attn, ego GRU, ego output MLP, intent codebook
+- Train: ego history attn, ego map attn, ego GRU, ego output_head (Linear), intent codebook
 - Intent Codebook 활성화, temperature annealing
 - 목표: ego가 sur 접근 시 의도 선택 (감속/유지/회피 등)
 
