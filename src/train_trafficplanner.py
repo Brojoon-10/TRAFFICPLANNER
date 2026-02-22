@@ -81,6 +81,16 @@ def parse_cfg():
     parser.add_argument('--lr', type=float, default=1e-5, help='learning rate for ADAM')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay on params.')
 
+    # LR scheduler (cosine annealing)
+    parser.add_argument('--use_lr_anneal', type=str2bool, default=False,
+                        help='Enable cosine annealing LR scheduler')
+    parser.add_argument('--lr_max', type=float, default=None,
+                        help='Max LR for cosine annealing (default: use --lr)')
+    parser.add_argument('--lr_min', type=float, default=1e-6,
+                        help='Min LR for cosine annealing')
+    parser.add_argument('--lr_anneal_epochs', type=int, default=None,
+                        help='T_max for cosine annealing (default: use --epochs)')
+
     # TrafficPlannerModel architecture parameters (past_feat_size, future_feat_size in base_args)
     parser.add_argument('--z_local_size', type=int, default=32,
                         help='Latent dimension for z_local (ego-only reactive)')
@@ -547,6 +557,22 @@ def main():
                                                 map_location=device)
         Logger.log('Loaded checkpoint from epoch %d with validation loss %f...' % (ckpt_epoch, ckpt_eval_loss))
 
+    # LR scheduler (cosine annealing)
+    scheduler = None
+    if cfg.use_lr_anneal:
+        lr_max = cfg.lr_max if cfg.lr_max is not None else cfg.lr
+        lr_min = cfg.lr_min
+        T_max = cfg.lr_anneal_epochs if cfg.lr_anneal_epochs is not None else cfg.epochs
+        # Set optimizer lr to lr_max
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr_max
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=lr_min)
+        # If resuming from checkpoint, advance scheduler
+        if ckpt_epoch > 0:
+            for _ in range(ckpt_epoch):
+                scheduler.step()
+        Logger.log(f'LR Cosine Annealing: max={lr_max}, min={lr_min}, T_max={T_max}')
+
     # Freeze z_global if requested (for custom training scenarios)
     if cfg.freeze_z_global and cfg.phase == 1:
         model.freeze_z_global()
@@ -663,6 +689,12 @@ def main():
         ax1.plot(train_loss)
         ax1.set_title(f"Train Loss (Phase {cfg.phase})")
         plt.savefig(f'loss_{cfg.loss_plot_suffix}.jpg', format='jpeg')
+
+        # Step LR scheduler
+        if scheduler is not None:
+            scheduler.step()
+            if use_wandb:
+                wandb.log({'lr': scheduler.get_last_lr()[0]}, step=step_counter)
 
         # lot of excess memory used by pygeometric
         torch.cuda.empty_cache()
