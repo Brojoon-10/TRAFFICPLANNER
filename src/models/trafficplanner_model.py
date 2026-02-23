@@ -118,23 +118,14 @@ class IntentCodebook(nn.Module):
         self.codebook = nn.Embedding(num_intents, intent_dim)
         self.intent_predictor = MLP([input_dim, 64, num_intents])
 
-    def forward(self, situation, temperature=1.0, phase=1):
+    def forward(self, situation, temperature=1.0):
         """
         :param situation: (N_ego, input_dim) — ego_state + predicted_sur_delta + map_ctx(detached)
         :param temperature: Gumbel-Softmax temperature
-        :param phase: 1=zero output (inactive), 2=active
         :return: (z_local, intent_weights)
             z_local: (N_ego, intent_dim)
             intent_weights: (N_ego, K)
         """
-        N = situation.size(0)
-        device = situation.device
-
-        if phase == 1:
-            z_local = torch.zeros(N, self.intent_dim, device=device)
-            intent_weights = torch.zeros(N, self.num_intents, device=device)
-            return z_local, intent_weights
-
         logits = self.intent_predictor(situation)  # (N_ego, K)
 
         if self.training:
@@ -177,14 +168,14 @@ class TrafficPlannerModel(nn.Module):
                  conv_kernel_list=[7, 5, 5, 3, 3, 3],
                  conv_stride_list=[2, 2, 2, 2, 2, 2],
                  conv_filter_list=[16, 32, 64, 64, 128, 128],
-                 tf_max_annealing_epoch=1600,
-                 tf_init_segment_len=1,
                  # New redesign params
                  num_intents=8,           # K for intent codebook
                  hist_attn_nhead=4,
                  map_attn_nhead=4,
                  sur_pred_dim=2,          # predicted sur delta dim (dx, dy)
                  map_recrop=False,        # re-crop map tokens every decode step
+                 use_ego_intent=True,     # enable ego intent codebook
+                 use_sur_intent=False,    # enable sur intent codebook
                  ):
         super(TrafficPlannerModel, self).__init__()
         self.normalizer = self.att_normalizer = None
@@ -287,10 +278,8 @@ class TrafficPlannerModel(nn.Module):
         self.z_local_size = z_local_size  # 32 (intent_dim)
 
         #
-        # Teacher Forcing parameters
+        # Map re-crop flag
         #
-        self.tf_max_annealing_epoch = tf_max_annealing_epoch
-        self.tf_init_segment_len = tf_init_segment_len
         self.map_recrop = map_recrop
 
         #
@@ -333,12 +322,18 @@ class TrafficPlannerModel(nn.Module):
         self.ego_map_attn = MapCrossAttention(self.d_model, self.map_token_ch, nhead=map_attn_nhead)
         self.sur_map_attn = MapCrossAttention(self.d_model, self.map_token_ch, nhead=map_attn_nhead)
 
-        # 4. Intent Codebook (ego only)
+        # 4. Intent Codebook
         intent_input_dim = self.state_size + self.sur_pred_dim + self.d_model  # 6 + 2 + 64 = 72
         self.intent_codebook = IntentCodebook(
             num_intents=num_intents,
             intent_dim=self.intent_dim,
             input_dim=intent_input_dim,
+        )
+        # Sur Intent Codebook (symmetric to ego)
+        self.sur_intent_codebook = IntentCodebook(
+            num_intents=num_intents,
+            intent_dim=self.intent_dim,
+            input_dim=intent_input_dim,  # same dim: state(6) + predicted_ego_delta(2) + sur_map_ctx(64)
         )
 
         # 5. Ego decoder GRU
@@ -350,8 +345,8 @@ class TrafficPlannerModel(nn.Module):
         self.ego_output_head = nn.Linear(self.d_model, self.traj_out_size)
 
         # 6. Sur decoder GRU
-        # Input: hist_ctx(D) + map_ctx(D) + z_global(z_size) + lw(2) + sem(NC)
-        sur_gru_in_size = self.d_model + self.d_model + self.z_size + self.att_feat_size + self.NC
+        # Input: hist_ctx(D) + map_ctx(D) + z_global(z_size) + z_local_sur(intent_dim) + lw(2) + sem(NC)
+        sur_gru_in_size = self.d_model + self.d_model + self.z_size + self.intent_dim + self.att_feat_size + self.NC
         self.sur_decoder_gru = nn.GRU(
             sur_gru_in_size, self.d_model, 3, batch_first=True,
         )
@@ -360,7 +355,8 @@ class TrafficPlannerModel(nn.Module):
         # 7. Auxiliary loss heads (all Linear — no MLP, force modules to encode directly)
         self.sur_pred_head = nn.Linear(self.d_model, self.sur_pred_dim)  # (B) ego→sur delta
         self.ego_pred_head = nn.Linear(self.d_model, self.sur_pred_dim)  # (C) sur→ego delta
-        self.intent_ce_head = nn.Linear(self.intent_dim, self.num_intents)  # (A) intent → num_intents classes
+        self.intent_ce_head = nn.Linear(self.intent_dim, self.num_intents)  # (A) ego intent CE head
+        self.sur_intent_ce_head = nn.Linear(self.intent_dim, self.num_intents)  # sur intent CE head
 
         # 8. Ego warmup GRU for initializing ego_decoder_gru hidden state
         self.ego_warmup_gru = nn.GRU(
@@ -376,8 +372,9 @@ class TrafficPlannerModel(nn.Module):
         self.phase = 1
         self.gumbel_temperature = 1.0
 
-        # Ablation flag
-        self.use_z_local = True
+        # Intent control flags (per agent type)
+        self.use_ego_intent = use_ego_intent
+        self.use_sur_intent = use_sur_intent
 
 
     def set_normalizer(self, normalizer):
@@ -395,15 +392,6 @@ class TrafficPlannerModel(nn.Module):
     def set_bicycle_params(self, bicycle_params):
         self.bicycle_params = bicycle_params
 
-    def get_tf_segment_len(self, current_epoch):
-        """Cosine annealing for TF segment length: tf_init_segment_len → FT."""
-        if current_epoch >= self.tf_max_annealing_epoch:
-            return self.FT
-        progress = current_epoch / self.tf_max_annealing_epoch
-        cos_out = 1 - math.cos(math.pi / 2 * progress)
-        segment_len = self.tf_init_segment_len + (self.FT - self.tf_init_segment_len) * cos_out
-        return int(segment_len)
-
     # ============================================================
     # Forward / Reconstruct / Sample — public API (unchanged interface)
     # ============================================================
@@ -411,15 +399,7 @@ class TrafficPlannerModel(nn.Module):
     def forward(self, scene_graph, map_idx, map_env,
                 use_post_mean=False,
                 future_sample=False,
-                teacher_forcing=False,
-                tf_segment_len=None,
-                current_epoch=0):
-        # Compute segment length using cosine annealing if not explicitly provided
-        if tf_segment_len is None and teacher_forcing:
-            tf_segment_len = self.get_tf_segment_len(current_epoch)
-        elif tf_segment_len is None:
-            tf_segment_len = self.FT
-
+                teacher_forcing=False):
         # Map encoding (encoder-level 64dim + decoder-level tokens)
         scene_graph.pos = scene_graph.past[:, -1, :4]
         map_feat, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
@@ -438,8 +418,7 @@ class TrafficPlannerModel(nn.Module):
             z_samp = self.rsample(post_mu, post_var)
         future_pred = self.decoder(scene_graph, map_feat, past_seq_out, z_samp, map_idx, map_env,
                                    map_tokens=map_tokens,
-                                   teacher_forcing=teacher_forcing,
-                                   tf_segment_len=tf_segment_len)
+                                   teacher_forcing=teacher_forcing)
 
         net_out = {
             'prior_out': (prior_mu, prior_var),
@@ -668,7 +647,7 @@ class TrafficPlannerModel(nn.Module):
     def decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
                 map_tokens=None,
                 ext_future=None, nfuture=None,
-                teacher_forcing=False, tf_segment_len=3,
+                teacher_forcing=False,
                 sur_gt_replay=False):
         """
         Decoder dispatcher.
@@ -683,7 +662,7 @@ class TrafficPlannerModel(nn.Module):
 
         if teacher_forcing:
             return self.teacher_forcing_decoder(scene_graph, map_feat, past_seq_out, z,
-                                                map_idx, map_env, map_tokens, tf_segment_len)
+                                                map_idx, map_env, map_tokens)
         else:
             return self.autoregressive_decoder(scene_graph, map_feat, past_seq_out, z,
                                                map_idx, map_env, map_tokens,
@@ -768,6 +747,8 @@ class TrafficPlannerModel(nn.Module):
         # Initialize analysis storage
         self._z_local_outputs = []
         self._intent_weights_outputs = []
+        self._z_local_sur_outputs = []
+        self._sur_intent_weights_outputs = []
         self._ego_map_attn_weights_outputs = []
         self._sur_map_attn_weights_outputs = []
         self._sur_pred_outputs = []
@@ -858,13 +839,35 @@ class TrafficPlannerModel(nn.Module):
             ], dim=-1)
 
             z_local, intent_weights = self.intent_codebook(
-                intent_input, temperature=self.gumbel_temperature, phase=self.phase)
+                intent_input, temperature=self.gumbel_temperature)
 
-            if not self.use_z_local:
+            if not self.use_ego_intent:
                 z_local = torch.zeros_like(z_local)
 
             self._z_local_outputs.append(z_local.detach())
             self._intent_weights_outputs.append(intent_weights.detach())
+
+            # Sur Intent Selection (symmetric to ego)
+            if mult_samp:
+                sur_state_for_intent = cur_state_6d.reshape(NA, NS, -1)[~ego_mask].reshape(num_sur * NS, -1)
+            else:
+                sur_state_for_intent = cur_state_6d[~ego_mask]
+
+            sur_intent_input = torch.cat([
+                sur_state_for_intent,
+                predicted_ego_delta,
+                sur_map_ctx.detach(),
+            ], dim=-1)
+
+            if self.use_sur_intent:
+                z_local_sur, sur_intent_weights = self.sur_intent_codebook(
+                    sur_intent_input, temperature=self.gumbel_temperature)
+            else:
+                z_local_sur = torch.zeros(sur_state_for_intent.size(0), self.intent_dim, device=device)
+                sur_intent_weights = torch.zeros(sur_state_for_intent.size(0), self.num_intents, device=device)
+
+            self._z_local_sur_outputs.append(z_local_sur.detach())
+            self._sur_intent_weights_outputs.append(sur_intent_weights.detach())
 
             # ============================================================
             # STEP 5: GRU + Output
@@ -890,7 +893,7 @@ class TrafficPlannerModel(nn.Module):
 
             # Sur GRU
             sur_gru_in = torch.cat([
-                sur_hist_ctx, sur_map_ctx, z_sur, sur_lw_flat, sur_sem_flat
+                sur_hist_ctx, sur_map_ctx, z_sur, z_local_sur, sur_lw_flat, sur_sem_flat
             ], dim=-1).unsqueeze(1)
 
             sur_gru_out, sur_gru_hidden = self.sur_decoder_gru(sur_gru_in, sur_gru_hidden)
@@ -953,14 +956,17 @@ class TrafficPlannerModel(nn.Module):
         return traj_out
 
     def teacher_forcing_decoder(self, scene_graph, map_feat, past_seq_out, z,
-                                 map_idx, map_env, map_tokens, tf_segment_len=3):
+                                 map_idx, map_env, map_tokens):
         """
-        Dual-loop Teacher Forcing decoder (Redesign).
+        GT-cached Teacher Forcing decoder (Redesign v2).
 
-        Loop 1: Sur (ego=GT, sur=autoregressive with new decoder)
-        Loop 2: Ego (sur=GT, ego=TF segmented with new decoder)
+        Both ego and sur use GT-based pre-computation with independent 1-step prediction.
+        No segment structure, no AR dependency during training.
 
-        Returns: list of FT segments for loss computation
+        Loop 1: Sur prediction (ego=GT, sur=GT-cached 1-step)
+        Loop 2: Ego prediction (sur=GT, ego=GT-cached 1-step)
+
+        Returns: (NA, FT, 4) flat tensor (same format as AR decoder)
         """
         NA = map_feat.size(0)
         FT = self.FT
@@ -976,6 +982,8 @@ class TrafficPlannerModel(nn.Module):
         # Initialize analysis storage
         self._z_local_outputs = []
         self._intent_weights_outputs = []
+        self._z_local_sur_outputs = []
+        self._sur_intent_weights_outputs = []
         self._ego_map_attn_weights_outputs = []
         self._sur_map_attn_weights_outputs = []
         self._sur_pred_outputs = []
@@ -994,7 +1002,7 @@ class TrafficPlannerModel(nn.Module):
         cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
 
         # ====================================================================
-        # Loop 1: Sur prediction (ego=GT, sur=autoregressive)
+        # Loop 1: Sur prediction (ego=GT, sur=GT-cached 1-step)
         # ====================================================================
         sur_traj_all = self._sur_loop_decoder(
             scene_graph, z_sur, ego_mask, gt_future,
@@ -1002,70 +1010,140 @@ class TrafficPlannerModel(nn.Module):
             map_idx, map_env)
 
         # ====================================================================
-        # Loop 2: Ego prediction (sur=GT, ego=TF segmented)
+        # Loop 2: Ego prediction (sur=GT, ego=GT-cached 1-step)
         # ====================================================================
-        ego_segments = self._ego_loop_decoder(
+        ego_traj_all = self._ego_loop_decoder(
             scene_graph, z_ego, ego_mask, gt_future,
-            ego_map_tokens, cur_lw, cur_sem, cur_veh_len, tf_segment_len,
+            ego_map_tokens, cur_lw, cur_sem, cur_veh_len,
             map_idx, map_env)
 
         # ====================================================================
-        # Merge
+        # Merge into flat (NA, FT, 4) tensor
         # ====================================================================
-        all_segment_preds = []
-        for seg_idx, ego_seg in enumerate(ego_segments):
-            segment_preds = []
-            for step, ego_pred in enumerate(ego_seg):
-                actual_t = seg_idx + step
-                if actual_t >= FT:
-                    break
-                full_pred = torch.zeros(NA, 4, device=device)
-                full_pred[ego_mask] = ego_pred
-                full_pred[~ego_mask] = sur_traj_all[:, actual_t, :]
-                segment_preds.append(full_pred)
-            all_segment_preds.append(segment_preds)
+        traj_out = torch.zeros(NA, FT, 4, device=device)
+        traj_out[ego_mask] = ego_traj_all
+        traj_out[~ego_mask] = sur_traj_all
 
-        return all_segment_preds
+        return traj_out
 
     def _sur_loop_decoder(self, scene_graph, z_sur, ego_mask, gt_future,
                               sur_map_tokens, cur_lw, cur_sem, cur_veh_len,
                               map_idx=None, map_env=None):
-        """Sur loop: ego=GT fixed, sur=autoregressive with new symmetric decoder."""
+        """Sur loop: ego=GT, sur=GT-cached independent 1-step prediction.
+
+        Same pattern as ego loop: GT-based pre-computation removes AR dependency.
+
+        Structure:
+        Step A: Pre-compute GT GCN features (ego=GT, sur=GT) for all FT
+        Step B: GT forward pass -> GRU hidden snapshots (no_grad)
+        Step C: Independent 1-step prediction at each t
+        """
         NA = ego_mask.size(0)
         FT = self.FT
         num_ego = int(ego_mask.sum())
         num_sur = NA - num_ego
         device = z_sur.device
 
-        # Pre-allocate
-        sur_history_buffer = torch.zeros(num_sur, FT, self.d_model, device=device)
-        sur_traj_all = torch.zeros(num_sur, FT, 4, device=device)
-
-        # Init GRU hidden via warmup
-        sur_gru_hidden = self._warmup_gru_hidden(scene_graph, ego_mask, is_ego=False, gt_future=None, target_t=0)
-
-        # Init prev_state (full NA, needed for GCN)
-        sur_prev_state = scene_graph.past[:, -1, :] if self.output_bicycle else scene_graph.past[:, -1, :4]
-
+        # ================================================================
+        # Step A: Pre-compute GT GCN features (ego=GT, sur=GT)
+        # ================================================================
+        gt_gcn_cache = torch.zeros(num_sur, FT, self.d_model, device=device)
         for t in range(FT):
-            # Build combined position: ego=GT, sur=predicted/initial
-            combined_state = sur_prev_state.clone()
             if t == 0:
-                ego_gt_state = scene_graph.past[:, -1, :][ego_mask]
+                gt_state = scene_graph.past[:, -1, :]
             else:
-                ego_gt_state = gt_future[:, t - 1, :][ego_mask]
-            combined_state[ego_mask] = ego_gt_state
+                gt_state = gt_future[:, t - 1, :]
 
-            # GCN on combined state
-            cur_state_6d = combined_state if combined_state.size(-1) >= 6 else \
-                torch.cat([combined_state, torch.zeros(NA, 6 - combined_state.size(-1), device=device)], dim=-1)
+            cur_state_6d = gt_state if gt_state.size(-1) >= 6 else \
+                torch.cat([gt_state, torch.zeros(NA, 6 - gt_state.size(-1), device=device)], dim=-1)
             gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
             scene_graph.x = gcn_in
             scene_graph.pos = cur_state_6d[:, :4]
             _, sur_gcn_feat = self.interaction_gcn(scene_graph, ego_mask)
+            gt_gcn_cache[:, t, :] = sur_gcn_feat
 
-            # History buffer
-            sur_history_buffer[:, t, :] = sur_gcn_feat
+        # Pre-compute GT map tokens if re-crop enabled
+        gt_map_tokens_cache = None
+        if self.map_recrop and map_idx is not None and map_env is not None:
+            gt_map_tokens_cache = []
+            for t in range(FT):
+                if t == 0:
+                    gt_pos = scene_graph.past[:, -1, :4]
+                else:
+                    gt_pos = gt_future[:, t - 1, :4]
+                cur_map_tokens = self._recompute_map_tokens(
+                    gt_pos, map_idx, map_env, scene_graph)
+                gt_map_tokens_cache.append(cur_map_tokens[~ego_mask])
+
+        # ================================================================
+        # Step B: Warmup (with grad) + GT forward pass for hidden snapshots (no_grad)
+        # Warmup GRU needs gradient so it learns proper hidden initialization.
+        # The GT cache loop does NOT need gradient (Step C re-computes independently).
+        # ================================================================
+        sur_gru_hidden_init = self._warmup_gru_hidden(
+            scene_graph, ego_mask, is_ego=False, gt_future=None, target_t=0)
+
+        with torch.no_grad():
+            sur_gru_hidden = sur_gru_hidden_init.detach().clone()
+
+            gt_history_buffer = torch.zeros(num_sur, FT, self.d_model, device=device)
+            gt_hidden_snapshots = [sur_gru_hidden.clone()]
+
+            for t in range(FT):
+                gt_history_buffer[:, t, :] = gt_gcn_cache[:, t, :]
+
+                sur_gru_h_last = sur_gru_hidden[-1]
+                sur_hist_ctx = self.sur_history_attn(sur_gru_h_last, gt_history_buffer, t)
+
+                predicted_ego_delta = self.ego_pred_head(sur_hist_ctx)
+
+                cur_sur_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else sur_map_tokens
+                sur_map_ctx, _ = self.sur_map_attn(sur_gru_h_last, cur_sur_map_tokens)
+
+                # Sur intent (Step B: no output storage needed)
+                if t == 0:
+                    sur_state_for_intent = scene_graph.past[:, -1, :][~ego_mask]
+                else:
+                    sur_state_for_intent = gt_future[:, t - 1, :][~ego_mask]
+                if sur_state_for_intent.size(-1) < 6:
+                    sur_state_for_intent = torch.cat([sur_state_for_intent,
+                        torch.zeros(num_sur, 6 - sur_state_for_intent.size(-1), device=device)], dim=-1)
+                sur_intent_input = torch.cat([sur_state_for_intent, predicted_ego_delta, sur_map_ctx.detach()], dim=-1)
+                if self.use_sur_intent:
+                    z_local_sur, _ = self.sur_intent_codebook(sur_intent_input, self.gumbel_temperature)
+                else:
+                    z_local_sur = torch.zeros(num_sur, self.intent_dim, device=device)
+
+                sur_lw_flat = cur_lw[~ego_mask]
+                sur_sem_flat = cur_sem[~ego_mask]
+                sur_gru_in = torch.cat([
+                    sur_hist_ctx, sur_map_ctx, z_sur, z_local_sur, sur_lw_flat, sur_sem_flat
+                ], dim=-1).unsqueeze(1)
+
+                _, sur_gru_hidden = self.sur_decoder_gru(sur_gru_in, sur_gru_hidden)
+                gt_hidden_snapshots.append(sur_gru_hidden.clone())
+
+        # Replace snapshot[0] with the grad-carrying warmup result
+        gt_hidden_snapshots[0] = sur_gru_hidden_init
+
+        # ================================================================
+        # Step C: Independent 1-step prediction at each t (GT-cached)
+        # ================================================================
+        sur_traj_all = torch.zeros(num_sur, FT, 4, device=device)
+
+        for t in range(FT):
+            # Restore GT state
+            sur_gru_hidden = gt_hidden_snapshots[t].clone()
+
+            # GT position for bicycle model
+            if t == 0:
+                sur_prev_state = scene_graph.past[:, -1, :][~ego_mask] if self.output_bicycle else scene_graph.past[:, -1, :4][~ego_mask]
+            else:
+                sur_prev_state = gt_future[:, t - 1, :][~ego_mask] if self.output_bicycle else gt_future[:, t - 1, :4][~ego_mask]
+
+            # History buffer from GT GCN cache (0~t)
+            sur_history_buffer = torch.zeros(num_sur, FT, self.d_model, device=device)
+            sur_history_buffer[:, :t + 1, :] = gt_gcn_cache[:, :t + 1, :]
 
             # History Attention
             sur_gru_h_last = sur_gru_hidden[-1]
@@ -1075,62 +1153,59 @@ class TrafficPlannerModel(nn.Module):
             predicted_ego_delta = self.ego_pred_head(sur_hist_ctx)
             self._ego_pred_outputs.append(predicted_ego_delta.detach())
 
-            # Re-crop map tokens at current positions (if enabled)
-            if self.map_recrop and map_idx is not None and map_env is not None:
-                cur_map_tokens = self._recompute_map_tokens(
-                    cur_state_6d[:, :4], map_idx, map_env, scene_graph)
-                sur_map_tokens = cur_map_tokens[~ego_mask]
-
             # Map Attention
-            sur_map_ctx, sur_map_attn_w = self.sur_map_attn(sur_gru_h_last, sur_map_tokens)
+            cur_sur_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else sur_map_tokens
+            sur_map_ctx, sur_map_attn_w = self.sur_map_attn(sur_gru_h_last, cur_sur_map_tokens)
             self._sur_map_attn_weights_outputs.append(sur_map_attn_w)
 
-            # Sur GRU
+            # Sur Intent
+            if t == 0:
+                sur_state_for_intent = scene_graph.past[:, -1, :][~ego_mask]
+            else:
+                sur_state_for_intent = gt_future[:, t - 1, :][~ego_mask]
+            if sur_state_for_intent.size(-1) < 6:
+                sur_state_for_intent = torch.cat([sur_state_for_intent,
+                    torch.zeros(num_sur, 6 - sur_state_for_intent.size(-1), device=device)], dim=-1)
+            sur_intent_input = torch.cat([sur_state_for_intent, predicted_ego_delta, sur_map_ctx.detach()], dim=-1)
+            if self.use_sur_intent:
+                z_local_sur, sur_intent_weights = self.sur_intent_codebook(sur_intent_input, self.gumbel_temperature)
+            else:
+                z_local_sur = torch.zeros(num_sur, self.intent_dim, device=device)
+                sur_intent_weights = torch.zeros(num_sur, self.num_intents, device=device)
+            self._z_local_sur_outputs.append(z_local_sur.detach())
+            self._sur_intent_weights_outputs.append(sur_intent_weights.detach())
+
+            # Sur GRU (1-step)
             sur_lw_flat = cur_lw[~ego_mask]
             sur_sem_flat = cur_sem[~ego_mask]
-            sur_gru_in = torch.cat([sur_hist_ctx, sur_map_ctx, z_sur, sur_lw_flat, sur_sem_flat], dim=-1).unsqueeze(1)
-            sur_gru_out, sur_gru_hidden = self.sur_decoder_gru(sur_gru_in, sur_gru_hidden)
+            sur_gru_in = torch.cat([
+                sur_hist_ctx, sur_map_ctx, z_sur, z_local_sur, sur_lw_flat, sur_sem_flat
+            ], dim=-1).unsqueeze(1)
+
+            sur_gru_out, _ = self.sur_decoder_gru(sur_gru_in, sur_gru_hidden)
             sur_traj_step = self.sur_output_head(sur_gru_out[:, 0])
 
             # Bicycle model for sur
-            sur_prev = sur_prev_state[~ego_mask]
-            sur_state_global, sur_bike_state = self._apply_dynamics_single(
-                sur_traj_step, sur_prev, cur_veh_len[~ego_mask])
+            sur_state_global, _ = self._apply_dynamics_single(
+                sur_traj_step, sur_prev_state, cur_veh_len[~ego_mask])
 
             sur_traj_all[:, t, :] = sur_state_global
-
-            # Update states
-            if t < FT - 1:
-                new_prev = sur_prev_state.clone()
-                if self.output_bicycle and sur_bike_state is not None:
-                    new_prev[~ego_mask] = sur_bike_state
-                else:
-                    # Pad to 6d for next step
-                    if sur_state_global.size(-1) < 6:
-                        new_prev[~ego_mask, :4] = sur_state_global
-                    else:
-                        new_prev[~ego_mask] = sur_state_global
-                ego_gt_next = gt_future[:, t, :][ego_mask]
-                new_prev[ego_mask] = ego_gt_next
-                sur_prev_state = new_prev
 
         return sur_traj_all  # (num_sur, FT, 4)
 
     def _ego_loop_decoder(self, scene_graph, z_ego, ego_mask, gt_future,
-                              ego_map_tokens, cur_lw, cur_sem, cur_veh_len, tf_segment_len,
+                              ego_map_tokens, cur_lw, cur_sem, cur_veh_len,
                               map_idx=None, map_env=None):
-        """Ego loop: sur=GT fixed, ego=TF segmented (sliding window).
+        """Ego loop: sur=GT fixed, ego=GT-cached independent 1-step prediction.
 
-        Sliding window: segment_len=3, FT=12 → segments at target_t=0,1,...,9
-        Each segment: step 0 uses GT GCN cache, steps 1+ use predicted position.
+        Removes AR dependency entirely: every step uses GT-cached state.
+        No inter-step dependency -> parallelizable.
 
-        구조:
-        Step A: GT GCN 사전계산 (future FT)
-        Step B: GT forward pass → 매 시점 decoder GRU hidden 스냅샷 저장 (no_grad)
-        Step C: Sliding window — segment 경계에서 GT 상태 복원, 내에서만 예측 누적
-
-        Segment 경계 리셋: ego position, history buffer, GRU hidden 모두 GT 복원
-        Segment 내부: 예측 기반 position/history/hidden 누적
+        Structure:
+        Step A: Pre-compute GT GCN features for all FT timesteps
+        Step B: GT forward pass -> GRU hidden snapshots at each step (no_grad)
+        Step C: Independent 1-step prediction at each t:
+                gt_hidden[t] + gt_gcn[:t+1] -> history attn -> map attn -> intent -> GRU 1-step -> pred[t]
         """
         NA = ego_mask.size(0)
         FT = self.FT
@@ -1155,7 +1230,7 @@ class TrafficPlannerModel(nn.Module):
             ego_gcn_feat, _ = self.interaction_gcn(scene_graph, ego_mask)
             gt_gcn_cache[:, t, :] = ego_gcn_feat
 
-        # Also pre-compute GT map tokens if re-crop enabled
+        # Pre-compute GT map tokens if re-crop enabled
         gt_map_tokens_cache = None
         if self.map_recrop and map_idx is not None and map_env is not None:
             gt_map_tokens_cache = []
@@ -1169,14 +1244,16 @@ class TrafficPlannerModel(nn.Module):
                 gt_map_tokens_cache.append(cur_map_tokens[ego_mask])
 
         # ================================================================
-        # Step B: GT forward pass → hidden 스냅샷 저장 (no_grad)
-        # warmup 1회 후, 매 스텝 GT 기반 full pipeline으로 decoder GRU hidden 누적
-        # 각 시점의 hidden을 저장해두고, segment 시작 시 복원
-        # loss에 직접 기여하지 않으므로 gradient 불필요
+        # Step B: Warmup (with grad) + GT forward pass for hidden snapshots (no_grad)
+        # Warmup GRU needs gradient so it learns proper hidden initialization.
+        # The GT cache loop does NOT need gradient (Step C re-computes independently).
         # ================================================================
+        ego_gru_hidden_init = self._warmup_gru_hidden(
+            scene_graph, ego_mask, is_ego=True, gt_future=gt_future, target_t=0)
+
         with torch.no_grad():
-            ego_gru_hidden = self._warmup_gru_hidden(
-                scene_graph, ego_mask, is_ego=True, gt_future=gt_future, target_t=0)
+            # Detach warmup result for the no_grad cache loop
+            ego_gru_hidden = ego_gru_hidden_init.detach().clone()
 
             gt_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
             gt_hidden_snapshots = [ego_gru_hidden.clone()]
@@ -1201,8 +1278,8 @@ class TrafficPlannerModel(nn.Module):
                         torch.zeros(num_ego, 6 - ego_state_for_intent.size(-1), device=device)], dim=-1)
 
                 intent_input = torch.cat([ego_state_for_intent, predicted_sur_delta, ego_map_ctx.detach()], dim=-1)
-                z_local, _ = self.intent_codebook(intent_input, self.gumbel_temperature, self.phase)
-                if not self.use_z_local:
+                z_local, _ = self.intent_codebook(intent_input, self.gumbel_temperature)
+                if not self.use_ego_intent:
                     z_local = torch.zeros_like(z_local)
 
                 ego_lw_flat = cur_lw[ego_mask]
@@ -1214,134 +1291,80 @@ class TrafficPlannerModel(nn.Module):
                 _, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
                 gt_hidden_snapshots.append(ego_gru_hidden.clone())
 
-        # ================================================================
-        # Step C: Sliding window segments
-        # segment 시작 시 GT hidden/history/position 복원
-        # segment 내에서만 예측 기반 누적
-        # ================================================================
-        ego_segments = []
-        ego_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
+        # Replace snapshot[0] with the grad-carrying warmup result
+        # so Step C t=0 can backprop through ego_warmup_gru
+        gt_hidden_snapshots[0] = ego_gru_hidden_init
 
-        for target_t in range(FT):
-            if target_t + tf_segment_len > FT:
-                break
+        # ================================================================
+        # Step C: Independent 1-step prediction at each t (GT-cached)
+        # Each t: gt_hidden[t] + gt_gcn[:t+1] -> pipeline -> pred[t]
+        # No inter-step dependency
+        # ================================================================
+        ego_traj_all = torch.zeros(num_ego, FT, 4, device=device)
 
-            # TF: segment 경계에서 모든 상태를 GT 기반으로 리셋
-            # 1) ego position → GT
-            if target_t == 0:
+        for t in range(FT):
+            # Restore GT state
+            ego_gru_hidden = gt_hidden_snapshots[t].clone()
+
+            # GT position for bicycle model
+            if t == 0:
                 ego_prev_state = scene_graph.past[:, -1, :][ego_mask] if self.output_bicycle else scene_graph.past[:, -1, :4][ego_mask]
             else:
-                ego_prev_state = gt_future[:, target_t - 1, :][ego_mask] if self.output_bicycle else gt_future[:, target_t - 1, :4][ego_mask]
+                ego_prev_state = gt_future[:, t - 1, :][ego_mask] if self.output_bicycle else gt_future[:, t - 1, :4][ego_mask]
 
-            # 2) history buffer → GT GCN 캐시로 교정 (0~target_t)
-            ego_history_buffer[:, :target_t + 1, :] = gt_gcn_cache[:, :target_t + 1, :]
+            # History buffer from GT GCN cache (0~t)
+            ego_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
+            ego_history_buffer[:, :t + 1, :] = gt_gcn_cache[:, :t + 1, :]
 
-            # 3) GRU hidden → GT 스냅샷 복원
-            ego_gru_hidden = gt_hidden_snapshots[target_t].clone()
+            # History Attention
+            ego_gru_h_last = ego_gru_hidden[-1]
+            ego_hist_ctx = self.ego_history_attn(ego_gru_h_last, ego_history_buffer, t)
 
-            segment_preds = []
-            seg_sur_pred = []
-            seg_map_attn = []
-            seg_z_local = []
-            seg_intent_w = []
+            # Auxiliary: sur prediction
+            predicted_sur_delta = self.sur_pred_head(ego_hist_ctx)
+            self._sur_pred_outputs.append(predicted_sur_delta.detach())
 
-            for step in range(tf_segment_len):
-                actual_t = target_t + step
-                if actual_t >= FT:
-                    break
+            # Map Attention
+            cur_ego_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else ego_map_tokens
+            ego_map_ctx, ego_map_attn_w = self.ego_map_attn(ego_gru_h_last, cur_ego_map_tokens)
+            self._ego_map_attn_weights_outputs.append(ego_map_attn_w)
 
-                if step == 0:
-                    # Step 0: use cached GT GCN feature
-                    ego_gcn_feat = gt_gcn_cache[:, actual_t, :]
-                    cur_ego_map_tokens = gt_map_tokens_cache[actual_t] if gt_map_tokens_cache is not None else ego_map_tokens
-                else:
-                    # Step 1+: ego at predicted position, sur at GT → new GCN
-                    sur_gt_state = gt_future[:, actual_t - 1, :][~ego_mask]
-                    combined_state = torch.zeros(NA, ego_prev_state.size(-1), device=device)
-                    combined_state[ego_mask] = ego_prev_state
-                    combined_state[~ego_mask] = sur_gt_state
-                    cur_state_6d = combined_state if combined_state.size(-1) >= 6 else \
-                        torch.cat([combined_state, torch.zeros(NA, 6 - combined_state.size(-1), device=device)], dim=-1)
-                    gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
-                    scene_graph.x = gcn_in
-                    scene_graph.pos = cur_state_6d[:, :4]
-                    ego_gcn_feat, _ = self.interaction_gcn(scene_graph, ego_mask)
+            # Intent
+            if t == 0:
+                ego_state_for_intent = scene_graph.past[:, -1, :][ego_mask]
+            else:
+                ego_state_for_intent = gt_future[:, t - 1, :][ego_mask]
 
-                    # Re-crop map tokens at predicted position (if enabled)
-                    if self.map_recrop and map_idx is not None and map_env is not None:
-                        cur_map_tokens = self._recompute_map_tokens(
-                            cur_state_6d[:, :4], map_idx, map_env, scene_graph)
-                        cur_ego_map_tokens = cur_map_tokens[ego_mask]
-                    else:
-                        cur_ego_map_tokens = ego_map_tokens
+            if ego_state_for_intent.size(-1) < 6:
+                ego_state_for_intent = torch.cat([ego_state_for_intent,
+                    torch.zeros(num_ego, 6 - ego_state_for_intent.size(-1), device=device)], dim=-1)
 
-                # History buffer
-                ego_history_buffer[:, actual_t, :] = ego_gcn_feat
+            intent_input = torch.cat([ego_state_for_intent, predicted_sur_delta, ego_map_ctx.detach()], dim=-1)
+            z_local, intent_weights = self.intent_codebook(intent_input, self.gumbel_temperature)
 
-                # History Attention
-                ego_gru_h_last = ego_gru_hidden[-1]
-                ego_hist_ctx = self.ego_history_attn(ego_gru_h_last, ego_history_buffer, actual_t)
+            if not self.use_ego_intent:
+                z_local = torch.zeros_like(z_local)
 
-                # Auxiliary: sur prediction
-                predicted_sur_delta = self.sur_pred_head(ego_hist_ctx)
-                seg_sur_pred.append(predicted_sur_delta.detach())
+            self._z_local_outputs.append(z_local.detach())
+            self._intent_weights_outputs.append(intent_weights.detach())
 
-                # Map Attention
-                ego_map_ctx, ego_map_attn_w = self.ego_map_attn(ego_gru_h_last, cur_ego_map_tokens)
-                seg_map_attn.append(ego_map_attn_w)
+            # Ego GRU (1-step)
+            ego_lw_flat = cur_lw[ego_mask]
+            ego_sem_flat = cur_sem[ego_mask]
+            ego_gru_in = torch.cat([
+                ego_hist_ctx, ego_map_ctx, z_ego, z_local, ego_lw_flat, ego_sem_flat
+            ], dim=-1).unsqueeze(1)
 
-                # Intent
-                if step == 0:
-                    if actual_t == 0:
-                        ego_state_for_intent = scene_graph.past[:, -1, :][ego_mask]
-                    else:
-                        ego_state_for_intent = gt_future[:, actual_t - 1, :][ego_mask]
-                else:
-                    ego_state_for_intent = ego_prev_state
+            ego_gru_out, _ = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
+            ego_traj_out = self.ego_output_head(ego_gru_out[:, 0])
 
-                if ego_state_for_intent.size(-1) < 6:
-                    ego_state_for_intent = torch.cat([ego_state_for_intent,
-                        torch.zeros(num_ego, 6 - ego_state_for_intent.size(-1), device=device)], dim=-1)
+            # Bicycle model
+            ego_state_global, _ = self._apply_dynamics_single(
+                ego_traj_out, ego_prev_state, cur_veh_len[ego_mask])
 
-                intent_input = torch.cat([ego_state_for_intent, predicted_sur_delta, ego_map_ctx.detach()], dim=-1)
-                z_local, intent_weights = self.intent_codebook(intent_input, self.gumbel_temperature, self.phase)
+            ego_traj_all[:, t, :] = ego_state_global
 
-                if not self.use_z_local:
-                    z_local = torch.zeros_like(z_local)
-
-                seg_z_local.append(z_local.detach())
-                seg_intent_w.append(intent_weights.detach())
-
-                # Ego GRU
-                ego_lw_flat = cur_lw[ego_mask]
-                ego_sem_flat = cur_sem[ego_mask]
-                ego_gru_in = torch.cat([
-                    ego_hist_ctx, ego_map_ctx, z_ego, z_local, ego_lw_flat, ego_sem_flat
-                ], dim=-1).unsqueeze(1)
-
-                ego_gru_out, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
-                ego_traj_out = self.ego_output_head(ego_gru_out[:, 0])
-
-                # Bicycle model
-                ego_state_global, ego_bike_state = self._apply_dynamics_single(
-                    ego_traj_out, ego_prev_state, cur_veh_len[ego_mask])
-
-                segment_preds.append(ego_state_global)
-
-                # Update ego state for next step within segment
-                if step < tf_segment_len - 1 and actual_t < FT - 1:
-                    if self.output_bicycle and ego_bike_state is not None:
-                        ego_prev_state = ego_bike_state
-                    else:
-                        ego_prev_state = ego_state_global
-
-            ego_segments.append(segment_preds)
-            self._sur_pred_outputs.append(seg_sur_pred)
-            self._ego_map_attn_weights_outputs.append(seg_map_attn)
-            self._z_local_outputs.append(seg_z_local)
-            self._intent_weights_outputs.append(seg_intent_w)
-
-        return ego_segments
+        return ego_traj_all  # (num_ego, FT, 4)
 
     # ============================================================
     # Dynamics helpers
@@ -1591,6 +1614,8 @@ class TrafficPlannerModel(nn.Module):
             self.sur_history_attn, self.sur_map_attn,
             self.sur_decoder_gru, self.sur_output_head,
             self.sur_warmup_gru,
+            # Sur intent codebook (freeze with sur decoder)
+            self.sur_intent_codebook, self.sur_intent_ce_head,
             # Ego pred head (sur→ego, Phase 1 only)
             self.ego_pred_head,
         ]
@@ -1607,10 +1632,7 @@ class TrafficPlannerModel(nn.Module):
     # ============================================================
 
     def get_z_local(self):
-        """Get z_local from last forward pass.
-        AR mode: list of FT tensors (num_ego, intent_dim)
-        TF mode: list of segments, each segment is list of tensors
-        """
+        """Get z_local from last forward pass. Flat list of FT tensors (num_ego, intent_dim)."""
         if not hasattr(self, '_z_local_outputs') or len(self._z_local_outputs) == 0:
             return None
         return self._z_local_outputs
@@ -1620,8 +1642,6 @@ class TrafficPlannerModel(nn.Module):
         raw = self.get_z_local()
         if raw is None:
             return None
-        if isinstance(raw[0], list):
-            return None  # TF mode — cannot stack
         return torch.stack(raw, dim=0)
 
     def get_z_local_mean(self):
@@ -1633,10 +1653,7 @@ class TrafficPlannerModel(nn.Module):
         return None
 
     def get_intent_weights(self):
-        """Get intent selection weights.
-        AR mode: list of FT tensors (num_ego, K)
-        TF mode: list of segments, each segment is list of tensors
-        """
+        """Get intent selection weights. Flat list of FT tensors (num_ego, K)."""
         if not hasattr(self, '_intent_weights_outputs') or len(self._intent_weights_outputs) == 0:
             return None
         return self._intent_weights_outputs
@@ -1658,9 +1675,6 @@ class TrafficPlannerModel(nn.Module):
         w = self.get_ego_map_attn_weights()
         if w is None:
             return None
-        # Handle both flat list (AR) and segmented list (TF)
-        if len(w) > 0 and isinstance(w[0], list):
-            return [[x.detach() for x in seg] for seg in w]
         return [x.detach() for x in w]
 
     def get_attn_weights(self):
@@ -1677,6 +1691,18 @@ class TrafficPlannerModel(nn.Module):
         if not hasattr(self, '_ego_pred_outputs') or len(self._ego_pred_outputs) == 0:
             return None
         return self._ego_pred_outputs
+
+    def get_sur_z_local(self):
+        """Get sur z_local outputs. Flat list of FT tensors (num_sur, intent_dim)."""
+        if not hasattr(self, '_z_local_sur_outputs') or len(self._z_local_sur_outputs) == 0:
+            return None
+        return self._z_local_sur_outputs
+
+    def get_sur_intent_weights(self):
+        """Get sur intent selection weights. Flat list of FT tensors (num_sur, K)."""
+        if not hasattr(self, '_sur_intent_weights_outputs') or len(self._sur_intent_weights_outputs) == 0:
+            return None
+        return self._sur_intent_weights_outputs
 
     def get_z_local_sparsity_loss(self, target_sparsity=0.1):
         """Backward-compatible sparsity loss (unused in redesign but kept for interface)."""

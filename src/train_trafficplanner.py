@@ -160,6 +160,10 @@ def parse_cfg():
                         help='Predicted surrounding agent delta dimension (dx, dy)')
     parser.add_argument('--map_recrop', type=str2bool, default=False,
                         help='Re-crop map tokens at each decode step')
+    parser.add_argument('--use_ego_intent', type=str2bool, default=True,
+                        help='Enable ego intent codebook')
+    parser.add_argument('--use_sur_intent', type=str2bool, default=False,
+                        help='Enable sur intent codebook')
 
     # Redesign: auxiliary loss weights
     parser.add_argument('--loss_sur_pred', type=float, default=0.1,
@@ -188,8 +192,7 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                   optimizer=None,
                   step_counter=0,
                   use_wandb=False,
-                  use_teacher_forcing=False,
-                  current_epoch=0):
+                  use_teacher_forcing=False):
     '''
     Run through dataset and for a single epoch. Trains if desired.
     '''
@@ -226,8 +229,7 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                         loss_fn.loss_weights.get('coll_env_prior', 0.0) > 0.0
 
             pred = model(scene_graph, map_idx, map_env, future_sample=do_sample,
-                         teacher_forcing=use_teacher_forcing if train else False,
-                         current_epoch=current_epoch)
+                         teacher_forcing=use_teacher_forcing if train else False)
 
             # Pass model to loss_fn for z_local sparsity computation
             # use_teacher_forcing only during training
@@ -347,9 +349,6 @@ def main():
     print(f'  - use_veh_potential: {cfg.use_veh_potential}')
     print(f'use_sparse_loss: {cfg.use_sparse_loss}')
     print(f'use_teacher_forcing: {cfg.use_teacher_forcing}')
-    if cfg.use_teacher_forcing:
-        print(f'  - tf_init_segment_len: {cfg.tf_init_segment_len}')
-        print(f'  - tf_max_annealing_epoch: {cfg.tf_max_annealing_epoch}')
 
     use_wandb = cfg.wandb_project is not None
     if use_wandb:
@@ -443,15 +442,14 @@ def main():
         conv_kernel_list=cfg.conv_kernel_list,
         conv_stride_list=cfg.conv_stride_list,
         conv_filter_list=cfg.conv_filter_list,
-        # Teacher forcing annealing parameters
-        tf_max_annealing_epoch=cfg.tf_max_annealing_epoch,
-        tf_init_segment_len=cfg.tf_init_segment_len,
         # Redesign params
         num_intents=cfg.num_intents,
         hist_attn_nhead=cfg.hist_attn_nhead,
         map_attn_nhead=cfg.map_attn_nhead,
         sur_pred_dim=cfg.sur_pred_dim,
         map_recrop=cfg.map_recrop,
+        use_ego_intent=cfg.use_ego_intent,
+        use_sur_intent=cfg.use_sur_intent,
     ).to(device)
 
     train_loss = []
@@ -598,8 +596,6 @@ def main():
     Logger.log(f'  PT (past_len): {model.PT}')
     Logger.log(f'  FT (future_len): {model.FT}')
     Logger.log(f'  z_local_size: {model.z_local_size}')
-    Logger.log(f'  tf_max_annealing_epoch: {model.tf_max_annealing_epoch}')
-    Logger.log(f'  tf_init_segment_len: {model.tf_init_segment_len}')
     Logger.log(f'  num_intents: {model.num_intents}')
     Logger.log(f'  intent_dim: {model.intent_dim}')
     Logger.log(f'  map_num_tokens: {model.map_num_tokens}')
@@ -631,12 +627,10 @@ def main():
     Logger.log(f'  use_lane_lines: {loss_fn.potential_cfg["use_lane_lines"]}')
     Logger.log(f'  env_loss_ego_only: {loss_fn.potential_cfg["env_loss_ego_only"]}')
 
-    # Teacher forcing (from cfg, not stored in model/loss_fn)
+    # Teacher forcing
     Logger.log('\n[Teacher Forcing]')
     Logger.log(f'  use_teacher_forcing: {cfg.use_teacher_forcing}')
-    if cfg.use_teacher_forcing:
-        Logger.log(f'  tf_init_segment_len: {cfg.tf_init_segment_len}')
-        Logger.log(f'  tf_max_annealing_epoch: {cfg.tf_max_annealing_epoch}')
+    Logger.log(f'  mode: GT-cached independent 1-step prediction (no AR during training)')
 
     # Optimizer
     Logger.log('\n[Optimizer]')
@@ -683,8 +677,7 @@ def main():
                                         optimizer=optimizer,
                                         step_counter=step_counter,
                                         use_wandb=use_wandb,
-                                        use_teacher_forcing=cfg.use_teacher_forcing,
-                                        current_epoch=epoch)
+                                        use_teacher_forcing=cfg.use_teacher_forcing)
         train_loss.append(_)
         ax1.clear()
         ax1.plot(train_loss)
@@ -710,8 +703,7 @@ def main():
                                                             train=False,
                                                             step_counter=step_counter,
                                                             use_wandb=use_wandb,
-                                                            use_teacher_forcing=False,
-                                                            current_epoch=epoch)
+                                                            use_teacher_forcing=False)
                 valid_loss.append(mean_eval_loss)
                 print(f'min_eval_loss = ', min_eval_loss)
                 print(f'mean_eval_loss = ', mean_eval_loss)

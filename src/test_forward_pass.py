@@ -115,7 +115,8 @@ def test_model_instantiation(device):
         map_feat_size=64, past_feat_size=64, future_feat_size=64,
         latent_size=32, z_local_size=32,
         output_bicycle=True, dt=0.5,
-        num_intents=8, hist_attn_nhead=4, map_attn_nhead=4, sur_pred_dim=2,
+        num_intents=9, hist_attn_nhead=4, map_attn_nhead=4, sur_pred_dim=2,
+        use_ego_intent=True, use_sur_intent=True,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -154,7 +155,7 @@ def test_forward_pass(model, device):
     model.set_bicycle_params({k: (v[0], v[1]) if isinstance(v, tuple) else v for k, v in NUSC_BIKE_PARAMS.items()})
 
     model.train()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False)
 
     NA = B * agents_per_scene
     assert pred['future_pred'].shape == (NA, 12, 4), f"Expected (NA, 12, 4), got {pred['future_pred'].shape}"
@@ -164,12 +165,12 @@ def test_forward_pass(model, device):
     # Check analysis outputs
     z_local = model.get_z_local_stacked()
     assert z_local is not None, "z_local should be available after forward"
-    assert z_local.shape == (12, B, 32), f"Expected z_local (12, B, 32), got {z_local.shape}"
+    assert z_local.shape == (12, B, 32), f"Expected z_local (12, num_ego, 32), got {z_local.shape}"
 
     intent_w_raw = model.get_intent_weights()
     assert intent_w_raw is not None, "intent_weights should be available"
     intent_w = torch.stack(intent_w_raw, dim=0)
-    assert intent_w.shape == (12, B, 8), f"Expected intent_weights (12, B, 8), got {intent_w.shape}"
+    assert intent_w.shape == (12, B, 9), f"Expected intent_weights (12, num_ego, 9), got {intent_w.shape}"
 
     map_attn = model.get_map_attn_weights()
     assert map_attn is not None, "map_attn should be available"
@@ -183,9 +184,23 @@ def test_forward_pass(model, device):
     assert ego_pred is not None, "ego_pred should be available"
     assert len(ego_pred) == 12, f"Expected 12 ego_pred entries, got {len(ego_pred)}"
 
+    # Sur intent outputs
+    sur_z_local = model.get_sur_z_local()
+    assert sur_z_local is not None, "sur_z_local should be available"
+    assert len(sur_z_local) == 12, f"Expected 12 sur_z_local entries, got {len(sur_z_local)}"
+    num_sur = NA - B  # agents_per_scene=3, 1 ego per scene -> 2 sur per scene
+    assert sur_z_local[0].shape == (num_sur, 32), f"Expected sur_z_local (num_sur, 32), got {sur_z_local[0].shape}"
+
+    sur_intent_w = model.get_sur_intent_weights()
+    assert sur_intent_w is not None, "sur_intent_weights should be available"
+    assert len(sur_intent_w) == 12, f"Expected 12 sur_intent_weights entries, got {len(sur_intent_w)}"
+    assert sur_intent_w[0].shape == (num_sur, 9), f"Expected sur_intent_w (num_sur, 9), got {sur_intent_w[0].shape}"
+
     print(f"  future_pred shape: {pred['future_pred'].shape}")
     print(f"  z_local shape: {z_local.shape}")
     print(f"  intent_weights shape: {intent_w.shape}")
+    print(f"  sur_z_local[0] shape: {sur_z_local[0].shape}")
+    print(f"  sur_intent_w[0] shape: {sur_intent_w[0].shape}")
     print(f"  map_attn[0] shape: {map_attn[0].shape}")
     print(f"  sur_pred[0] shape: {sur_pred[0].shape}")
     print(f"  ego_pred[0] shape: {ego_pred[0].shape}")
@@ -203,15 +218,37 @@ def test_teacher_forcing(model, device):
     map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
     map_idx = torch.zeros(B, dtype=torch.long, device=device)
 
+    NA = B * agents_per_scene
     model.train()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=100)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True)
 
-    # TF output is list of segments
+    # TF output is now flat (NA, FT, 4) tensor (same as AR)
     tf_preds = pred['future_pred']
-    assert isinstance(tf_preds, list), "TF output should be list of segments"
-    print(f"  Number of segments: {len(tf_preds)}")
-    for i, seg in enumerate(tf_preds[:3]):  # show first 3
-        print(f"  Segment {i}: {len(seg)} steps, shape {seg[0].shape if len(seg) > 0 else 'empty'}")
+    assert isinstance(tf_preds, torch.Tensor), f"TF output should be tensor, got {type(tf_preds)}"
+    assert tf_preds.shape == (NA, 12, 4), f"Expected (NA, 12, 4), got {tf_preds.shape}"
+    print(f"  TF future_pred shape: {tf_preds.shape}")
+
+    # Check analysis outputs are flat lists
+    z_local = model.get_z_local()
+    assert z_local is not None, "z_local should be available after TF"
+    assert isinstance(z_local, list), "z_local should be flat list"
+    assert len(z_local) == 12, f"Expected 12 z_local entries, got {len(z_local)}"
+    print(f"  z_local: {len(z_local)} entries (flat list)")
+
+    sur_pred = model.get_sur_pred_outputs()
+    assert sur_pred is not None and len(sur_pred) == 12, f"Expected 12 sur_pred entries"
+    ego_pred = model.get_ego_pred_outputs()
+    assert ego_pred is not None and len(ego_pred) == 12, f"Expected 12 ego_pred entries"
+    print(f"  sur_pred: {len(sur_pred)} entries, ego_pred: {len(ego_pred)} entries")
+
+    # Sur intent outputs in TF mode
+    sur_z_local = model.get_sur_z_local()
+    assert sur_z_local is not None, "sur_z_local should be available after TF"
+    assert len(sur_z_local) == 12, f"Expected 12 sur_z_local entries, got {len(sur_z_local)}"
+    sur_intent_w = model.get_sur_intent_weights()
+    assert sur_intent_w is not None, "sur_intent_weights should be available after TF"
+    assert len(sur_intent_w) == 12, f"Expected 12 sur_intent_weights entries, got {len(sur_intent_w)}"
+    print(f"  sur_z_local: {len(sur_z_local)} entries, sur_intent_w: {len(sur_intent_w)} entries")
 
     print("  [OK] Teacher forcing forward pass successful\n")
     return pred
@@ -310,7 +347,7 @@ def test_loss_computation(model, device):
     ).to(device)
 
     model.train()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False)
     loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env, model=model)
 
     print(f"  Total loss: {loss_dict['loss'].item():.4f}")
@@ -366,15 +403,13 @@ def test_loss_teacher_forcing(model, device):
 
     model.train()
     model.zero_grad()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=100)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True)
     loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env,
                         model=model, use_teacher_forcing=True)
 
     print(f"  Total loss: {loss_dict['loss'].item():.4f}")
     print(f"  Recon loss: {loss_dict['recon_loss'].mean().item():.4f}")
     print(f"  KL loss: {loss_dict['kl_loss'].mean().item():.4f}")
-    if 'num_segments' in loss_dict:
-        print(f"  Num segments: {loss_dict['num_segments'].item():.0f}")
     if 'sur_pred_loss' in loss_dict:
         print(f"  Sur pred loss: {loss_dict['sur_pred_loss'].item():.4f}")
     if 'ego_pred_loss' in loss_dict:
@@ -385,6 +420,18 @@ def test_loss_teacher_forcing(model, device):
     num_total = sum(1 for _ in model.parameters())
     print(f"  Params with gradients: {num_with_grad}/{num_total}")
     assert num_with_grad > 0, "No parameters received gradients!"
+
+    # Verify warmup GRU receives gradient in TF mode
+    ego_warmup_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.ego_warmup_gru.parameters())
+    sur_warmup_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.sur_warmup_gru.parameters())
+    print(f"  ego_warmup_gru has grad: {ego_warmup_has_grad}")
+    print(f"  sur_warmup_gru has grad: {sur_warmup_has_grad}")
+    assert ego_warmup_has_grad, "ego_warmup_gru should receive gradient in TF mode!"
+    assert sur_warmup_has_grad, "sur_warmup_gru should receive gradient in TF mode!"
     print("  [OK] TF loss computation and backward pass successful\n")
 
 
@@ -410,7 +457,8 @@ def test_freeze_for_finetuning(model, device):
 
     # Check that key frozen components are frozen
     frozen_prefixes = ['latent_prior_net', 'latent_posterior_net', 'map_conv_early',
-                       'interaction_gcn', 'sur_decoder_gru', 'sur_output_head']
+                       'interaction_gcn', 'sur_decoder_gru', 'sur_output_head',
+                       'sur_intent_codebook', 'sur_intent_ce_head']
     for prefix in frozen_prefixes:
         matching = [n for n in frozen if n.startswith(prefix)]
         assert len(matching) > 0, f"Expected {prefix} to be frozen, but found none!"
@@ -440,7 +488,7 @@ def test_phase2_forward(model, device):
 
     model.set_phase(2)
     model.train()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False)
 
     z_local = model.get_z_local_stacked()
     intent_w_raw = model.get_intent_weights()
@@ -493,7 +541,7 @@ def test_map_attn_loss(model, device):
     # --- Autoregressive mode ---
     model.train()
     model.zero_grad()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False)
     loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env, model=model)
 
     assert 'map_attn_loss' in loss_dict, "map_attn_loss should be in loss_dict when weight > 0"
@@ -502,14 +550,13 @@ def test_map_attn_loss(model, device):
     print(f"  [AR] Total loss: {loss_dict['loss'].item():.4f}")
 
     loss_dict['loss'].backward()
-    # Check that map_attn module gets gradients
     map_attn_grads = sum(1 for n, p in model.named_parameters()
                          if 'ego_map_attn' in n and p.grad is not None)
     print(f"  [AR] ego_map_attn params with grad: {map_attn_grads}")
 
     # --- Teacher forcing mode ---
     model.zero_grad()
-    pred_tf = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=100)
+    pred_tf = model(scene_graph, map_idx, map_env, teacher_forcing=True)
     loss_dict_tf = loss_fn(scene_graph, pred_tf, map_idx=map_idx, map_env=map_env,
                            model=model, use_teacher_forcing=True)
 
@@ -524,6 +571,81 @@ def test_map_attn_loss(model, device):
     print(f"  [TF] ego_map_attn params with grad: {map_attn_grads_tf}")
 
     print("  [OK] Map attention guidance loss successful\n")
+
+
+def test_intent_ce_loss(model, device):
+    print("=" * 60)
+    print("[12] Intent CE Loss (ego + sur)")
+    print("=" * 60)
+
+    B, agents_per_scene = 2, 3
+    scene_graph = make_dummy_scene_graph(B=B, agents_per_scene=agents_per_scene, device=device)
+    map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
+    map_idx = torch.zeros(B, dtype=torch.long, device=device)
+
+    state_norm, att_norm = make_dummy_normalizers()
+    state_norm.mean_vals = state_norm.mean_vals.to(device)
+    state_norm.std_vals = state_norm.std_vals.to(device)
+    att_norm.mean_vals = att_norm.mean_vals.to(device)
+    att_norm.std_vals = att_norm.std_vals.to(device)
+
+    loss_weights = {
+        'recon': 1.0, 'kl': 0.04,
+        'coll_veh_prior': 0.0, 'coll_env_prior': 0.0,
+        'potential_veh': 0.0, 'potential_env': 0.0,
+        'sparse': 0.0,
+        'sur_pred': 0.1, 'ego_pred': 0.1,
+        'intent_ce': 0.1, 'map_attn': 0.0,  # intent_ce ON
+    }
+
+    loss_fn = TrafficPlannerLoss(
+        loss_weights, state_norm, att_norm,
+        phase=1, use_sparse_loss=False, use_potential_loss=False,
+    ).to(device)
+
+    # --- AR mode ---
+    model.train()
+    model.zero_grad()
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False)
+    loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env, model=model)
+
+    assert 'intent_ce_loss' in loss_dict, "intent_ce_loss should be in loss_dict (ego)"
+    print(f"  [AR] intent_ce_loss (ego): {loss_dict['intent_ce_loss'].item():.4f}")
+
+    if model.use_sur_intent:
+        assert 'sur_intent_ce_loss' in loss_dict, "sur_intent_ce_loss should be in loss_dict"
+        print(f"  [AR] sur_intent_ce_loss: {loss_dict['sur_intent_ce_loss'].item():.4f}")
+
+    loss_dict['loss'].backward()
+
+    # Check intent codebook gradient
+    ego_intent_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.intent_codebook.parameters())
+    print(f"  ego intent_codebook has grad: {ego_intent_has_grad}")
+    assert ego_intent_has_grad, "ego intent_codebook should receive gradient!"
+
+    if model.use_sur_intent:
+        sur_intent_has_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in model.sur_intent_codebook.parameters())
+        print(f"  sur intent_codebook has grad: {sur_intent_has_grad}")
+        assert sur_intent_has_grad, "sur_intent_codebook should receive gradient!"
+
+    # --- TF mode ---
+    model.zero_grad()
+    pred_tf = model(scene_graph, map_idx, map_env, teacher_forcing=True)
+    loss_dict_tf = loss_fn(scene_graph, pred_tf, map_idx=map_idx, map_env=map_env,
+                           model=model, use_teacher_forcing=True)
+
+    assert 'intent_ce_loss' in loss_dict_tf, "intent_ce_loss should be in TF loss_dict (ego)"
+    print(f"  [TF] intent_ce_loss (ego): {loss_dict_tf['intent_ce_loss'].item():.4f}")
+
+    if model.use_sur_intent:
+        assert 'sur_intent_ce_loss' in loss_dict_tf, "sur_intent_ce_loss should be in TF loss_dict"
+        print(f"  [TF] sur_intent_ce_loss: {loss_dict_tf['sur_intent_ce_loss'].item():.4f}")
+
+    print("  [OK] Intent CE loss successful\n")
 
 
 def main():
@@ -572,6 +694,9 @@ def main():
 
     # Test 11: Map Attention Guidance Loss
     test_map_attn_loss(model, device)
+
+    # Test 12: Intent CE Loss (ego + sur)
+    test_intent_ce_loss(model, device)
 
     print("=" * 60)
     print("ALL TESTS PASSED!")
