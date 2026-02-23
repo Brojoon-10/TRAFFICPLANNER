@@ -197,7 +197,8 @@ class TransDecoderLayer(nn.Module):
         """
         A2S: map cross-attention with shared K/V and separate ego/sur Q/O.
         :param query_tokens: (B*T, N, D)
-        :param map_tokens: (N, num_tokens, map_dim) — per-agent map crop
+        :param map_tokens: (N, num_tokens, map_dim) — 3D: same map for all steps
+                           or (B*T, N, num_tokens, map_dim) — 4D: per-step recrop
         :param ego_mask: (N,) bool
         :return: output (B*T, N, D), ego_attn_weights, sur_attn_weights
         """
@@ -205,15 +206,17 @@ class TransDecoderLayer(nn.Module):
         nhead = self.a2s_nhead
         head_dim = self.a2s_head_dim
 
-        # Shared map K/V: (N, num_tokens, map_dim) → (N, num_tokens, D)
-        map_k = self.a2s_map_k_proj(map_tokens)  # (N, num_tokens, D)
-        map_v = self.a2s_map_v_proj(map_tokens)  # (N, num_tokens, D)
-        num_tokens = map_k.shape[1]
-
-        # Expand map K/V for all timesteps: (N, ...) → (BT, N, ...)
-        # map_tokens are per-agent, need to broadcast across BT
-        map_k = map_k.unsqueeze(0).expand(BT, -1, -1, -1)  # (BT, N, num_tokens, D)
-        map_v = map_v.unsqueeze(0).expand(BT, -1, -1, -1)
+        if map_tokens.dim() == 3:
+            # Same map for all timesteps: (N, num_tokens, ch) → project → broadcast
+            map_k = self.a2s_map_k_proj(map_tokens)  # (N, num_tokens, D)
+            map_v = self.a2s_map_v_proj(map_tokens)
+            map_k = map_k.unsqueeze(0).expand(BT, -1, -1, -1)  # (BT, N, num_tokens, D)
+            map_v = map_v.unsqueeze(0).expand(BT, -1, -1, -1)
+        else:
+            # Per-step recrop: (BT, N, num_tokens, ch) → project directly
+            map_k = self.a2s_map_k_proj(map_tokens)  # (BT, N, num_tokens, D)
+            map_v = self.a2s_map_v_proj(map_tokens)
+        num_tokens = map_k.shape[2]
 
         ego_idx = ego_mask.nonzero(as_tuple=True)[0]
         sur_idx = (~ego_mask).nonzero(as_tuple=True)[0]
@@ -991,11 +994,14 @@ class TrafficPlannerModel(nn.Module):
         # ================================================================
         # 5. Run through Transformer layers
         # ================================================================
-        # Re-crop map tokens if enabled (use last past position for all steps in training)
+        # Re-crop map tokens per timestep using GT positions
         if self.map_recrop:
-            # Use per-step position for map re-crop in training
-            # For simplicity, use initial crop (already per-agent)
-            pass  # map_tokens already per-agent from initial crop
+            all_map_tokens = []
+            for t in range(T_total):
+                pos_t = all_states[:, t, :4]  # (NA, 4) normalized
+                mt = self._recompute_map_tokens(pos_t, map_idx, map_env, scene_graph)
+                all_map_tokens.append(mt)  # (NA, num_tokens, ch)
+            map_tokens = torch.stack(all_map_tokens, dim=0)  # (T_total, NA, num_tokens, ch)
 
         x = tokens  # (1, T_total, NA, D)
 
@@ -1206,7 +1212,13 @@ class TrafficPlannerModel(nn.Module):
             causal_mask = self._build_causal_mask(cur_T, device)
 
             # Compute map_tokens for current agents
-            cur_map = map_tokens_flat  # (NA_eff, num_tokens, ch)
+            if self.map_recrop and t > 0:
+                cur_pos = prev_state[:, :4]  # (NA_eff, 4) normalized
+                cur_map = self._recompute_map_tokens(
+                    cur_pos, map_idx, map_env, scene_graph,
+                    mult_samp=mult_samp, NS=NS)
+            else:
+                cur_map = map_tokens_flat  # (NA_eff, num_tokens, ch)
 
             x = all_tokens  # (1, cur_T, NA_eff, D)
 
@@ -1486,21 +1498,28 @@ class TrafficPlannerModel(nn.Module):
             merged[~ego_mask] = other_feat
         return merged
 
-    def _recompute_map_tokens(self, pos_normalized, map_idx, map_env, scene_graph):
+    def _recompute_map_tokens(self, pos_normalized, map_idx, map_env, scene_graph,
+                               mult_samp=False, NS=None):
         """
         Re-crop and re-encode map tokens at given normalized positions.
 
-        :param pos_normalized: (NA, 4) normalized positions (x, y, hx, hy)
+        :param pos_normalized: (NA, 4) or (NA*NS, 4) normalized positions
         :param map_idx: (B,) map index per batch
         :param map_env: map environment for cropping
         :param scene_graph: scene graph (for .batch attribute)
-        :return: map_tokens (NA, num_tokens, map_token_ch)
+        :param mult_samp: if True, pos is (NA*NS, 4) and mapixes need expansion
+        :param NS: number of samples per agent (required if mult_samp=True)
+        :return: map_tokens (NA, num_tokens, ch) or (NA*NS, num_tokens, ch)
         """
         pos_unnorm = self.normalizer.unnormalize(pos_normalized)
-        mapixes = map_idx[scene_graph.batch]
-        map_obs = map_env.get_map_crop_pos(pos_unnorm, mapixes).to(torch.float)  # (NA, C, H, W)
-        map_early = self.map_conv_early(map_obs)  # (NA, ch, H', W')
-        map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (NA, num_tokens, ch)
+        if mult_samp and NS is not None:
+            mapixes = map_idx[scene_graph.batch]  # (NA,)
+            mapixes = mapixes.unsqueeze(1).expand(-1, NS).reshape(-1)  # (NA*NS,)
+        else:
+            mapixes = map_idx[scene_graph.batch]
+        map_obs = map_env.get_map_crop_pos(pos_unnorm, mapixes).to(torch.float)
+        map_early = self.map_conv_early(map_obs)
+        map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (N, num_tokens, ch)
         return map_tokens
 
     def rsample(self, mean, var):

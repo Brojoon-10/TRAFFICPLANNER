@@ -595,17 +595,15 @@ def main():
             total_steps = est_steps_per_epoch * cfg.epochs
             Logger.log(f'LR: estimated {est_steps_per_epoch} steps/epoch, {total_steps} total steps')
 
-        # Set initial lr to something small (will be overridden by schedule)
-        for pg in optimizer.param_groups:
-            pg['lr'] = lr_min
-
         # Step-based warmup + cosine decay function
+        # BMT-style: lr_min → lr_max (warmup) → lr_min (cosine decay)
+        min_ratio = lr_min / lr_max
         def lr_lambda(step):
             if step < warmup_steps:
-                # Linear warmup: 0 → 1
-                return step / max(warmup_steps, 1)
+                # Linear warmup: lr_min → lr_max
+                return max(min_ratio, step / max(warmup_steps, 1))
             else:
-                # Cosine decay: 1 → lr_min/lr_max
+                # Cosine decay: lr_max → lr_min
                 progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
                 progress = min(progress, 1.0)
                 cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))

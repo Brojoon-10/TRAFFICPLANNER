@@ -426,6 +426,13 @@ A2S: agent token → map_tokens cross-attention
   Q/O만 ego/sur 분리 → 역할별 query 차별화
   map_tokens는 에이전트별 위치 기준 crop → 입력 자체가 이미 다름
   residual: x = x + A2S(x)
+
+  map_recrop (config: map_recrop: True):
+    Training: GT state 16개로 미리 step별 map_tokens crop → (T_total, NA, num_tokens, ch) 4D
+              _a2s_attention이 4D map_tokens 직접 사용 (broadcast 없음)
+    Inference(AR): 매 step prev_state 기준 _recompute_map_tokens() 호출
+              mult_samp도 지원 (mapixes를 NA*NS로 expand)
+    False: 초기 crop(last past 위치) 재사용 → 3D (NA, num_tokens, ch) broadcast
 ```
 
 ### 6d. Layer 구조 요약
@@ -564,6 +571,7 @@ trans_dropout: 0.1           # dropout rate
 use_ego_z_local: True        # ego z_local on/off
 use_sur_z_local: True        # sur z_local on/off (config 기준)
 temporal_pe_type: learnable  # positional encoding type
+map_recrop: True             # step별 map re-crop (TF: 미리 16step crop, AR: 매 step crop)
 
 # Projection dimensions
 gcn_feat_dim: 64             # GCN output → Linear(64→128) → Transformer
@@ -582,7 +590,7 @@ T_total: 16                  # PT + FT
 use_lr_anneal: True
 lr_max: 3e-4                 # warmup 완료 후 peak LR
 lr_min: 5e-6                 # cosine decay 종료 시 최소 LR
-lr_warmup_steps: 2500        # linear warmup (0 → lr_max)
+lr_warmup_steps: 2500        # linear warmup (lr_min → lr_max)
 # lr_total_steps: auto       # epochs * (data_size / batch_size)
 # KL annealing은 기존대로 epoch 기반 (kl_anneal_end: 50)
 ```
