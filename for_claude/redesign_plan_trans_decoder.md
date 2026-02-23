@@ -590,7 +590,7 @@ T_total: 16                  # PT + FT
 use_lr_anneal: True
 lr_max: 3e-4                 # warmup 완료 후 peak LR
 lr_min: 5e-6                 # cosine decay 종료 시 최소 LR
-lr_warmup_steps: 2500        # linear warmup (lr_min → lr_max)
+lr_warmup_steps: 2500        # linear warmup (~0 → lr_max), warmup_floor=5e-7
 # lr_total_steps: auto       # epochs * (data_size / batch_size)
 # KL annealing은 기존대로 epoch 기반 (kl_anneal_end: 50)
 ```

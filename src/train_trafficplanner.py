@@ -596,18 +596,19 @@ def main():
             Logger.log(f'LR: estimated {est_steps_per_epoch} steps/epoch, {total_steps} total steps')
 
         # Step-based warmup + cosine decay function
-        # BMT-style: lr_min → lr_max (warmup) → lr_min (cosine decay)
-        min_ratio = lr_min / lr_max
+        # ~0 → lr_max (warmup) → lr_min (cosine decay)
+        warmup_floor = 5e-7 / lr_max  # near-zero start for warmup
+        decay_floor = lr_min / lr_max  # cosine decay end
         def lr_lambda(step):
             if step < warmup_steps:
-                # Linear warmup: lr_min → lr_max
-                return max(min_ratio, step / max(warmup_steps, 1))
+                # Linear warmup: ~0 → lr_max
+                return max(warmup_floor, step / max(warmup_steps, 1))
             else:
                 # Cosine decay: lr_max → lr_min
                 progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
                 progress = min(progress, 1.0)
                 cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-                return max(lr_min / lr_max, cosine_decay)
+                return max(decay_floor, cosine_decay)
 
         # Set optimizer to lr_max (lambda will scale it)
         for pg in optimizer.param_groups:
