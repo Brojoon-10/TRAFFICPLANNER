@@ -64,16 +64,21 @@ def parse_cfg():
     # TrafficPlannerModel architecture parameters (past_feat_size, future_feat_size in base_args)
     parser.add_argument('--z_local_size', type=int, default=32,
                         help='Latent dimension for z_local (ego-only reactive)')
-    parser.add_argument('--num_intents', type=int, default=8,
+    parser.add_argument('--num_intents', type=int, default=9,
                         help='Number of intent codebook entries (K)')
-    parser.add_argument('--hist_attn_nhead', type=int, default=4,
-                        help='Number of heads for decoder history attention')
-    parser.add_argument('--map_attn_nhead', type=int, default=4,
-                        help='Number of heads for decoder map cross-attention')
     parser.add_argument('--sur_pred_dim', type=int, default=2,
                         help='Predicted surrounding agent delta dimension (dx, dy)')
-    parser.add_argument('--map_recrop', type=str2bool, default=False,
+    parser.add_argument('--map_recrop', type=str2bool, default=True,
                         help='Re-crop map tokens at each decode step')
+
+    # Transformer decoder parameters
+    parser.add_argument('--trans_num_layers', type=int, default=4)
+    parser.add_argument('--trans_d_model', type=int, default=128)
+    parser.add_argument('--trans_nhead', type=int, default=8)
+    parser.add_argument('--trans_ffn_dim', type=int, default=512)
+    parser.add_argument('--trans_dropout', type=float, default=0.1)
+    parser.add_argument('--use_ego_z_local', type=str2bool, default=True)
+    parser.add_argument('--use_sur_z_local', type=str2bool, default=True)
 
     # Potential field parameters (ignored in test, but needed for config compatibility)
     parser.add_argument('--k_veh_repel', type=float, default=1.0)
@@ -395,10 +400,16 @@ def main():
         conv_filter_list=cfg.conv_filter_list,
         # Redesign params
         num_intents=cfg.num_intents,
-        hist_attn_nhead=cfg.hist_attn_nhead,
-        map_attn_nhead=cfg.map_attn_nhead,
         sur_pred_dim=cfg.sur_pred_dim,
         map_recrop=cfg.map_recrop,
+        # Transformer decoder params
+        trans_num_layers=cfg.trans_num_layers,
+        trans_d_model=cfg.trans_d_model,
+        trans_nhead=cfg.trans_nhead,
+        trans_ffn_dim=cfg.trans_ffn_dim,
+        trans_dropout=cfg.trans_dropout,
+        use_ego_z_local=cfg.use_ego_z_local,
+        use_sur_z_local=cfg.use_sur_z_local,
     ).to(device)
 
     print(model)

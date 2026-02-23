@@ -8,7 +8,7 @@
 # - Phase-based training (Phase 1: pretrain, Phase 2: finetune)
 # - Potential-based collision avoidance loss
 
-import os, argparse, time
+import os, argparse, time, csv
 
 import gc
 import math
@@ -16,6 +16,7 @@ import tqdm
 import torch
 import torch.optim as optim
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 from torch_geometric.data import DataLoader as GraphDataLoader
 
@@ -130,11 +131,6 @@ def parse_cfg():
     # Teacher forcing (prevents error accumulation in autoregressive decoding)
     parser.add_argument('--use_teacher_forcing', type=str2bool, default=False,
                         help='Enable teacher forcing during training')
-    parser.add_argument('--tf_init_segment_len', type=int, default=1,
-                        help='Initial segment length for teacher forcing (anneals to future_len)')
-    parser.add_argument('--tf_max_annealing_epoch', type=int, default=200,
-                        help='Epoch to reach full segment length (future_len) via cosine annealing')
-
     # Potential field parameters (optional tuning)
     parser.add_argument('--k_veh_repel', type=float, default=2.0, help='Vehicle repulsion strength')
     parser.add_argument('--sigma_veh', type=float, default=3.0, help='Vehicle repulsion decay rate')
@@ -152,14 +148,26 @@ def parse_cfg():
     # Redesign: new model architecture params
     parser.add_argument('--num_intents', type=int, default=8,
                         help='Number of intent codebook entries (K)')
-    parser.add_argument('--hist_attn_nhead', type=int, default=4,
-                        help='Number of heads for decoder history attention')
-    parser.add_argument('--map_attn_nhead', type=int, default=4,
-                        help='Number of heads for decoder map cross-attention')
     parser.add_argument('--sur_pred_dim', type=int, default=2,
                         help='Predicted surrounding agent delta dimension (dx, dy)')
     parser.add_argument('--map_recrop', type=str2bool, default=False,
                         help='Re-crop map tokens at each decode step')
+
+    # Transformer Decoder params
+    parser.add_argument('--trans_num_layers', type=int, default=4,
+                        help='Number of Transformer decoder layers')
+    parser.add_argument('--trans_d_model', type=int, default=128,
+                        help='Transformer decoder d_model dimension')
+    parser.add_argument('--trans_nhead', type=int, default=8,
+                        help='Number of attention heads in Transformer decoder')
+    parser.add_argument('--trans_ffn_dim', type=int, default=512,
+                        help='FFN intermediate dimension in Transformer decoder')
+    parser.add_argument('--trans_dropout', type=float, default=0.1,
+                        help='Dropout rate for Transformer decoder')
+    parser.add_argument('--use_ego_z_local', type=str2bool, default=True,
+                        help='Enable ego z_local (IntentCodebook)')
+    parser.add_argument('--use_sur_z_local', type=str2bool, default=False,
+                        help='Enable sur z_local via separate IntentCodebook')
 
     # Redesign: auxiliary loss weights
     parser.add_argument('--loss_sur_pred', type=float, default=0.1,
@@ -189,7 +197,9 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                   step_counter=0,
                   use_wandb=False,
                   use_teacher_forcing=False,
-                  current_epoch=0):
+                  current_epoch=0,
+                  tb_writer=None,
+                  global_step=0):
     '''
     Run through dataset and for a single epoch. Trains if desired.
     '''
@@ -250,29 +260,19 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                         raise RuntimeError(f"NaN detected in {loss_name}")
 
                 # --- Start: Detailed Loss Monitoring ---
-                recon_val = torch.mean(loss_dict['recon_loss']).item()
-                kl_val = torch.mean(loss_dict['kl_loss']).item()
-
-                # Retrieve potential loss values if available
-                pot_veh_val = loss_dict.get('potential_veh_loss', torch.tensor(0.0)).item()
-                pot_env_val = loss_dict.get('potential_env_loss', torch.tensor(0.0)).item()
-                sparse_val = loss_dict.get('sparse_loss', torch.tensor(0.0)).item()
-
-                # Formatted print statement for clear and readable output.
-                print(
-                    f"Total Loss: {loss.item():.4f} | "
-                    f"Recon: {recon_val:.4f} | "
-                    f"KL: {kl_val:.4f} | "
-                    f"PotVeh: {pot_veh_val:.4f} | "
-                    f"PotEnv: {pot_env_val:.4f} | "
-                    f"Sparse: {sparse_val:.4f}"
-                )
+                parts = [f"Total Loss: {loss.item():.4f}"]
+                for k, v in loss_dict.items():
+                    if k == 'loss':
+                        continue
+                    parts.append(f"{k}: {torch.mean(v).item():.4f}")
+                print(" | ".join(parts))
             # --- END: ROBUST NAN DEBUGGING BLOCK ---
 
             if train:
                 # training step for generator
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             # compute interpretable errors
@@ -322,17 +322,26 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
         # Log the loss to the tqdm progress bar
         pbar.set_postfix(progress_bar_metrics)
 
+        # TensorBoard: per-batch logging (train only, every 100 batches)
+        if tb_writer is not None and train:
+            global_step += 1
+            if global_step % 10 == 0:
+                for k, v in progress_bar_metrics.items():
+                    tb_writer.add_scalar(f'batch/{k}', v, global_step)
+
     wandb_epoch_metrics = {}
+    epoch_metrics = {}
     for k, v in metrics.items():
         metrics[k] = np.concatenate(metrics[k])
-        wandb_epoch_metrics[prefix + " Epoch Mean " + k] = np.mean(metrics[k])
+        epoch_metrics[k] = np.mean(metrics[k])
+        wandb_epoch_metrics[prefix + " Epoch Mean " + k] = epoch_metrics[k]
 
     mean_epoch_loss = wandb_epoch_metrics[prefix + " Epoch Mean loss"]
 
     if use_wandb and len(wandb_epoch_metrics) > 0:
         wandb.log(wandb_epoch_metrics, step=step_counter)
 
-    return step_counter, mean_epoch_loss
+    return step_counter, mean_epoch_loss, epoch_metrics, global_step
 
 
 def main():
@@ -347,9 +356,6 @@ def main():
     print(f'  - use_veh_potential: {cfg.use_veh_potential}')
     print(f'use_sparse_loss: {cfg.use_sparse_loss}')
     print(f'use_teacher_forcing: {cfg.use_teacher_forcing}')
-    if cfg.use_teacher_forcing:
-        print(f'  - tf_init_segment_len: {cfg.tf_init_segment_len}')
-        print(f'  - tf_max_annealing_epoch: {cfg.tf_max_annealing_epoch}')
 
     use_wandb = cfg.wandb_project is not None
     if use_wandb:
@@ -443,15 +449,18 @@ def main():
         conv_kernel_list=cfg.conv_kernel_list,
         conv_stride_list=cfg.conv_stride_list,
         conv_filter_list=cfg.conv_filter_list,
-        # Teacher forcing annealing parameters
-        tf_max_annealing_epoch=cfg.tf_max_annealing_epoch,
-        tf_init_segment_len=cfg.tf_init_segment_len,
         # Redesign params
         num_intents=cfg.num_intents,
-        hist_attn_nhead=cfg.hist_attn_nhead,
-        map_attn_nhead=cfg.map_attn_nhead,
         sur_pred_dim=cfg.sur_pred_dim,
         map_recrop=cfg.map_recrop,
+        # Transformer decoder params
+        trans_num_layers=cfg.trans_num_layers,
+        trans_d_model=cfg.trans_d_model,
+        trans_nhead=cfg.trans_nhead,
+        trans_ffn_dim=cfg.trans_ffn_dim,
+        trans_dropout=cfg.trans_dropout,
+        use_ego_z_local=cfg.use_ego_z_local,
+        use_sur_z_local=cfg.use_sur_z_local,
     ).to(device)
 
     train_loss = []
@@ -526,6 +535,7 @@ def main():
     # create optimizer
     optimizer = optim.Adam(model.parameters(),
                            lr=cfg.lr,
+                           betas=(0.9, 0.95),
                            weight_decay=cfg.weight_decay)
 
     # load model weights & optimizer to start from, if given
@@ -550,6 +560,7 @@ def main():
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.Adam(trainable_params,
                                lr=cfg.lr,
+                               betas=(0.9, 0.95),
                                weight_decay=cfg.weight_decay)
         Logger.log('Created optimizer with %d trainable parameters' % len(trainable_params))
     elif cfg.ckpt is not None:
@@ -598,8 +609,6 @@ def main():
     Logger.log(f'  PT (past_len): {model.PT}')
     Logger.log(f'  FT (future_len): {model.FT}')
     Logger.log(f'  z_local_size: {model.z_local_size}')
-    Logger.log(f'  tf_max_annealing_epoch: {model.tf_max_annealing_epoch}')
-    Logger.log(f'  tf_init_segment_len: {model.tf_init_segment_len}')
     Logger.log(f'  num_intents: {model.num_intents}')
     Logger.log(f'  intent_dim: {model.intent_dim}')
     Logger.log(f'  map_num_tokens: {model.map_num_tokens}')
@@ -634,14 +643,14 @@ def main():
     # Teacher forcing (from cfg, not stored in model/loss_fn)
     Logger.log('\n[Teacher Forcing]')
     Logger.log(f'  use_teacher_forcing: {cfg.use_teacher_forcing}')
-    if cfg.use_teacher_forcing:
-        Logger.log(f'  tf_init_segment_len: {cfg.tf_init_segment_len}')
-        Logger.log(f'  tf_max_annealing_epoch: {cfg.tf_max_annealing_epoch}')
 
     # Optimizer
     Logger.log('\n[Optimizer]')
-    Logger.log(f'  lr: {cfg.lr}')
+    actual_lr = optimizer.param_groups[0]['lr']
+    Logger.log(f'  lr (actual): {actual_lr}')
     Logger.log(f'  weight_decay: {cfg.weight_decay}')
+    if cfg.use_lr_anneal:
+        Logger.log(f'  cosine annealing: {cfg.lr_max} → {cfg.lr_min} over {cfg.lr_anneal_epochs} epochs')
 
     Logger.log('=' * 80)
     Logger.log('')
@@ -658,8 +667,26 @@ def main():
     step_counter = 0
     min_eval_loss = ckpt_eval_loss
 
+    # TensorBoard
+    tb_log_dir = os.path.join(cfg.out, 'tb_logs')
+    tb_writer = SummaryWriter(log_dir=tb_log_dir)
+    Logger.log(f'TensorBoard logs: {tb_log_dir}')
+
+    # CSV logging
+    csv_dir = os.path.join(cfg.out, 'csv_logs')
+    mkdir(csv_dir)
+    csv_train_path = os.path.join(csv_dir, 'train_losses.csv')
+    csv_val_path = os.path.join(csv_dir, 'val_losses.csv')
+    csv_train_file = open(csv_train_path, 'w', newline='')
+    csv_val_file = open(csv_val_path, 'w', newline='')
+    csv_train_writer = None  # initialized on first epoch (to get column names)
+    csv_val_writer = None
+    Logger.log(f'CSV logs: {csv_dir}')
+
     # Matplotlib for loss visualization
     fig, (ax1, ax2) = plt.subplots(1, 2)
+
+    global_step = 0  # batch-level step counter for TensorBoard
 
     for epoch in range(ckpt_epoch, cfg.epochs):
         Logger.log('Starting epoch %d (Phase %d)...' % (epoch, cfg.phase))
@@ -678,14 +705,33 @@ def main():
         # train for one epoch
         start_t = time.time()
         model.train()
-        step_counter, _ = run_one_epoch(train_loader, model, map_env, loss_fn, device, cfg.out,
+        step_counter, mean_train_loss, train_epoch_metrics, global_step = run_one_epoch(
+                                        train_loader, model, map_env, loss_fn, device, cfg.out,
                                         train=True,
                                         optimizer=optimizer,
                                         step_counter=step_counter,
                                         use_wandb=use_wandb,
                                         use_teacher_forcing=cfg.use_teacher_forcing,
-                                        current_epoch=epoch)
-        train_loss.append(_)
+                                        current_epoch=epoch,
+                                        tb_writer=tb_writer,
+                                        global_step=global_step)
+        train_loss.append(mean_train_loss)
+
+        # TensorBoard: log train metrics
+        if tb_writer is not None:
+            for k, v in train_epoch_metrics.items():
+                tb_writer.add_scalar(f'train/{k}', v, epoch)
+            if scheduler is not None:
+                tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
+
+        # CSV: log train metrics
+        if csv_train_writer is None:
+            csv_train_writer = csv.DictWriter(csv_train_file, fieldnames=['epoch'] + sorted(train_epoch_metrics.keys()))
+            csv_train_writer.writeheader()
+        row = {'epoch': epoch}
+        row.update(train_epoch_metrics)
+        csv_train_writer.writerow(row)
+        csv_train_file.flush()
         ax1.clear()
         ax1.plot(train_loss)
         ax1.set_title(f"Train Loss (Phase {cfg.phase})")
@@ -706,12 +752,27 @@ def main():
             Logger.log('Validating...')
             with torch.no_grad():
                 model.eval()
-                step_counter, mean_eval_loss = run_one_epoch(val_loader, model, map_env, loss_fn, device, cfg.out,
+                step_counter, mean_eval_loss, val_epoch_metrics, _ = run_one_epoch(
+                                                            val_loader, model, map_env, loss_fn, device, cfg.out,
                                                             train=False,
                                                             step_counter=step_counter,
                                                             use_wandb=use_wandb,
                                                             use_teacher_forcing=False,
                                                             current_epoch=epoch)
+
+                # TensorBoard: log val metrics
+                if tb_writer is not None:
+                    for k, v in val_epoch_metrics.items():
+                        tb_writer.add_scalar(f'val/{k}', v, epoch)
+
+                # CSV: log val metrics
+                if csv_val_writer is None:
+                    csv_val_writer = csv.DictWriter(csv_val_file, fieldnames=['epoch'] + sorted(val_epoch_metrics.keys()))
+                    csv_val_writer.writeheader()
+                val_row = {'epoch': epoch}
+                val_row.update(val_epoch_metrics)
+                csv_val_writer.writerow(val_row)
+                csv_val_file.flush()
                 valid_loss.append(mean_eval_loss)
                 print(f'min_eval_loss = ', min_eval_loss)
                 print(f'mean_eval_loss = ', mean_eval_loss)
@@ -738,6 +799,13 @@ def main():
             save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss)
             if use_wandb:
                 wandb.save(save_file)
+
+    # Close loggers
+    if tb_writer is not None:
+        tb_writer.close()
+    csv_train_file.close()
+    csv_val_file.close()
+    Logger.log(f'Training complete. TensorBoard: tensorboard --logdir {tb_log_dir}')
 
     if use_wandb:
         # save full log after training

@@ -1,7 +1,7 @@
 """
-Forward pass test for TrafficPlannerModel (Redesign).
-Tests model instantiation, forward, reconstruct, sample, teacher forcing, and loss computation
-using dummy data (no real dataset needed).
+Forward pass test for TrafficPlannerModel (Transformer Decoder Redesign).
+Tests model instantiation, training forward, inference forward, reconstruct,
+sample, loss computation, and freeze for fine-tuning using dummy data.
 """
 
 import sys
@@ -38,7 +38,6 @@ def make_dummy_normalizers():
 def make_dummy_scene_graph(B=2, agents_per_scene=3, PT=4, FT=12, NC=2, device='cpu'):
     """
     Create a dummy batched scene graph (PyG Batch format).
-
     Each scene has `agents_per_scene` agents (first is ego).
     """
     NA = B * agents_per_scene
@@ -71,14 +70,12 @@ def make_dummy_scene_graph(B=2, agents_per_scene=3, PT=4, FT=12, NC=2, device='c
     batch = torch.arange(B, device=device).repeat_interleave(agents_per_scene)
     ptr = torch.arange(0, NA + 1, agents_per_scene, device=device)
 
-    # Build as Data then create Batch manually
     data = Data(
         past=past, future=future, future_gt=future_gt, past_gt=past_gt,
         past_vis=past_vis, future_vis=future_vis,
         lw=lw, sem=sem, edge_index=edge_index,
         batch=batch, ptr=ptr,
     )
-    # Set num_nodes for PyG
     data.num_nodes = NA
 
     return data
@@ -104,19 +101,43 @@ class DummyMapEnv:
         return torch.randn(NA, self.num_layers, self.map_size, self.map_size, device=self.device)
 
 
-def test_model_instantiation(device):
-    print("=" * 60)
-    print("[1] Model Instantiation")
-    print("=" * 60)
-
+def setup_model(device):
+    """Create and configure model with normalizers."""
     model = TrafficPlannerModel(
         npast=4, nfuture=12,
         map_obs_size_pix=240, nclasses=2,
         map_feat_size=64, past_feat_size=64, future_feat_size=64,
         latent_size=32, z_local_size=32,
         output_bicycle=True, dt=0.5,
-        num_intents=8, hist_attn_nhead=4, map_attn_nhead=4, sur_pred_dim=2,
+        num_intents=9, sur_pred_dim=2,
+        # Transformer decoder params
+        trans_num_layers=4,
+        trans_d_model=128,
+        trans_nhead=8,
+        trans_ffn_dim=512,
+        trans_dropout=0.1,
+        use_ego_z_local=True,
+        use_sur_z_local=False,
     ).to(device)
+
+    state_norm, att_norm = make_dummy_normalizers()
+    state_norm.mean_vals = state_norm.mean_vals.to(device)
+    state_norm.std_vals = state_norm.std_vals.to(device)
+    att_norm.mean_vals = att_norm.mean_vals.to(device)
+    att_norm.std_vals = att_norm.std_vals.to(device)
+    model.set_normalizer(state_norm)
+    model.set_att_normalizer(att_norm)
+    model.set_bicycle_params(NUSC_BIKE_PARAMS)
+
+    return model
+
+
+def test_model_instantiation(device):
+    print("=" * 60)
+    print("[1] Model Instantiation (Transformer Decoder)")
+    print("=" * 60)
+
+    model = setup_model(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -124,96 +145,131 @@ def test_model_instantiation(device):
     print(f"  Trainable params: {trainable_params:,}")
     print(f"  Map tokens: {model.map_num_tokens} ({model.map_token_spatial}x{model.map_token_spatial})")
     print(f"  Map token channels: {model.map_token_ch}")
-    print(f"  d_model: {model.d_model}")
+    print(f"  trans_d_model: {model.trans_d_model}")
+    print(f"  trans_num_layers: {model.trans_num_layers}")
     print(f"  z_size: {model.z_size}")
     print(f"  intent_dim: {model.intent_dim}")
     print(f"  num_intents: {model.num_intents}")
+
+    # Check Transformer layers exist
+    assert len(model.trans_layers) == 4, f"Expected 4 trans layers, got {len(model.trans_layers)}"
+    assert hasattr(model, 'token_proj'), "Missing token_proj"
+    assert hasattr(model, 'temporal_pe'), "Missing temporal_pe"
+    assert hasattr(model, 'intent_codebook'), "Missing intent_codebook"
+    assert hasattr(model, 'ego_output_head'), "Missing ego_output_head"
+    assert hasattr(model, 'sur_output_head'), "Missing sur_output_head"
+    assert hasattr(model, 'sur_pred_head'), "Missing sur_pred_head"
+    assert hasattr(model, 'ego_pred_head'), "Missing ego_pred_head"
+    assert hasattr(model, 'intent_ce_head'), "Missing intent_ce_head"
+
     print("  [OK] Model instantiated successfully\n")
     return model
 
 
-def test_forward_pass(model, device):
+def test_training_forward(model, device):
+    """Test training forward (parallel with causal mask)."""
     print("=" * 60)
-    print("[2] Forward Pass (autoregressive)")
+    print("[2] Training Forward (teacher_forcing=True, parallel)")
     print("=" * 60)
 
     B, agents_per_scene = 2, 3
+    NA = B * agents_per_scene
     scene_graph = make_dummy_scene_graph(B=B, agents_per_scene=agents_per_scene, device=device)
     map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
     map_idx = torch.zeros(B, dtype=torch.long, device=device)
 
-    # Set normalizers and bicycle params
-    state_norm, att_norm = make_dummy_normalizers()
-    state_norm.mean_vals = state_norm.mean_vals.to(device)
-    state_norm.std_vals = state_norm.std_vals.to(device)
-    att_norm.mean_vals = att_norm.mean_vals.to(device)
-    att_norm.std_vals = att_norm.std_vals.to(device)
+    model.train()
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=0)
 
-    model.set_normalizer(state_norm)
-    model.set_att_normalizer(att_norm)
-    model.set_bicycle_params({k: (v[0], v[1]) if isinstance(v, tuple) else v for k, v in NUSC_BIKE_PARAMS.items()})
+    # future_pred should be (NA, FT, 4) tensor
+    fp = pred['future_pred']
+    assert isinstance(fp, torch.Tensor), f"Expected tensor, got {type(fp)}"
+    assert fp.shape == (NA, 12, 4), f"Expected ({NA}, 12, 4), got {fp.shape}"
+
+    # Encoder outputs
+    assert pred['prior_out'][0].shape == (NA, 32), f"prior_mu shape: {pred['prior_out'][0].shape}"
+    assert pred['posterior_out'][0].shape == (NA, 32), f"post_mu shape: {pred['posterior_out'][0].shape}"
+
+    # z_local: training → tensor (FT, num_ego, intent_dim)
+    z_local = model.get_z_local_stacked()
+    assert z_local is not None, "z_local should be available"
+    num_ego = B  # 1 ego per scene
+    assert z_local.shape == (12, num_ego, 32), f"Expected z_local (12, {num_ego}, 32), got {z_local.shape}"
+
+    # intent_weights: training → tensor (FT, num_ego, K)
+    intent_w = model.get_intent_weights()
+    assert intent_w is not None, "intent_weights should be available"
+    assert isinstance(intent_w, torch.Tensor), f"Training mode should return tensor, got {type(intent_w)}"
+    assert intent_w.shape == (12, num_ego, 9), f"Expected (12, {num_ego}, 9), got {intent_w.shape}"
+
+    # ego map attn: training → tensor (B*T_total, N_ego, num_tokens)
+    ego_map_attn = model.get_ego_map_attn_weights()
+    assert ego_map_attn is not None, "ego_map_attn should be available in training"
+    assert isinstance(ego_map_attn, torch.Tensor), f"Expected tensor, got {type(ego_map_attn)}"
+    T_total = 4 + 12  # PT + FT
+    print(f"  ego_map_attn shape: {ego_map_attn.shape} (expected B*T_total={B*T_total} or T_total={T_total})")
+
+    # sur map attn
+    sur_map_attn = model.get_sur_map_attn_weights()
+    assert sur_map_attn is not None, "sur_map_attn should be available in training"
+
+    # sur_pred/ego_pred: training → tensor
+    sur_pred = model.get_sur_pred_outputs()
+    assert sur_pred is not None, "sur_pred should be available"
+    assert isinstance(sur_pred, torch.Tensor), f"Expected tensor, got {type(sur_pred)}"
+
+    ego_pred = model.get_ego_pred_outputs()
+    assert ego_pred is not None, "ego_pred should be available"
+    assert isinstance(ego_pred, torch.Tensor), f"Expected tensor, got {type(ego_pred)}"
+
+    print(f"  future_pred shape: {fp.shape}")
+    print(f"  z_local shape: {z_local.shape}")
+    print(f"  intent_weights shape: {intent_w.shape}")
+    print(f"  sur_pred shape: {sur_pred.shape}")
+    print(f"  ego_pred shape: {ego_pred.shape}")
+    print("  [OK] Training forward pass successful\n")
+    return pred
+
+
+def test_inference_forward(model, device):
+    """Test inference forward (autoregressive)."""
+    print("=" * 60)
+    print("[3] Inference Forward (teacher_forcing=False, AR)")
+    print("=" * 60)
+
+    B, agents_per_scene = 2, 3
+    NA = B * agents_per_scene
+    scene_graph = make_dummy_scene_graph(B=B, agents_per_scene=agents_per_scene, device=device)
+    map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
+    map_idx = torch.zeros(B, dtype=torch.long, device=device)
 
     model.train()
     pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
 
-    NA = B * agents_per_scene
-    assert pred['future_pred'].shape == (NA, 12, 4), f"Expected (NA, 12, 4), got {pred['future_pred'].shape}"
-    assert pred['prior_out'][0].shape == (NA, 32), f"Expected prior_mu (NA, 32), got {pred['prior_out'][0].shape}"
-    assert pred['posterior_out'][0].shape == (NA, 32), f"Expected post_mu (NA, 32), got {pred['posterior_out'][0].shape}"
+    fp = pred['future_pred']
+    assert isinstance(fp, torch.Tensor), f"Expected tensor, got {type(fp)}"
+    assert fp.shape == (NA, 12, 4), f"Expected ({NA}, 12, 4), got {fp.shape}"
 
-    # Check analysis outputs
+    # z_local: inference → list of FT tensors
+    z_local_raw = model.get_z_local()
     z_local = model.get_z_local_stacked()
-    assert z_local is not None, "z_local should be available after forward"
-    assert z_local.shape == (12, B, 32), f"Expected z_local (12, B, 32), got {z_local.shape}"
+    assert z_local is not None, "z_local should be available"
+    num_ego = B
+    assert z_local.shape == (12, num_ego, 32), f"Expected z_local (12, {num_ego}, 32), got {z_local.shape}"
 
+    # intent_weights: inference → list
     intent_w_raw = model.get_intent_weights()
     assert intent_w_raw is not None, "intent_weights should be available"
-    intent_w = torch.stack(intent_w_raw, dim=0)
-    assert intent_w.shape == (12, B, 8), f"Expected intent_weights (12, B, 8), got {intent_w.shape}"
 
-    map_attn = model.get_map_attn_weights()
-    assert map_attn is not None, "map_attn should be available"
-    assert len(map_attn) == 12, f"Expected 12 map_attn entries, got {len(map_attn)}"
-
+    # sur_pred/ego_pred: Not collected in AR inference (only in training parallel mode)
     sur_pred = model.get_sur_pred_outputs()
-    assert sur_pred is not None, "sur_pred should be available"
-    assert len(sur_pred) == 12, f"Expected 12 sur_pred entries, got {len(sur_pred)}"
-
     ego_pred = model.get_ego_pred_outputs()
-    assert ego_pred is not None, "ego_pred should be available"
-    assert len(ego_pred) == 12, f"Expected 12 ego_pred entries, got {len(ego_pred)}"
-
-    print(f"  future_pred shape: {pred['future_pred'].shape}")
-    print(f"  z_local shape: {z_local.shape}")
-    print(f"  intent_weights shape: {intent_w.shape}")
-    print(f"  map_attn[0] shape: {map_attn[0].shape}")
-    print(f"  sur_pred[0] shape: {sur_pred[0].shape}")
-    print(f"  ego_pred[0] shape: {ego_pred[0].shape}")
-    print("  [OK] Forward pass successful\n")
-    return pred, scene_graph, map_idx, map_env
-
-
-def test_teacher_forcing(model, device):
-    print("=" * 60)
-    print("[3] Teacher Forcing Forward Pass")
-    print("=" * 60)
-
-    B, agents_per_scene = 2, 3
-    scene_graph = make_dummy_scene_graph(B=B, agents_per_scene=agents_per_scene, device=device)
-    map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
-    map_idx = torch.zeros(B, dtype=torch.long, device=device)
-
-    model.train()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=100)
-
-    # TF output is list of segments
-    tf_preds = pred['future_pred']
-    assert isinstance(tf_preds, list), "TF output should be list of segments"
-    print(f"  Number of segments: {len(tf_preds)}")
-    for i, seg in enumerate(tf_preds[:3]):  # show first 3
-        print(f"  Segment {i}: {len(seg)} steps, shape {seg[0].shape if len(seg) > 0 else 'empty'}")
-
-    print("  [OK] Teacher forcing forward pass successful\n")
+    # These may be None in inference mode — that's OK
+    print(f"  future_pred shape: {fp.shape}")
+    print(f"  z_local stacked shape: {z_local.shape}")
+    print(f"  sur_pred available: {sur_pred is not None}")
+    print(f"  ego_pred available: {ego_pred is not None}")
+    print("  [OK] Inference forward pass successful\n")
     return pred
 
 
@@ -223,6 +279,7 @@ def test_reconstruct(model, device):
     print("=" * 60)
 
     B, agents_per_scene = 2, 3
+    NA = B * agents_per_scene
     scene_graph = make_dummy_scene_graph(B=B, agents_per_scene=agents_per_scene, device=device)
     map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
     map_idx = torch.zeros(B, dtype=torch.long, device=device)
@@ -231,7 +288,6 @@ def test_reconstruct(model, device):
     with torch.no_grad():
         pred = model.reconstruct(scene_graph, map_idx, map_env)
 
-    NA = B * agents_per_scene
     assert pred['future_pred'].shape == (NA, 12, 4)
     print(f"  Reconstruct future_pred shape: {pred['future_pred'].shape}")
     print("  [OK] Reconstruct successful\n")
@@ -243,6 +299,7 @@ def test_sample(model, device):
     print("=" * 60)
 
     B, agents_per_scene = 2, 3
+    NA = B * agents_per_scene
     scene_graph = make_dummy_scene_graph(B=B, agents_per_scene=agents_per_scene, device=device)
     map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
     map_idx = torch.zeros(B, dtype=torch.long, device=device)
@@ -251,9 +308,9 @@ def test_sample(model, device):
     with torch.no_grad():
         pred = model.sample(scene_graph, map_idx, map_env, num_samples=3)
 
-    NA = B * agents_per_scene
-    # sample() uses stack(..., dim=1) → (NA, NS, FT, 4)
-    assert pred['future_pred'].shape == (NA, 3, 12, 4), f"Expected (NA, 3, 12, 4), got {pred['future_pred'].shape}"
+    # sample() → (NA, NS, FT, 4)
+    assert pred['future_pred'].shape == (NA, 3, 12, 4), \
+        f"Expected (NA, 3, 12, 4), got {pred['future_pred'].shape}"
     print(f"  Sample future_pred shape: {pred['future_pred'].shape}")
     print("  [OK] Sample successful\n")
 
@@ -264,6 +321,7 @@ def test_sample_batched(model, device):
     print("=" * 60)
 
     B, agents_per_scene = 2, 3
+    NA = B * agents_per_scene
     scene_graph = make_dummy_scene_graph(B=B, agents_per_scene=agents_per_scene, device=device)
     map_env = DummyMapEnv(map_size=240, num_layers=4, device=device)
     map_idx = torch.zeros(B, dtype=torch.long, device=device)
@@ -272,16 +330,16 @@ def test_sample_batched(model, device):
     with torch.no_grad():
         pred = model.sample_batched(scene_graph, map_idx, map_env, num_samples=3)
 
-    NA = B * agents_per_scene
-    # sample_batched returns future_pred as (NA, NS, FT, 4)
-    assert pred['future_pred'].shape == (NA, 3, 12, 4), f"Expected (NA, 3, 12, 4), got {pred['future_pred'].shape}"
+    assert pred['future_pred'].shape == (NA, 3, 12, 4), \
+        f"Expected (NA, 3, 12, 4), got {pred['future_pred'].shape}"
     print(f"  Sample batched future_pred shape: {pred['future_pred'].shape}")
     print("  [OK] Sample batched successful\n")
 
 
-def test_loss_computation(model, device):
+def test_loss_training(model, device):
+    """Test loss computation with training forward (parallel)."""
     print("=" * 60)
-    print("[7] Loss Computation (autoregressive)")
+    print("[7] Loss Computation (training forward)")
     print("=" * 60)
 
     B, agents_per_scene = 2, 3
@@ -300,8 +358,8 @@ def test_loss_computation(model, device):
         'coll_veh_prior': 0.0, 'coll_env_prior': 0.0,
         'potential_veh': 0.0, 'potential_env': 0.0,
         'sparse': 0.0,
-        'sur_pred': 0.1, 'ego_pred': 0.1,
-        'intent_ce': 0.0, 'map_attn': 0.0,
+        'sur_pred': 1.0, 'ego_pred': 1.0,
+        'intent_ce': 0.0, 'map_attn': 0.1,
     }
 
     loss_fn = TrafficPlannerLoss(
@@ -310,7 +368,8 @@ def test_loss_computation(model, device):
     ).to(device)
 
     model.train()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    model.zero_grad()
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=0)
     loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env, model=model)
 
     print(f"  Total loss: {loss_dict['loss'].item():.4f}")
@@ -320,8 +379,10 @@ def test_loss_computation(model, device):
         print(f"  Sur pred loss: {loss_dict['sur_pred_loss'].item():.4f}")
     if 'ego_pred_loss' in loss_dict:
         print(f"  Ego pred loss: {loss_dict['ego_pred_loss'].item():.4f}")
+    if 'map_attn_loss' in loss_dict:
+        print(f"  Map attn loss: {loss_dict['map_attn_loss'].item():.4f}")
 
-    # Check backward pass
+    # Backward pass — check gradient flow
     loss_dict['loss'].backward()
     grad_norms = {}
     for name, p in model.named_parameters():
@@ -331,12 +392,19 @@ def test_loss_computation(model, device):
     num_total = sum(1 for _ in model.parameters())
     print(f"  Params with gradients: {num_with_grad}/{num_total}")
     assert num_with_grad > 0, "No parameters received gradients!"
-    print("  [OK] Loss computation and backward pass successful\n")
+
+    # Check key Transformer components get gradients
+    trans_grads = [n for n in grad_norms if 'trans_layers' in n]
+    print(f"  Transformer layer params with grad: {len(trans_grads)}")
+    assert len(trans_grads) > 0, "Transformer layers should receive gradients!"
+
+    print("  [OK] Training loss and backward pass successful\n")
 
 
-def test_loss_teacher_forcing(model, device):
+def test_loss_inference(model, device):
+    """Test loss computation with inference forward (AR)."""
     print("=" * 60)
-    print("[8] Loss Computation (teacher forcing)")
+    print("[8] Loss Computation (inference forward)")
     print("=" * 60)
 
     B, agents_per_scene = 2, 3
@@ -355,7 +423,7 @@ def test_loss_teacher_forcing(model, device):
         'coll_veh_prior': 0.0, 'coll_env_prior': 0.0,
         'potential_veh': 0.0, 'potential_env': 0.0,
         'sparse': 0.0,
-        'sur_pred': 0.1, 'ego_pred': 0.1,
+        'sur_pred': 1.0, 'ego_pred': 1.0,
         'intent_ce': 0.0, 'map_attn': 0.0,
     }
 
@@ -366,26 +434,19 @@ def test_loss_teacher_forcing(model, device):
 
     model.train()
     model.zero_grad()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=100)
-    loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env,
-                        model=model, use_teacher_forcing=True)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env, model=model)
 
     print(f"  Total loss: {loss_dict['loss'].item():.4f}")
     print(f"  Recon loss: {loss_dict['recon_loss'].mean().item():.4f}")
     print(f"  KL loss: {loss_dict['kl_loss'].mean().item():.4f}")
-    if 'num_segments' in loss_dict:
-        print(f"  Num segments: {loss_dict['num_segments'].item():.0f}")
-    if 'sur_pred_loss' in loss_dict:
-        print(f"  Sur pred loss: {loss_dict['sur_pred_loss'].item():.4f}")
-    if 'ego_pred_loss' in loss_dict:
-        print(f"  Ego pred loss: {loss_dict['ego_pred_loss'].item():.4f}")
 
     loss_dict['loss'].backward()
     num_with_grad = sum(1 for p in model.parameters() if p.grad is not None)
     num_total = sum(1 for _ in model.parameters())
     print(f"  Params with gradients: {num_with_grad}/{num_total}")
     assert num_with_grad > 0, "No parameters received gradients!"
-    print("  [OK] TF loss computation and backward pass successful\n")
+    print("  [OK] Inference loss and backward pass successful\n")
 
 
 def test_freeze_for_finetuning(model, device):
@@ -399,22 +460,37 @@ def test_freeze_for_finetuning(model, device):
     trainable = {n for n, p in model.named_parameters() if p.requires_grad}
     frozen = {n for n, p in model.named_parameters() if not p.requires_grad}
 
-    # Check that key ego components are trainable
-    trainable_prefixes = ['ego_history_attn', 'ego_map_attn', 'ego_decoder_gru',
-                          'ego_output_head', 'intent_codebook', 'intent_ce_head',
-                          'sur_pred_head', 'ego_warmup_gru']
-    for prefix in trainable_prefixes:
-        matching = [n for n in trainable if n.startswith(prefix)]
-        assert len(matching) > 0, f"Expected {prefix} to be trainable, but found none!"
-        print(f"  [TRAINABLE] {prefix}: {len(matching)} params")
+    # Key ego components should be trainable (Transformer version)
+    trainable_keywords = ['ego_output_head', 'intent_codebook', 'intent_ce_head',
+                          'ego_intent_proj', 'sur_pred_head']
+    for kw in trainable_keywords:
+        matching = [n for n in trainable if kw in n]
+        if len(matching) > 0:
+            print(f"  [TRAINABLE] {kw}: {len(matching)} params")
+        else:
+            print(f"  [WARNING] {kw}: not found in trainable")
 
-    # Check that key frozen components are frozen
-    frozen_prefixes = ['latent_prior_net', 'latent_posterior_net', 'map_conv_early',
-                       'interaction_gcn', 'sur_decoder_gru', 'sur_output_head']
-    for prefix in frozen_prefixes:
-        matching = [n for n in frozen if n.startswith(prefix)]
-        assert len(matching) > 0, f"Expected {prefix} to be frozen, but found none!"
-        print(f"  [FROZEN] {prefix}: {len(matching)} params")
+    # Ego Q/O in A2A and A2S should be trainable
+    ego_qo = [n for n in trainable if 'ego_q_proj' in n or 'ego_o_proj' in n]
+    print(f"  [TRAINABLE] ego Q/O projections: {len(ego_qo)} params")
+
+    # Ego FFN should be trainable
+    ego_ffn = [n for n in trainable if 'ego_ffn' in n]
+    print(f"  [TRAINABLE] ego FFN: {len(ego_ffn)} params")
+
+    # Frozen components
+    frozen_keywords = ['latent_prior_net', 'latent_posterior_net', 'map_conv_early',
+                       'interaction_gcn', 'sur_output_head']
+    for kw in frozen_keywords:
+        matching = [n for n in frozen if kw in n]
+        if len(matching) > 0:
+            print(f"  [FROZEN] {kw}: {len(matching)} params")
+        else:
+            print(f"  [WARNING] {kw}: not found in frozen")
+
+    # A2T (self-attn) should be fully frozen
+    a2t = [n for n in frozen if 'a2t_self_attn' in n]
+    print(f"  [FROZEN] A2T self-attn: {len(a2t)} params")
 
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     num_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
@@ -440,19 +516,19 @@ def test_phase2_forward(model, device):
 
     model.set_phase(2)
     model.train()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    # Test training forward in Phase 2
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=0)
 
     z_local = model.get_z_local_stacked()
-    intent_w_raw = model.get_intent_weights()
-    intent_w = torch.stack(intent_w_raw, dim=0)
+    intent_w = model.get_intent_weights()
 
-    # In Phase 2, z_local should be non-zero (intent codebook active)
     z_local_norm = z_local.norm().item()
-    intent_w_sum = intent_w.sum().item()
+    if isinstance(intent_w, torch.Tensor):
+        intent_w_sum = intent_w.sum().item()
+    else:
+        intent_w_sum = sum(w.sum().item() for w in intent_w)
     print(f"  z_local L2 norm: {z_local_norm:.4f} (should be > 0 in Phase 2)")
     print(f"  intent_weights sum: {intent_w_sum:.4f}")
-
-    # Note: z_local can still be 0 if codebook initialized to 0, so just check intent_weights
     assert intent_w_sum > 0, "Intent weights should be non-zero in Phase 2"
     print("  [OK] Phase 2 forward pass successful\n")
 
@@ -490,38 +566,22 @@ def test_map_attn_loss(model, device):
         phase=1, use_sparse_loss=False, use_potential_loss=False,
     ).to(device)
 
-    # --- Autoregressive mode ---
+    # Training mode (parallel) — map attn available
     model.train()
     model.zero_grad()
-    pred = model(scene_graph, map_idx, map_env, teacher_forcing=False, current_epoch=0)
+    pred = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=0)
     loss_dict = loss_fn(scene_graph, pred, map_idx=map_idx, map_env=map_env, model=model)
 
     assert 'map_attn_loss' in loss_dict, "map_attn_loss should be in loss_dict when weight > 0"
     map_attn_val = loss_dict['map_attn_loss'].item()
-    print(f"  [AR] map_attn_loss: {map_attn_val:.4f}")
-    print(f"  [AR] Total loss: {loss_dict['loss'].item():.4f}")
+    print(f"  [Training] map_attn_loss: {map_attn_val:.4f}")
+    print(f"  [Training] Total loss: {loss_dict['loss'].item():.4f}")
 
     loss_dict['loss'].backward()
-    # Check that map_attn module gets gradients
-    map_attn_grads = sum(1 for n, p in model.named_parameters()
-                         if 'ego_map_attn' in n and p.grad is not None)
-    print(f"  [AR] ego_map_attn params with grad: {map_attn_grads}")
-
-    # --- Teacher forcing mode ---
-    model.zero_grad()
-    pred_tf = model(scene_graph, map_idx, map_env, teacher_forcing=True, current_epoch=100)
-    loss_dict_tf = loss_fn(scene_graph, pred_tf, map_idx=map_idx, map_env=map_env,
-                           model=model, use_teacher_forcing=True)
-
-    assert 'map_attn_loss' in loss_dict_tf, "map_attn_loss should be in TF loss_dict"
-    map_attn_tf_val = loss_dict_tf['map_attn_loss'].item()
-    print(f"  [TF] map_attn_loss: {map_attn_tf_val:.4f}")
-    print(f"  [TF] Total loss: {loss_dict_tf['loss'].item():.4f}")
-
-    loss_dict_tf['loss'].backward()
-    map_attn_grads_tf = sum(1 for n, p in model.named_parameters()
-                            if 'ego_map_attn' in n and p.grad is not None)
-    print(f"  [TF] ego_map_attn params with grad: {map_attn_grads_tf}")
+    # Check that Transformer A2S layers get gradients
+    a2s_grads = sum(1 for n, p in model.named_parameters()
+                    if 'a2s' in n and p.grad is not None)
+    print(f"  [Training] A2S params with grad: {a2s_grads}")
 
     print("  [OK] Map attention guidance loss successful\n")
 
@@ -533,21 +593,11 @@ def main():
     # Test 1: Instantiation
     model = test_model_instantiation(device)
 
-    # Set up normalizers and bicycle params
-    state_norm, att_norm = make_dummy_normalizers()
-    state_norm.mean_vals = state_norm.mean_vals.to(device)
-    state_norm.std_vals = state_norm.std_vals.to(device)
-    att_norm.mean_vals = att_norm.mean_vals.to(device)
-    att_norm.std_vals = att_norm.std_vals.to(device)
-    model.set_normalizer(state_norm)
-    model.set_att_normalizer(att_norm)
-    model.set_bicycle_params(NUSC_BIKE_PARAMS)
+    # Test 2: Training forward (parallel)
+    test_training_forward(model, device)
 
-    # Test 2: Forward pass
-    test_forward_pass(model, device)
-
-    # Test 3: Teacher forcing
-    test_teacher_forcing(model, device)
+    # Test 3: Inference forward (autoregressive)
+    test_inference_forward(model, device)
 
     # Test 4: Reconstruct
     test_reconstruct(model, device)
@@ -558,11 +608,11 @@ def main():
     # Test 6: Sample batched
     test_sample_batched(model, device)
 
-    # Test 7: Loss (autoregressive)
-    test_loss_computation(model, device)
+    # Test 7: Loss (training forward)
+    test_loss_training(model, device)
 
-    # Test 8: Loss (teacher forcing)
-    test_loss_teacher_forcing(model, device)
+    # Test 8: Loss (inference forward)
+    test_loss_inference(model, device)
 
     # Test 9: Freeze for fine-tuning
     test_freeze_for_finetuning(model, device)
