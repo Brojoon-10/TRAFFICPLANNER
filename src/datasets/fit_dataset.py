@@ -238,18 +238,37 @@ class FITDataset(Dataset):
         
         scene_full_list = sorted(glob.glob(os.path.join(scenario_path, 'driving_data_scenario_*.xlsx')))
         n = len(scene_full_list)
-        half = n // 2
-        rest = n - half
-        val_num = rest // 3
-        test_num = rest - val_num
+
+        # # --- Old split (50% / 16.7% / 33.3%) ---
+        # half = n // 2
+        # rest = n - half
+        # val_num = rest // 3
+        # test_num = rest - val_num
+        #
+        # if self.split == "train":
+        #     scene_separated_list = scene_full_list[:half]
+        # elif self.split == "val":
+        #     scene_separated_list = scene_full_list[half:half+val_num]
+        # elif self.split == "test":
+        #     scene_separated_list = scene_full_list[half+val_num:]
+        # elif self.split == "adv":
+        #     scene_separated_list = scene_full_list
+        # else:
+        #     raise ValueError("split must be 'train', 'val', or 'test', or 'adv'")
+        # --- End old split ---
+
+        # --- New split (85% train / 10% val / 5% test) ---
+        train_num = int(n * 0.85)
+        val_num = int(n * 0.10)
+        # test_num = remainder
 
         if self.split == "train":
-            scene_separated_list = scene_full_list[:half]
+            scene_separated_list = scene_full_list[:train_num]
         elif self.split == "val":
-            scene_separated_list = scene_full_list[half:half+val_num]
+            scene_separated_list = scene_full_list[train_num:train_num+val_num]
         elif self.split == "test":
-            scene_separated_list = scene_full_list[half+val_num:]
-        elif self.split == "adv" :
+            scene_separated_list = scene_full_list[train_num+val_num:]
+        elif self.split == "adv":
             scene_separated_list = scene_full_list
         else:
             raise ValueError("split must be 'train', 'val', or 'test', or 'adv'")

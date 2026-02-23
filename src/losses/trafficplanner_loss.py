@@ -663,18 +663,21 @@ class TrafficPlannerLoss(nn.Module):
         total_loss = torch.tensor(0.0, device=device)
         count = 0
 
-        # ego_attn_raw is (B*T_total, N_ego, num_tokens) tensor from training
-        # or could be None/list from inference
+        # ego_attn_raw:
+        #   TF: (B*T_total, N_ego, num_tokens) — need shifted slicing [PT-1:-1]
+        #   AR: (FT, N_ego, num_tokens) — already last-token-only, no slicing needed
         if isinstance(ego_attn_raw, torch.Tensor):
-            # Training mode: (B*T_total, N_ego, num_tokens)
-            # T_total = PT + FT, B=1 for our case
             PT = model.PT
             T_total = PT + FT
             num_ego = int(ego_mask.sum())
 
-            # Reshape: (T_total, N_ego, num_tokens) — extract future steps
-            ego_attn_all = ego_attn_raw.view(T_total, num_ego, num_tokens)
-            ego_attn_future = ego_attn_all[PT:]  # (FT, N_ego, num_tokens)
+            if ego_attn_raw.size(0) == T_total * num_ego or ego_attn_raw.size(0) == T_total:
+                # TF mode: (B*T_total, N_ego, num_tokens) — shifted slicing
+                ego_attn_all = ego_attn_raw.view(T_total, num_ego, num_tokens)
+                ego_attn_future = ego_attn_all[PT-1:-1]  # (FT, N_ego, num_tokens)
+            else:
+                # AR mode: (FT, N_ego, num_tokens) — already future-only
+                ego_attn_future = ego_attn_raw  # (FT, N_ego, num_tokens)
 
             for t in range(FT):
                 remaining = min(map_gt_steps, FT - t - 1)
@@ -700,8 +703,13 @@ class TrafficPlannerLoss(nn.Module):
             # Sur attn guidance (Phase 1 only)
             if self.phase == 1 and sur_attn_raw is not None and isinstance(sur_attn_raw, torch.Tensor):
                 num_sur = int((~ego_mask).sum())
-                sur_attn_all = sur_attn_raw.view(T_total, num_sur, num_tokens)
-                sur_attn_future = sur_attn_all[PT:]  # (FT, N_sur, num_tokens)
+                if sur_attn_raw.size(0) == T_total * num_sur or sur_attn_raw.size(0) == T_total:
+                    # TF mode
+                    sur_attn_all = sur_attn_raw.view(T_total, num_sur, num_tokens)
+                    sur_attn_future = sur_attn_all[PT-1:-1]  # (FT, N_sur, num_tokens)
+                else:
+                    # AR mode
+                    sur_attn_future = sur_attn_raw  # (FT, N_sur, num_tokens)
 
                 for t in range(FT):
                     remaining = min(map_gt_steps, FT - t - 1)

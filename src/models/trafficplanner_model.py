@@ -1021,10 +1021,11 @@ class TrafficPlannerModel(nn.Module):
             # After Layer 0: extract auxiliary outputs & apply intent codebook
             if is_before_intent:
                 # Pred loss: from A2A output of Layer 0
+                # Shifted: PE N output predicts step N+1 (matches AR)
                 if 'a2a_output' in extras:
                     a2a_out = extras['a2a_output']  # (1, T_total, NA, D)
-                    # Extract future steps only for pred heads
-                    a2a_future = a2a_out[:, PT:, :, :]  # (1, FT, NA, D)
+                    # Extract shifted tokens: PE 3~14 output → future step 0~11
+                    a2a_future = a2a_out[:, PT-1:-1, :, :]  # (1, FT, NA, D)
 
                     # ego tokens → predict sur delta
                     ego_a2a = a2a_future[:, :, ego_mask, :]  # (1, FT, num_ego, D)
@@ -1043,8 +1044,8 @@ class TrafficPlannerModel(nn.Module):
                     self._sur_map_attn_weights_outputs = extras['sur_map_attn_weights']
 
                 # Intent Codebook (ego, between Layer 0 and Layer 1)
-                # Use future ego tokens as input to intent predictor
-                ego_tokens_l0 = x[:, PT:, ego_mask, :]  # (1, FT, num_ego, D)
+                # Shifted: use PE 3~14 tokens for future step 0~11 intent
+                ego_tokens_l0 = x[:, PT-1:-1, ego_mask, :]  # (1, FT, num_ego, D)
                 ego_tokens_flat = ego_tokens_l0.reshape(-1, self.trans_d_model)  # (FT*num_ego, D)
 
                 z_local, intent_weights = self.intent_codebook(
@@ -1064,13 +1065,13 @@ class TrafficPlannerModel(nn.Module):
                 ego_projected = self.ego_intent_proj(ego_with_z_local)  # (FT*num_ego, D)
                 ego_projected = ego_projected.view(1, FT, num_ego, self.trans_d_model)
 
-                # Replace ego future tokens with projected version
+                # Replace shifted ego tokens with projected version
                 x = x.clone()
-                x[:, PT:, ego_mask, :] = ego_projected
+                x[:, PT-1:-1, ego_mask, :] = ego_projected
 
                 # Sur intent codebook (optional)
                 if self.use_sur_z_local:
-                    sur_tokens_l0 = x[:, PT:, ~ego_mask, :]
+                    sur_tokens_l0 = x[:, PT-1:-1, ~ego_mask, :]
                     sur_tokens_flat = sur_tokens_l0.reshape(-1, self.trans_d_model)
                     sur_z_local, sur_intent_w = self.sur_intent_codebook(
                         sur_tokens_flat, temperature=self.gumbel_temperature)
@@ -1078,12 +1079,13 @@ class TrafficPlannerModel(nn.Module):
                     sur_projected = self.sur_intent_proj(sur_with_z_local)
                     num_sur = NA - num_ego
                     sur_projected = sur_projected.view(1, FT, num_sur, self.trans_d_model)
-                    x[:, PT:, ~ego_mask, :] = sur_projected
+                    x[:, PT-1:-1, ~ego_mask, :] = sur_projected
 
         # ================================================================
-        # 6. Output heads: future tokens → (acc, yaw_rate)
+        # 6. Output heads: shifted tokens → (acc, yaw_rate)
+        #    PE 3~14 output predicts future step 0~11 (matches AR decoder)
         # ================================================================
-        future_tokens = x[:, PT:, :, :]  # (1, FT, NA, D)
+        future_tokens = x[:, PT-1:-1, :, :]  # (1, FT, NA, D)
 
         ego_future = future_tokens[:, :, ego_mask, :]  # (1, FT, num_ego, D)
         sur_future = future_tokens[:, :, ~ego_mask, :]  # (1, FT, num_sur, D)
@@ -1214,12 +1216,18 @@ class TrafficPlannerModel(nn.Module):
                     x, ego_mask if not mult_samp else self._expand_ego_mask(ego_mask, NS),
                     causal_mask, cur_map,
                     return_a2a_output=False,
-                    return_a2s_weights=False,
+                    return_a2s_weights=is_first_layer,
                 )
                 x = x_out
 
                 # Intent between Layer 0 and Layer 1
                 if is_first_layer:
+                    # Collect map attn weights — last token only (current prediction step)
+                    if 'ego_map_attn_weights' in extras and extras['ego_map_attn_weights'] is not None:
+                        self._ego_map_attn_weights_outputs.append(extras['ego_map_attn_weights'][-1:])
+                    if 'sur_map_attn_weights' in extras and extras['sur_map_attn_weights'] is not None:
+                        self._sur_map_attn_weights_outputs.append(extras['sur_map_attn_weights'][-1:])
+
                     cur_ego_mask = ego_mask if not mult_samp else self._expand_ego_mask(ego_mask, NS)
                     # Only apply intent to the last token (current prediction step)
                     last_ego_token = x[:, -1:, cur_ego_mask, :]  # (1, 1, num_ego_eff, D)
@@ -1319,7 +1327,7 @@ class TrafficPlannerModel(nn.Module):
                 # Build single token
                 new_gcn = gcn_merged.unsqueeze(0).unsqueeze(0)  # (1, 1, NA_eff, 64)
                 new_token = self._build_decoder_tokens_single(
-                    new_gcn, z_flat, scene_graph, t_pos=PT + t + 1,
+                    new_gcn, z_flat, scene_graph, t_pos=PT + t,
                     mult_samp=mult_samp, NS=NS)
                 # (1, 1, NA_eff, D)
                 all_tokens = torch.cat([all_tokens, new_token], dim=1)
@@ -1660,8 +1668,8 @@ class TrafficPlannerModel(nn.Module):
 
     def get_ego_map_attn_weights(self):
         """Get ego map attention weights.
-        Training: tensor (B*T, N_ego, num_tokens) from Layer 0
-        Inference: None (not collected in AR mode)
+        TF: tensor (B*T_total, N_ego, num_tokens) from Layer 0
+        AR: list of (1, N_ego, num_tokens) per step → cat to (FT, N_ego, num_tokens)
         """
         if not hasattr(self, '_ego_map_attn_weights_outputs'):
             return None
@@ -1670,12 +1678,18 @@ class TrafficPlannerModel(nn.Module):
         if isinstance(self._ego_map_attn_weights_outputs, torch.Tensor):
             if self._ego_map_attn_weights_outputs.numel() == 0:
                 return None
-        elif isinstance(self._ego_map_attn_weights_outputs, list) and len(self._ego_map_attn_weights_outputs) == 0:
-            return None
-        return self._ego_map_attn_weights_outputs
+            return self._ego_map_attn_weights_outputs
+        if isinstance(self._ego_map_attn_weights_outputs, list):
+            if len(self._ego_map_attn_weights_outputs) == 0:
+                return None
+            return torch.cat(self._ego_map_attn_weights_outputs, dim=0)  # (FT, N_ego, num_tokens)
+        return None
 
     def get_sur_map_attn_weights(self):
-        """Get sur map attention weights."""
+        """Get sur map attention weights.
+        TF: tensor (B*T_total, N_sur, num_tokens) from Layer 0
+        AR: list of (1, N_sur, num_tokens) per step → cat to (FT, N_sur, num_tokens)
+        """
         if not hasattr(self, '_sur_map_attn_weights_outputs'):
             return None
         if self._sur_map_attn_weights_outputs is None:
@@ -1683,9 +1697,12 @@ class TrafficPlannerModel(nn.Module):
         if isinstance(self._sur_map_attn_weights_outputs, torch.Tensor):
             if self._sur_map_attn_weights_outputs.numel() == 0:
                 return None
-        elif isinstance(self._sur_map_attn_weights_outputs, list) and len(self._sur_map_attn_weights_outputs) == 0:
-            return None
-        return self._sur_map_attn_weights_outputs
+            return self._sur_map_attn_weights_outputs
+        if isinstance(self._sur_map_attn_weights_outputs, list):
+            if len(self._sur_map_attn_weights_outputs) == 0:
+                return None
+            return torch.cat(self._sur_map_attn_weights_outputs, dim=0)  # (FT, N_sur, num_tokens)
+        return None
 
     def get_map_attn_weights(self):
         """Get ego map attention weights (detached, for analysis)."""
