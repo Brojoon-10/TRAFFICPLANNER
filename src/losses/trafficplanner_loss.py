@@ -393,6 +393,7 @@ class TrafficPlannerLoss(nn.Module):
             'map_gt_steps': 6,
             'map_gt_decay_lambda': 0.3,  # exponential decay: w_t = exp(-λt) / Σexp(-λt)
             'intent_sigma': 0.5,         # Gaussian sigma for intent soft label
+            'map_gauss_sigma_d': 0.8,    # lateral Gaussian sigma (grid cells, ~2.1m)
         }
         if aux_cfg is not None:
             default_aux_cfg.update(aux_cfg)
@@ -740,50 +741,132 @@ class TrafficPlannerLoss(nn.Module):
                          weights, normalizer, bounds, m2pix_l, m2pix_w,
                          pix2grid_l, pix2grid_w, grid_size, num_tokens, device):
         """
-        GT future 위치 → agent local frame → grid index → soft label 생성.
+        Trajectory-based soft label with uniform lateral width.
+
+        For each grid cell:
+        1. Find nearest point on GT future polyline, get perpendicular distance (d)
+           and arc length (s) at that point
+        2. Lateral: exp(-0.5 * d² / σ_d²) — uniform-width Gaussian band along trajectory
+        3. Longitudinal: additive decay bonus on centerline — nearer = brighter center
+        4. Normalize to probability distribution
 
         :param frame: (N, 4) current agent position (normalized, x,y,hx,hy)
         :param gt_future_agent: (N, FT, 6) GT future for these agents (normalized)
         :param t: current timestep
-        :param remaining: number of future steps to look ahead (1~4)
+        :param remaining: number of future steps to look ahead
         :return: (N, num_tokens) soft label or None
         """
         N = frame.size(0)
         if N == 0:
             return None
 
-        # Unnormalize frame and future positions
+        sigma_d = self.aux_cfg.get('map_gauss_sigma_d', 1.0)
+        decay_lambda = self.aux_cfg.get('map_gt_decay_lambda', 0.3)
+
         frame_unnorm = normalizer.unnormalize(frame)  # (N, 4)
 
-        soft_label = torch.zeros(N, num_tokens, device=device)
+        # Collect GT waypoints in grid coordinates: agent pos + K future points
+        agent_gi = (frame_unnorm[:, 0] - bounds[0]) * m2pix_l * pix2grid_l  # (N,)
+        agent_gj = (frame_unnorm[:, 1] - bounds[1]) * m2pix_w * pix2grid_w  # (N,)
 
+        waypoints_i = [agent_gi]
+        waypoints_j = [agent_gj]
+
+        num_pts = 0
         for k in range(remaining):
             future_t = t + 1 + k
             if future_t >= gt_future_agent.size(1):
                 break
+            gt_pos = gt_future_agent[:, future_t, :4]
+            gt_pos_unnorm = normalizer.unnormalize(gt_pos)
+            local_pos = transform2frame(frame_unnorm, gt_pos_unnorm.unsqueeze(1))
+            local_xy = local_pos[:, 0, :2]
+            gi_f = (local_xy[:, 0] - bounds[0]) * m2pix_l * pix2grid_l
+            gj_f = (local_xy[:, 1] - bounds[1]) * m2pix_w * pix2grid_w
+            waypoints_i.append(gi_f)
+            waypoints_j.append(gj_f)
+            num_pts += 1
 
-            gt_pos = gt_future_agent[:, future_t, :4]  # (N, 4) normalized
-            gt_pos_unnorm = normalizer.unnormalize(gt_pos)  # (N, 4)
+        if num_pts == 0:
+            return None
 
-            # Global → agent local frame: transform2frame expects (B, N, 4)
-            local_pos = transform2frame(
-                frame_unnorm, gt_pos_unnorm.unsqueeze(1))  # (N, 1, 4)
-            local_xy = local_pos[:, 0, :2]  # (N, 2) — local (l, w)
+        # Stack waypoints: (N, K+1) where K+1 = agent + future points
+        wp_i = torch.stack(waypoints_i, dim=1)  # (N, K+1)
+        wp_j = torch.stack(waypoints_j, dim=1)  # (N, K+1)
 
-            # Local meters → pixel coordinates
-            pix_l = (local_xy[:, 0] - bounds[0]) * m2pix_l  # offset + scale
-            pix_w = (local_xy[:, 1] - bounds[1]) * m2pix_w
+        # Compute cumulative arc length along polyline (grid cell units)
+        seg_di = wp_i[:, 1:] - wp_i[:, :-1]  # (N, K)
+        seg_dj = wp_j[:, 1:] - wp_j[:, :-1]  # (N, K)
+        seg_len = torch.sqrt(seg_di ** 2 + seg_dj ** 2 + 1e-8)  # (N, K)
+        cum_len = torch.cat([torch.zeros(N, 1, device=device),
+                             torch.cumsum(seg_len, dim=1)], dim=1)  # (N, K+1)
+        total_len = cum_len[:, -1:]  # (N, 1)
 
-            # Pixel → conv3 grid index
-            gi = (pix_l * pix2grid_l).long().clamp(0, grid_size - 1)
-            gj = (pix_w * pix2grid_w).long().clamp(0, grid_size - 1)
+        # Grid coordinates: (G*G, 2)
+        gi_range = torch.arange(grid_size, device=device, dtype=torch.float32)
+        gj_range = torch.arange(grid_size, device=device, dtype=torch.float32)
+        grid_i, grid_j = torch.meshgrid(gi_range, gj_range)
+        g_i = grid_i.reshape(-1)  # (G*G,)
+        g_j = grid_j.reshape(-1)  # (G*G,)
+        G2 = g_i.size(0)
 
-            # Flatten index
-            flat_idx = gi * grid_size + gj  # (N,)
+        # For each grid cell, find nearest point on polyline
+        soft_label = torch.zeros(N, G2, device=device)
+        inv_sigma_d_sq = 1.0 / (sigma_d ** 2)
 
-            # Add weighted contribution
-            w = weights[k]
-            soft_label.scatter_add_(1, flat_idx.unsqueeze(1), torch.full((N, 1), w, device=device))
+        for n in range(N):
+            wi = wp_i[n]
+            wj = wp_j[n]
+            cl = cum_len[n]
+            tl = total_len[n, 0]
+
+            K = num_pts
+            seg_start_i = wi[:K]
+            seg_start_j = wj[:K]
+            s_len = seg_len[n]
+
+            # Vector from segment start to each grid cell: (G2, K)
+            to_grid_i = g_i.unsqueeze(1) - seg_start_i.unsqueeze(0)
+            to_grid_j = g_j.unsqueeze(1) - seg_start_j.unsqueeze(0)
+
+            # Segment direction unit vectors: (K,)
+            dir_i = seg_di[n] / (s_len + 1e-8)
+            dir_j = seg_dj[n] / (s_len + 1e-8)
+
+            # Project grid-to-start onto segment direction: (G2, K)
+            proj = to_grid_i * dir_i.unsqueeze(0) + to_grid_j * dir_j.unsqueeze(0)
+            proj_clamped = proj.clamp(min=0).clamp(max=s_len.unsqueeze(0))
+
+            # Nearest point on segment
+            near_i = seg_start_i.unsqueeze(0) + proj_clamped * dir_i.unsqueeze(0)
+            near_j = seg_start_j.unsqueeze(0) + proj_clamped * dir_j.unsqueeze(0)
+
+            # Perpendicular distance: (G2, K)
+            d_sq = (g_i.unsqueeze(1) - near_i) ** 2 + (g_j.unsqueeze(1) - near_j) ** 2
+
+            # Arc length at projection point: (G2, K)
+            arc_at_proj = cl[:K].unsqueeze(0) + proj_clamped
+
+            # Find nearest segment for each grid cell
+            nearest_seg = d_sq.argmin(dim=1)
+            arange_idx = torch.arange(G2, device=device)
+            min_d_sq = d_sq[arange_idx, nearest_seg]
+            min_arc = arc_at_proj[arange_idx, nearest_seg]
+
+            # Mask out cells behind the agent
+            raw_proj_seg0 = proj[:, 0]
+            behind_mask = (nearest_seg == 0) & (raw_proj_seg0 < 0)
+
+            # Lateral Gaussian: exp(-0.5 * d² / σ_d²)
+            lateral = torch.exp(-0.5 * min_d_sq * inv_sigma_d_sq)
+
+            # Longitudinal decay: exp(-λ * s)
+            arc_normalized = min_arc / (tl + 1e-8) * num_pts
+            longitudinal = torch.exp(-decay_lambda * arc_normalized)
+
+            cell_value = longitudinal * lateral
+            cell_value[behind_mask] = 0.0
+            soft_label[n] = cell_value
 
         # Normalize to probability distribution
         label_sum = soft_label.sum(dim=1, keepdim=True)

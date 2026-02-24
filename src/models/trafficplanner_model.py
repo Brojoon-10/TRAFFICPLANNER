@@ -994,14 +994,11 @@ class TrafficPlannerModel(nn.Module):
         # ================================================================
         # 5. Run through Transformer layers
         # ================================================================
-        # Re-crop map tokens per timestep using GT positions
+        # Re-crop map tokens per timestep using GT positions (batched CNN)
         if self.map_recrop:
-            all_map_tokens = []
-            for t in range(T_total):
-                pos_t = all_states[:, t, :4]  # (NA, 4) normalized
-                mt = self._recompute_map_tokens(pos_t, map_idx, map_env, scene_graph)
-                all_map_tokens.append(mt)  # (NA, num_tokens, ch)
-            map_tokens = torch.stack(all_map_tokens, dim=0)  # (T_total, NA, num_tokens, ch)
+            map_tokens = self._recompute_map_tokens_batched(
+                all_states[:, :, :4], map_idx, map_env, scene_graph
+            )  # (T_total, NA, num_tokens, ch)
 
         x = tokens  # (1, T_total, NA, D)
 
@@ -1520,6 +1517,36 @@ class TrafficPlannerModel(nn.Module):
         map_obs = map_env.get_map_crop_pos(pos_unnorm, mapixes).to(torch.float)
         map_early = self.map_conv_early(map_obs)
         map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (N, num_tokens, ch)
+        return map_tokens
+
+    def _recompute_map_tokens_batched(self, all_pos_normalized, map_idx, map_env, scene_graph):
+        """
+        Batched map recrop: all timesteps at once → single CNN forward.
+
+        :param all_pos_normalized: (NA, T, 4) normalized positions for all timesteps
+        :param map_idx: (B,) map index per batch
+        :param map_env: map environment for cropping
+        :param scene_graph: scene graph (for .batch attribute)
+        :return: map_tokens (T, NA, num_tokens, ch)
+        """
+        NA, T = all_pos_normalized.shape[0], all_pos_normalized.shape[1]
+
+        # Flatten all positions: (NA*T, 4)
+        pos_flat = all_pos_normalized.reshape(NA * T, 4)
+        pos_flat_unnorm = self.normalizer.unnormalize(pos_flat)
+
+        # Expand mapixes: (NA,) → (NA*T,)
+        mapixes = map_idx[scene_graph.batch]  # (NA,)
+        mapixes = mapixes.unsqueeze(1).expand(-1, T).reshape(NA * T)  # (NA*T,)
+
+        # Single crop + CNN forward
+        map_obs = map_env.get_map_crop_pos(pos_flat_unnorm, mapixes).to(torch.float)  # (NA*T, C, H, W)
+        map_early = self.map_conv_early(map_obs)  # (NA*T, ch, H', W')
+        map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (NA*T, num_tokens, ch)
+
+        # Reshape: (NA, T, num_tokens, ch) → (T, NA, num_tokens, ch)
+        map_tokens = map_tokens.reshape(NA, T, -1, map_tokens.shape[-1])
+        map_tokens = map_tokens.permute(1, 0, 2, 3)  # (T, NA, num_tokens, ch)
         return map_tokens
 
     def rsample(self, mean, var):

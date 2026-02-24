@@ -184,6 +184,10 @@ def parse_cfg():
                         help='Number of future GT steps for map attention soft label')
     parser.add_argument('--map_gt_decay_lambda', type=float, default=0.3,
                         help='Exponential decay lambda for map attention GT weights: w_t = exp(-lambda*t) / sum')
+    parser.add_argument('--map_attn_anneal', type=str2bool, default=False,
+                        help='Enable epoch-based cosine annealing for map attn loss (full → 0)')
+    parser.add_argument('--map_attn_anneal_epochs', type=int, default=0,
+                        help='Epochs for map attn cosine decay (0 = use total epochs)')
 
     args = parser.parse_args()
     config_dict = vars(args)
@@ -741,6 +745,16 @@ def main():
             if epoch == cfg.kl_anneal_end:
                 Logger.log('KL ANNEALING FINISHED: resetting val loss tracking...')
                 min_eval_loss = float('inf')
+
+        # Map attention loss annealing: cosine decay from full weight to 0
+        if getattr(cfg, 'map_attn_anneal', False) and cfg.loss_map_attn > 0:
+            anneal_total = cfg.map_attn_anneal_epochs if cfg.map_attn_anneal_epochs > 0 else cfg.epochs
+            progress = min(epoch / max(anneal_total, 1), 1.0)
+            map_attn_w = cfg.loss_map_attn * 0.5 * (1 + math.cos(math.pi * progress))
+            loss_fn.loss_weights['map_attn'] = map_attn_w
+            Logger.log('Map attn weight %.6f...' % map_attn_w)
+            if tb_writer is not None:
+                tb_writer.add_scalar('train/map_attn_weight', map_attn_w, epoch)
 
         # train for one epoch
         start_t = time.time()

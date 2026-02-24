@@ -2,7 +2,7 @@
 
 > 작성일: 2026-02-23
 > 최종 수정: 2026-02-24
-> 상태: 구현 완료, TF/AR shifted prediction 버그 수정 완료
+> 상태: 구현 완료, TF/AR shifted prediction 버그 수정, map recrop 배치화, trajectory soft label, map attn annealing 완료
 > 기반: redesign_plan.md (v6) → GRU decoder를 Transformer decoder로 교체
 
 ---
@@ -323,14 +323,21 @@ AR mode:
   각 step의 마지막 토큰 weight만 append → list
   getter에서 torch.cat → (FT, N, 841)
 
-GT soft label 생성:
-  1. GT 미래 6스텝 (x, y) 좌표
-  2. agent local frame → pixel → 29×29 grid index
-  3. exponential decay 가중: [0.311, 0.230, 0.170, 0.126, 0.094, 0.069]
-  4. scatter → 841dim soft label
+GT soft label 생성 (trajectory-based continuous):
+  1. GT 미래 6스텝을 polyline으로 연결 (agent local frame → grid 좌표)
+  2. 각 grid cell에서 polyline까지 최단 수직 거리(d) + arc length(s) 계산
+  3. Lateral Gaussian: exp(-0.5 * d² / σ_d²), σ_d=0.8 grid cells (~2.1m)
+  4. Longitudinal decay: exp(-λ * s_normalized), λ=0.3
+  5. cell_value = longitudinal * lateral, 뒤쪽 cell은 0으로 마스킹
+  6. normalize → 841dim 확률 분포
 
 Loss: KL divergence(GT soft label, model attn weight)
 목적: "실제로 차가 갈 도로 위치"에 map attention 집중
+
+Map Attn Loss Annealing (cosine decay):
+  weight = initial * 0.5 * (1 + cos(π * epoch / anneal_epochs))
+  config: map_attn_anneal=True, map_attn_anneal_epochs=300
+  효과: 초기에 강하게 가이드 → 점진적으로 0 (모델이 자유롭게 attend)
 ```
 
 ### 5e. Intent Soft Label Loss 상세
@@ -428,8 +435,10 @@ A2S: agent token → map_tokens cross-attention
   residual: x = x + A2S(x)
 
   map_recrop (config: map_recrop: True):
-    Training: GT state 16개로 미리 step별 map_tokens crop → (T_total, NA, num_tokens, ch) 4D
-              _a2s_attention이 4D map_tokens 직접 사용 (broadcast 없음)
+    Training: GT state 16개 → _recompute_map_tokens_batched() 1회 호출
+              (NA, T_total, 4) flatten → (NA*T_total, 4) → CNN 1회 → reshape
+              → (T_total, NA, num_tokens, ch) 4D
+              ※ 기존 for loop 16회 CNN → 배치 CNN 1회로 최적화
     Inference(AR): 매 step prev_state 기준 _recompute_map_tokens() 호출
               mult_samp도 지원 (mapixes를 NA*NS로 expand)
     False: 초기 crop(last past 위치) 재사용 → 3D (NA, num_tokens, ch) broadcast
@@ -571,7 +580,7 @@ trans_dropout: 0.1           # dropout rate
 use_ego_z_local: True        # ego z_local on/off
 use_sur_z_local: True        # sur z_local on/off (config 기준)
 temporal_pe_type: learnable  # positional encoding type
-map_recrop: True             # step별 map re-crop (TF: 미리 16step crop, AR: 매 step crop)
+map_recrop: True             # step별 map re-crop (TF: batched CNN 1회, AR: 매 step crop)
 
 # Projection dimensions
 gcn_feat_dim: 64             # GCN output → Linear(64→128) → Transformer
@@ -593,6 +602,15 @@ lr_min: 5e-6                 # cosine decay 종료 시 최소 LR
 lr_warmup_steps: 2500        # linear warmup (~0 → lr_max), warmup_floor=5e-7
 # lr_total_steps: auto       # epochs * (data_size / batch_size)
 # KL annealing은 기존대로 epoch 기반 (kl_anneal_end: 50)
+
+# Map Attn Loss Annealing (epoch-based cosine decay)
+map_attn_anneal: True        # cosine decay 활성화
+map_attn_anneal_epochs: 300  # 300 epoch에 걸쳐 weight → 0
+
+# Map Attn Soft Label
+map_gauss_sigma_d: 0.8       # lateral Gaussian sigma (grid cells, ~2.1m)
+map_gt_decay_lambda: 0.3     # longitudinal exponential decay rate
+map_gt_steps: 6              # GT future lookahead steps
 ```
 
 ---
@@ -664,3 +682,541 @@ AFTER (fix):
 - **Level 3: GRU loop → Transformer decoder**
 
 나머지 (encoder, loss weights, Phase 전략, fine-tuning 전략)는 redesign_plan.md 그대로 유지.
+
+---
+
+## 13. 전체 모델 구조 (End-to-End ASCII)
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║                          INPUT DATA                                 ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  scene_graph:                                                        ║
+║    .past     (NA, 4, 6)    .future    (NA, 12, 6)                   ║
+║    .future_gt(NA, 12, 6)   .past_vis  (NA, 4)                      ║
+║    .lw       (NA, 2)       .sem       (NA, NC)                      ║
+║    .edge_index             .batch     (NA,)                          ║
+║  map_env, map_idx(B,)                                                ║
+║  state = (x, y, hx, hy, speed, hdot) normalized                     ║
+╚══════════════════════════════════════════════════════════════════════╝
+                              │
+                              ▼
+╔══════════════════════════════════════════════════════════════════════╗
+║              SCENE UNDERSTANDING (Encoder, 1회)                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  [Temporal GCN Encoder]                                              ║
+║  for t=0..3:                                                         ║
+║    MLP(state+lw+vis+sem → 128 → 64) → temporal_gcn_encoder(64→64)  ║
+║  → sequence_features (NA, 4, 64)                                     ║
+║  Prior:     GRU(2-layer) → past_context (NA, 64)                    ║
+║  Posterior: PE + TransformerEncoder(3-layer) → past_seq_out(NA,4,64) ║
+║                                                                      ║
+║  [Map CNN]                                                           ║
+║  crop(NA, 4ch, 240, 240)                                             ║
+║  → conv_early(1-3): 240→117→57→27, ch 16→32→64                    ║
+║    ├→ map_tokens (NA, 729, 64)  ← 27×27 spatial flatten            ║
+║  → conv_late(4-6): 27→13→6→3, ch 64→128→128                       ║
+║    └→ Linear(128*3*3→64) → map_feat (NA, 64)                       ║
+║                                                                      ║
+║  [CVAE z_global]                                                     ║
+║  Prior:     (past_ctx 64 + map 64 + sem NC) → MLP → μ,σ (32)      ║
+║  Posterior: (past_ctx 64 + fut_ctx 64 + map 64 + sem NC) → μ,σ(32) ║
+║  z_global = rsample(μ, σ²) → (NA, 32)                              ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+                              │
+        z_global(NA,32), map_tokens(NA,729,64), map_feat(NA,64)
+                              │
+                              ▼
+╔══════════════════════════════════════════════════════════════════════╗
+║              TOKEN CONSTRUCTION (Decoder 입력 준비)                   ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  [Interaction GCN] — temporal_gcn_encoder와 별도 weight             ║
+║  all_states = cat(past 4, gt_future 12) → (NA, 16, 6)              ║
+║  for t=0..15:                                                        ║
+║    cat(state_6d, lw, sem) → interaction_gcn → (NA, 64)             ║
+║  → gcn_feats (NA, 16, 64)                                           ║
+║                                                                      ║
+║  [Token Projection]                                                  ║
+║  gcn(64) ⊕ z_global(32) ⊕ lw(2) ⊕ sem(NC)                        ║
+║  → token_proj: Linear(64+32+2+NC → 128) + temporal_PE(16,128)      ║
+║  → tokens (1, 16, NA, 128)                                          ║
+║                                                                      ║
+║  [Map Recrop (optional, map_recrop=True)]                            ║
+║  (NA, 16, 4) flatten → (NA*16, 4) → unnorm → CNN 1회 batch         ║
+║  → (NA*16, 64, 27, 27) → flatten → reshape                         ║
+║  → map_tokens_4d (16, NA, 729, 64)                                  ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+                              │
+                              ▼
+╔══════════════════════════════════════════════════════════════════════╗
+║              TRANSFORMER DECODER (4 Layers + Intent)                 ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  causal_mask: (16×16) upper triangle = -inf                          ║
+║                                                                      ║
+║  ┌─────────────── Layer 0 ───────────────────────────────┐          ║
+║  │  A2T: (NA,T,D) self-attn + causal mask (공통 weight)  │          ║
+║  │  A2A: (T,NA,D) K/V 공유 + ego_Q/O, sur_Q/O 분리      │          ║
+║  │    ★ shifted [PT-1:-1] → sur_pred_head, ego_pred_head │          ║
+║  │  A2S: map K/V 공유 + ego_Q/O, sur_Q/O 분리            │          ║
+║  │    ★ ego_attn_weight, sur_attn_weight 추출             │          ║
+║  │  FFN: ego_FFN / sur_FFN 완전 분리 (128→512→128)       │          ║
+║  └────────────────────────────────────────────────────────┘          ║
+║                          │                                           ║
+║  ┌──────── Intent Codebook (Layer 0~1 사이) ──────────┐             ║
+║  │  ego: token(128) → MLP(128→64→9) → Gumbel → w(9)   │             ║
+║  │       w @ codebook(9,32) → z_local(32)              │             ║
+║  │       cat(128,32) → Linear(160→128) → replace token │             ║
+║  │  sur: 동일 구조 (use_sur_z_local=True 시)           │             ║
+║  └─────────────────────────────────────────────────────┘             ║
+║                          │                                           ║
+║  ┌──── Layer 1~3: A2T → A2A → A2S → FFN (×3 반복) ────┐           ║
+║  │  aux loss 추출 없음, intent 없음                      │           ║
+║  └───────────────────────────────────────────────────────┘           ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  OUTPUT HEAD (Shifted Prediction)                                    ║
+║  x[:, PT-1:-1] = PE 3~14 → 12 tokens (future step 0~11)           ║
+║  ego → ego_output_head(128→2), sur → sur_output_head(128→2)        ║
+║  → (acc, hdot) → Bicycle Model → (x,y,hx,hy) = traj_out(NA,12,4)  ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+## 14. 학습 구조 상세 (Training Pipeline)
+
+### 14a. 전체 학습 흐름
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║                    TRAINING PIPELINE (1 Epoch)                       ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  [Epoch 시작]                                                        ║
+║  │                                                                   ║
+║  ├─ KL annealing: β = min(epoch/50, 1.0) * loss_kl                 ║
+║  │  (Phase 1 only, epoch 0~50까지 0→0.004)                         ║
+║  │                                                                   ║
+║  ├─ Map Attn annealing: w = 0.1 * 0.5*(1+cos(π*epoch/300))        ║
+║  │  (epoch 0: 0.1, epoch 150: 0.05, epoch 300: 0)                  ║
+║  │                                                                   ║
+║  ├─ for batch in train_loader:                                       ║
+║  │  │                                                                ║
+║  │  │  ┌──── Forward ────────────────────────────────────────┐      ║
+║  │  │  │  model(scene_graph, map_idx, map_env,               │      ║
+║  │  │  │        teacher_forcing=True)                        │      ║
+║  │  │  │                                                      │      ║
+║  │  │  │  1. encode_map → map_feat, map_tokens               │      ║
+║  │  │  │  2. prior → prior_mu, prior_var, past_seq_out       │      ║
+║  │  │  │  3. encoder(posterior) → post_mu, post_var          │      ║
+║  │  │  │  4. z = rsample(post_mu, post_var)                  │      ║
+║  │  │  │  5. decoder(teacher_forcing=True):                  │      ║
+║  │  │  │     GT 16 step → GCN → tokens → Transformer        │      ║
+║  │  │  │     → traj_out (NA, 12, 4)                          │      ║
+║  │  │  │     + aux: z_local, intent_w, attn_w, pred          │      ║
+║  │  │  └──────────────────────────────────────────────────────┘      ║
+║  │  │                                                                ║
+║  │  │  ┌──── Loss Computation ───────────────────────────────┐      ║
+║  │  │  │  loss_fn(scene_graph, pred, model=model,            │      ║
+║  │  │  │          use_teacher_forcing=True)                   │      ║
+║  │  │  │                                                      │      ║
+║  │  │  │  (A) Recon MSE:  traj vs GT                    ×1.0 │      ║
+║  │  │  │  (B) KL:         posterior vs prior            ×β   │      ║
+║  │  │  │  (C) Intent CE:  z_local → pred(9) vs GT soft ×0.1 │      ║
+║  │  │  │  (D) Map Attn:   attn(729) vs GT soft label   ×w   │      ║
+║  │  │  │  (E) Sur Pred:   ego→sur delta MSE             ×1.0 │      ║
+║  │  │  │  (F) Ego Pred:   sur→ego delta MSE             ×1.0 │      ║
+║  │  │  │  (G) Env Potent: 비도로 진입 페널티 (ego)      ×0.1 │      ║
+║  │  │  │                                                      │      ║
+║  │  │  │  total = Σ (weight × loss)                           │      ║
+║  │  │  └──────────────────────────────────────────────────────┘      ║
+║  │  │                                                                ║
+║  │  │  ┌──── Backward + Optimize ────────────────────────────┐      ║
+║  │  │  │  optimizer.zero_grad()                               │      ║
+║  │  │  │  loss.backward()                                     │      ║
+║  │  │  │  clip_grad_norm_(params, max_norm=1.0)              │      ║
+║  │  │  │  optimizer.step()                                    │      ║
+║  │  │  │  scheduler.step()  ← step-based LR update          │      ║
+║  │  │  │  global_step += 1                                    │      ║
+║  │  │  └──────────────────────────────────────────────────────┘      ║
+║  │  │                                                                ║
+║  │  └─ (repeat for all batches)                                      ║
+║  │                                                                   ║
+║  ├─ Validation (teacher_forcing=False, AR mode):                     ║
+║  │  with torch.no_grad():                                            ║
+║  │    model.eval()                                                   ║
+║  │    run_one_epoch(train=False, use_teacher_forcing=False)          ║
+║  │    → val loss (AR mode: 에러 누적 있는 실제 성능)                ║
+║  │                                                                   ║
+║  ├─ Checkpoint:                                                      ║
+║  │  if val_loss < best: save best_eval_model_phase{N}.pth           ║
+║  │  매 save_every epoch: save latest + epoch별 checkpoint            ║
+║  │  저장: model_state, optimizer_state, epoch, val_loss, global_step ║
+║  │                                                                   ║
+║  └─ Logging:                                                         ║
+║     TensorBoard: train/val 각 loss component, lr, map_attn_weight   ║
+║     CSV: epoch별 전체 metrics                                        ║
+║     matplotlib: loss curve 이미지 저장                               ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+### 14b. LR 스케줄러 (Step-based Cosine with Warmup)
+
+```
+lr
+  ↑
+  │   lr_max=3e-4
+  │      ╱‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾╲
+  │     ╱                    ╲
+  │    ╱                      ╲
+  │   ╱                        ╲
+  │  ╱                          ╲
+  │ ╱ warmup                     ╲ cosine decay
+  │╱ (linear)                     ╲
+  ├────────────────────────────────╲──── lr_min=5e-6
+  │                                  ‾‾‾‾
+  └──────────────────────────────────────→ step
+  0   2500                        total_steps
+
+  warmup_floor = 5e-7 (near zero start)
+  warmup: 0 → lr_max linear over 2500 steps
+  decay:  lr_max → lr_min cosine over remaining steps
+  total_steps = epochs × (data_size / batch_size) ← auto estimated
+
+  ※ step-based (매 batch마다 update), epoch-based가 아님
+  ※ resume 시 global_step만큼 scheduler.step() 반복하여 복원
+```
+
+### 14c. Loss Weight Annealing 타임라인
+
+```
+epoch:  0         50        150       300       500
+        │         │         │         │         │
+KL β:   0 ──────→ 0.004    0.004     0.004     0.004
+        (linear)  (full)
+
+Map w:  0.1       0.1       0.05      0         0
+        (full)    │         │         (off)
+                  ╲─────cosine decay──╱
+
+LR:     ~0 → 3e-4 (warmup ~epoch 5)
+              3e-4 ─── cosine ──→ 5e-6
+
+※ KL annealing: Phase 1 only, epoch 기반, 0~50 linear
+※ Map annealing: epoch 기반, 0~300 cosine decay
+※ LR: step 기반, warmup 2500 steps + cosine
+```
+
+### 14d. 1 Batch 내부 상세 흐름
+
+```
+scene_graph (B scenes, NA agents total)
+            │
+            ▼
+┌──────────── model.forward() ─────────────────┐
+│                                                │
+│  1. encode_map(scene_graph)                    │
+│     .pos = past[:, -1, :4]                     │
+│     → map_feat(NA,64), map_tokens(NA,729,64)  │
+│                                                │
+│  2. prior(scene_graph, map_feat)               │
+│     past 4 step → temporal_gcn_encoder(loop 4)│
+│     → GRU → prior_mu, prior_var               │
+│     → past_seq_out (NA, 4, 64)                │
+│                                                │
+│  3. encoder(scene_graph, map_feat, past_ctx)   │
+│     future 12 step → temporal_gcn_encoder      │
+│     → TransformerEncoder                       │
+│     → post_mu, post_var                        │
+│                                                │
+│  4. z_global = rsample(post_mu, post_var)      │
+│                                                │
+│  5. transformer_decoder_training():            │
+│     ┌──────────────────────────────────────┐   │
+│     │ all_states = cat(past, gt_future)    │   │
+│     │ = (NA, 16, 6)                        │   │
+│     │                                      │   │
+│     │ interaction_gcn(16 steps, loop)      │   │
+│     │ → gcn_feats (NA, 16, 64)            │   │
+│     │                                      │   │
+│     │ build_decoder_tokens                 │   │
+│     │ = gcn ⊕ z ⊕ lw ⊕ sem → proj(128)  │   │
+│     │ + temporal_PE → tokens(1,16,NA,128)  │   │
+│     │                                      │   │
+│     │ [map_recrop=True]:                   │   │
+│     │ _recompute_map_tokens_batched()      │   │
+│     │ → (16, NA, 729, 64) = 4D map_tokens │   │
+│     │                                      │   │
+│     │ Layer 0:                             │   │
+│     │   A2T(causal) → A2A → A2S → FFN     │   │
+│     │   extras: a2a_output, attn_weights   │   │
+│     │                                      │   │
+│     │ Intent (shifted PE 3~14):            │   │
+│     │   ego: MLP→Gumbel→z_local→concat    │   │
+│     │   sur: 동일 (optional)               │   │
+│     │                                      │   │
+│     │ Layer 1~3: A2T→A2A→A2S→FFN ×3      │   │
+│     │                                      │   │
+│     │ output = x[:, PT-1:-1]  (PE 3~14)   │   │
+│     │ → output_head(128→2) = (acc, hdot)  │   │
+│     │                                      │   │
+│     │ Bicycle model (GT prev_state):       │   │
+│     │ for t=0..11:                         │   │
+│     │   acc * a_std + a_mean               │   │
+│     │   hdot * ddh_std + ddh_mean          │   │
+│     │   kinematics → (x,y,hx,hy) norm     │   │
+│     │ → traj_out (NA, 12, 4)              │   │
+│     └──────────────────────────────────────┘   │
+│                                                │
+│  net_out = {                                   │
+│    prior_out:     (prior_mu, prior_var)        │
+│    posterior_out: (post_mu, post_var)           │
+│    future_pred:   traj_out (NA, 12, 4)         │
+│    past_seq_out:  (NA, 4, 64)                  │
+│  }                                             │
+│  + model._z_local_outputs                      │
+│  + model._intent_weights_outputs               │
+│  + model._ego_map_attn_weights_outputs         │
+│  + model._sur_map_attn_weights_outputs         │
+│  + model._sur_pred_outputs                     │
+│  + model._ego_pred_outputs                     │
+└────────────────────────────────────────────────┘
+            │
+            ▼
+┌──────────── loss_fn.forward() ───────────────┐
+│                                                │
+│  [Recon MSE] (weight=1.0)                      │
+│  traj_out vs gt_future[:,:,:4]                 │
+│  ego: MSE + sur: MSE → 가중 합                │
+│                                                │
+│  [KL Divergence] (weight=β, Phase 1)           │
+│  KL(N(post_mu, post_var) || N(prior_mu,..))   │
+│  per-agent sum → batch mean                    │
+│                                                │
+│  [Auxiliary Losses]                             │
+│  _compute_auxiliary_losses(model, scene_graph): │
+│                                                │
+│  (C) Intent CE: (weight=0.1)                   │
+│    model._z_local_outputs (FT, N_ego, 32)     │
+│    → intent_ce_head(Linear 32→9) → logits     │
+│    GT: (acc,yaw) → 9-prototype Gaussian soft   │
+│    Loss: KL(log_softmax(logits), gt_soft)      │
+│                                                │
+│  (D) Map Attn: (weight=w, annealing)           │
+│    model._ego_map_attn_weights (T, N_ego, 729) │
+│    TF: [PT-1:-1] slicing → (FT, N_ego, 729)  │
+│    GT: trajectory-based continuous soft label   │
+│      polyline 6 steps → nearest segment         │
+│      lateral Gaussian(σ=0.8) × longit decay    │
+│    Loss: KL(model_attn, gt_soft)               │
+│                                                │
+│  (E) Sur Pred: (weight=1.0)                    │
+│    model._sur_pred_outputs (FT, N_ego, 2)     │
+│    GT: sur_mean_delta(dx, dy) per step         │
+│    Loss: MSE                                   │
+│                                                │
+│  (F) Ego Pred: (weight=1.0, Phase 1)           │
+│    model._ego_pred_outputs (FT, N_sur, 2)     │
+│    GT: ego_delta(dx, dy) per step              │
+│    Loss: MSE                                   │
+│                                                │
+│  (G) Env Potential: (weight=0.1, ego only)     │
+│    traj_out → unnorm → 도로 이미지 좌표        │
+│    non-drivable pixel 근접 → Gaussian penalty  │
+│                                                │
+│  total = Σ wi × Li                             │
+│                                                │
+└────────────────────────────────────────────────┘
+            │
+            ▼
+┌──────────── Backward + Optimize ─────────────┐
+│  optimizer.zero_grad()                         │
+│  total_loss.backward()                         │
+│  clip_grad_norm_(model.parameters(), 1.0)     │
+│  optimizer.step()                              │
+│  scheduler.step()  ← step-based LR            │
+└────────────────────────────────────────────────┘
+```
+
+### 14e. Validation vs Training 차이
+
+```
+╔═══════════════════════════╦══════════════════════════════════════╗
+║       항목                 ║       Training vs Validation          ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ teacher_forcing            ║ Train: True (TF)                     ║
+║                           ║ Val: False (AR)                       ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ decoder mode              ║ Train: 16 step 병렬 (causal mask)    ║
+║                           ║ Val: 순차 12 step AR                 ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ GCN input state           ║ Train: GT state (all 16 steps)       ║
+║                           ║ Val: predicted state (sequential)    ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ Bicycle prev_state        ║ Train: GT prev_state                 ║
+║                           ║ Val: predicted prev_state             ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ map_recrop                ║ Train: batched CNN 1회 (GT 16 pos)   ║
+║                           ║ Val: per-step crop (predicted pos)   ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ Aux loss 추출             ║ Train: shifted [PT-1:-1] 배치        ║
+║                           ║ Val: last token per step → concat    ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ Intent Gumbel             ║ Train: soft (differentiable)         ║
+║                           ║ Val: one-hot (argmax)                ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ gradient                  ║ Train: backward + clip + step        ║
+║                           ║ Val: torch.no_grad()                 ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ z_global                  ║ Train: posterior sample               ║
+║                           ║ Val: posterior sample (reconstruct)  ║
+║                           ║      prior sample (sample mode)      ║
+╠═══════════════════════════╬══════════════════════════════════════╣
+║ 에러 누적                 ║ Train: 없음 (GT state)               ║
+║                           ║ Val: 있음 (compound error)           ║
+╚═══════════════════════════╩══════════════════════════════════════╝
+
+※ Train/Val gap = 이 차이에서 발생 (주로 에러 누적)
+※ gap이 크면 → TF에 overfit, AR robustness 부족
+```
+
+### 14f. Gradient 흐름 (어떤 Loss가 어디로 전파되는가)
+
+```
+Loss 별 gradient 도달 범위:
+
+(A) Recon MSE ──→ output_head → Layer 1~3 → Intent proj → Layer 0
+                  → token_proj → interaction_gcn
+                  → z_global → posterior_net → temporal_gcn_encoder
+                  → bicycle model params (a_stats, ddh_stats는 고정)
+                  ★ 전체 모델에 gradient 전파 (가장 중요한 loss)
+
+(B) KL ──→ latent_posterior_net ← temporal_gcn_encoder(future)
+           latent_prior_net ← temporal_gcn_encoder(past, GRU)
+           ★ encoder에만 영향, decoder 무관
+
+(C) Intent CE ──→ intent_ce_head ← z_local ← codebook + intent_predictor
+                  ← Layer 0 output (ego tokens)
+                  ★ codebook 품질 + Layer 0의 ego 표현 강제
+
+(D) Map Attn ──→ A2S ego_Q/O ← Layer 0 A2S attention weights
+                 (map K/V projection도 학습됨)
+                 ★ Layer 0 A2S가 도로 위치에 집중하도록 가이드
+
+(E) Sur Pred ──→ sur_pred_head ← Layer 0 A2A ego tokens
+                 ← A2A ego_Q/O, shared_K/V
+                 ★ A2A가 sur 정보를 ego에 전달하도록 강제
+
+(F) Ego Pred ──→ ego_pred_head ← Layer 0 A2A sur tokens
+                 ← A2A sur_Q/O, shared_K/V
+                 ★ A2A가 ego 정보를 sur에 전달하도록 강제
+
+(G) Env Potential ──→ output_head → 전체 decoder
+                     ★ 비도로 영역 회피 유도 (Recon과 동일 경로)
+```
+
+### 14g. Phase 2 Fine-tuning 학습 구조
+
+```
+Phase 2 학습 흐름:
+
+1. Phase 1 checkpoint 로드
+2. model.freeze_z_global():
+   - Encoder 전체 freeze (prior, posterior, temporal_gcn_encoder)
+   - Map CNN freeze
+   - Interaction GCN freeze
+   ※ 현재 Transformer decoder 내부 freeze는 미구현
+      (추후: A2T, A2A/A2S shared K/V, sur_Q/O, sur_FFN freeze)
+
+3. Optimizer 재생성 (requires_grad=True인 param만)
+4. global_step=0, epoch=0 리셋
+5. 학습:
+   - Loss: Recon + Intent(ego) + MapAttn(ego) + SurPred
+   - KL off (encoder frozen), EgoPred off (sur frozen), MapAttn sur off
+
+Phase 2 학습 의도:
+  Phase 1: "세상이 어떻게 움직이는지" 학습 (모든 agent, 모든 loss)
+  Phase 2: "ego가 adversarial하게 행동하는 법" 학습 (ego만, fine-tune data)
+  → sur는 Phase 1 knowledge 유지, ego만 새로운 행동 학습
+```
+
+---
+
+## 15. Dimension 흐름 요약
+
+```
+[Encoder]
+  state(6)+lw(2)+vis(1)+sem(NC) → MLP(128) → 64
+  temporal_gcn_encoder: 64 → 64
+  GRU/TransformerEncoder: 64 → 64
+  prior/posterior net: (64+64+NC or 64+64+64+NC) → MLP(128) → 64 (μ32+σ32)
+
+[Map]
+  (4ch, 240, 240) → conv_early → (64, 27, 27) → tokens(729, 64)
+  conv_late → (128, 3, 3) → Linear → 64
+
+[Interaction GCN]
+  state_6d(6)+lw(2)+sem(NC) → interaction_gcn → 64
+
+[Token]
+  gcn(64)+z(32)+lw(2)+sem(NC) → Linear → 128 + PE(128) = 128
+
+[Transformer Layer]
+  A2T: MHA(128, 8heads, head_dim=16)
+  A2A: SharedKV(128, 8heads)
+  A2S: map(64)→K/V(128), Q/O(128) per ego/sur
+  FFN: 128→512→128
+
+[Intent]
+  128 → MLP(64) → 9 → Gumbel → w(9) @ codebook(9,32) → 32
+  cat(128,32) → Linear(160→128)
+
+[Output]
+  Linear(128→2) → bicycle → (x,y,hx,hy)
+
+[Aux Heads]
+  sur_pred: Linear(128→2), ego_pred: Linear(128→2)
+  intent_ce: Linear(32→9)
+```
+
+---
+
+## 16. 파일 구조
+
+```
+src/
+├── models/
+│   ├── trafficplanner_model.py       ← 전체 모델 (Encoder+Decoder)
+│   │   ├ PositionalEncoding           (sinusoidal, encoder용)
+│   │   ├ SharedKVAttention            (A2A/A2S shared K/V)
+│   │   ├ TransDecoderLayer            (A2T→A2A→A2S→FFN)
+│   │   ├ IntentCodebook               (Gumbel-Softmax codebook)
+│   │   └ TrafficPlannerModel          (forward/decoder/encoder)
+│   ├── individual_interaction_net.py  ← GCN
+│   └── common.py                     ← MLP, car_dynamics
+│
+├── losses/
+│   └── trafficplanner_loss.py        ← 6종 loss 통합
+│       ├ VehCollisionLoss, EnvironmentLoss
+│       ├ IntentCELoss
+│       └ TrafficPlannerLoss.forward()
+│
+├── train_trafficplanner.py           ← Phase 1 학습 루프
+├── train_finetune_trafficplanner.py  ← Phase 2 fine-tuning
+├── test_trafficplanner.py            ← 평가 (recon/sample)
+├── test_finetune_trafficplanner.py   ← fine-tune 평가
+│
+├── datasets/
+│   ├── carla_dataset.py              ← CARLA 데이터 로더
+│   └── fit_dataset.py                ← fine-tuning 데이터 (85/10/5 split)
+│
+└── configs/
+    ├── train_trafficplanner.cfg      ← 학습 설정
+    └── test_finetune_trafficplanner.cfg
+```
