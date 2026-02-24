@@ -375,7 +375,7 @@ def main():
     ckpt_epoch = 0
     ckpt_eval_loss = float('inf')
     if cfg.ckpt is not None:
-        ckpt_epoch, ckpt_eval_loss = load_state(cfg.ckpt, model,
+        ckpt_epoch, ckpt_eval_loss, _ = load_state(cfg.ckpt, model,
                                                 optimizer=optimizer,
                                                 map_location=device)
         Logger.log('Loaded checkpoint from epoch %d with validation loss %f...' % (ckpt_epoch, ckpt_eval_loss))

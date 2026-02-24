@@ -17,7 +17,7 @@ def count_params(model):
     params = sum([np.prod(p.size()) for p in model_parameters])
     return params
 
-def save_state(file_out, model, optimizer, cur_epoch=0, min_val_loss=float('Inf'), ignore_keys=None):
+def save_state(file_out, model, optimizer, cur_epoch=0, min_val_loss=float('Inf'), global_step=0, ignore_keys=None):
     model_state_dict = model.state_dict()
     if ignore_keys is not None:
         model_state_dict = {k: v for k, v in model_state_dict.items() if k.split('.')[0] not in ignore_keys}
@@ -27,6 +27,7 @@ def save_state(file_out, model, optimizer, cur_epoch=0, min_val_loss=float('Inf'
         'optim' : optimizer.state_dict(),
         'epoch' : cur_epoch,
         'min_val_loss' : min_val_loss,
+        'global_step' : global_step,
     }
     torch.save(full_checkpoint_dict, file_out)
 
@@ -57,7 +58,8 @@ def load_state(load_path, model, optimizer=None, map_location=None, ignore_keys=
     if optimizer is not None:
         optimizer.load_state_dict(optim_state_dict)
 
-    return full_checkpoint_dict['epoch'], full_checkpoint_dict['min_val_loss']
+    global_step = full_checkpoint_dict.get('global_step', 0)
+    return full_checkpoint_dict['epoch'], full_checkpoint_dict['min_val_loss'], global_step
 
 def calc_conv_out(in_size, kernel_size, stride, padding_size=0):
     return int(((in_size - kernel_size - 2*padding_size) // stride) + 1)

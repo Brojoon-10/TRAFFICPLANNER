@@ -370,7 +370,7 @@ def main():
     if cfg.ckpt is None:
         throw_err('Must provide pretrained checkpoint for fine-tuning!')
 
-    ckpt_epoch, ckpt_eval_loss = load_state(cfg.ckpt, model, optimizer=None, map_location=device)
+    ckpt_epoch, ckpt_eval_loss, _ = load_state(cfg.ckpt, model, optimizer=None, map_location=device)
     Logger.log('Loaded pretrained checkpoint from epoch %d with loss %f' % (ckpt_epoch, ckpt_eval_loss))
 
     # Set normalizers

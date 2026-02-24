@@ -391,7 +391,7 @@ def main():
 
     # load model weights
     if cfg.ckpt is not None:
-        ckpt_epoch, _ = load_state(cfg.ckpt, model, map_location=device)
+        ckpt_epoch, _, _ = load_state(cfg.ckpt, model, map_location=device)
         Logger.log('Loaded checkpoint from epoch %d...' % (ckpt_epoch))
     else:
         throw_err('Must pass in model weights to evaluate a trained model!')

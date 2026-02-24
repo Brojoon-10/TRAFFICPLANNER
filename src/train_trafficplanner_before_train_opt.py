@@ -454,7 +454,7 @@ def main():
     # Phase 2: Load Phase 1 checkpoint
     if cfg.phase == 2 and cfg.phase1_ckpt is not None:
         Logger.log('Loading Phase 1 checkpoint for Phase 2 training...')
-        ckpt_epoch, ckpt_eval_loss = load_state(cfg.phase1_ckpt, model,
+        ckpt_epoch, ckpt_eval_loss, _ = load_state(cfg.phase1_ckpt, model,
                                                 optimizer=None,  # Don't load optimizer for Phase 2
                                                 map_location=device)
         Logger.log('Loaded Phase 1 checkpoint from epoch %d' % (ckpt_epoch))
@@ -472,7 +472,7 @@ def main():
                                weight_decay=cfg.weight_decay)
         Logger.log('Created optimizer with %d trainable parameters' % len(trainable_params))
     elif cfg.ckpt is not None:
-        ckpt_epoch, ckpt_eval_loss = load_state(cfg.ckpt, model,
+        ckpt_epoch, ckpt_eval_loss, _ = load_state(cfg.ckpt, model,
                                                 optimizer=optimizer,
                                                 map_location=device)
         Logger.log('Loaded checkpoint from epoch %d with validation loss %f...' % (ckpt_epoch, ckpt_eval_loss))

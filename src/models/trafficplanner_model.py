@@ -14,6 +14,8 @@ from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from models.individual_interaction_net import IndividualSceneInteractionNet
 from models.common import MLP, car_dynamics
 
+from torch_geometric.data import Data
+
 
 class PositionalEncoding(nn.Module):
     """
@@ -78,6 +80,62 @@ class DecoderHistoryAttention(nn.Module):
         Q = query.unsqueeze(1)  # (N, 1, D)
         attn_out, _ = self.cross_attn(Q, history, history)
         return attn_out.squeeze(1)  # (N, D)
+
+    def forward_batched(self, queries, history_buffer, FT):
+        """
+        Batched forward: all FT timesteps at once using causal mask.
+
+        Each timestep t attends to history[0..t-1]. t=0 sees nothing → zero output.
+        To avoid NaN from all-masked softmax at t=0, we only process t=1..FT-1
+        through MHA and set t=0 output to zero.
+
+        :param queries: (N, FT, D) — GRU hidden states for all timesteps
+        :param history_buffer: (N, FT, D) — full GCN features for all timesteps
+        :param FT: number of future timesteps
+        :return: (N, FT, D) — history context for all timesteps
+        """
+        N, _, D = queries.size()
+        device = queries.device
+
+        # Output buffer — t=0 stays zero
+        output = torch.zeros(N, FT, D, device=device)
+
+        if FT <= 1:
+            return output
+
+        # Project all history + add PE
+        history = self.feat_proj(history_buffer)  # (N, FT, D)
+        positions = self.pe(torch.arange(FT, device=device))  # (FT, D)
+        history = history + positions.unsqueeze(0)  # (N, FT, D)
+
+        # Only process t=1..FT-1 (FT-1 queries)
+        FT1 = FT - 1  # number of active queries
+        Q = queries[:, 1:, :].reshape(N * FT1, 1, D)  # (N*FT1, 1, D)
+        KV = history.unsqueeze(1).expand(N, FT1, FT, D).reshape(N * FT1, FT, D)  # (N*FT1, FT, D)
+
+        # Causal mask for t=1..FT-1: timestep t can see history[0..t-1]
+        # Mask shape: (FT1, FT) where row i corresponds to t=i+1
+        causal_mask = torch.zeros(FT1, FT, device=device)
+        for i in range(FT1):
+            t = i + 1  # actual timestep
+            causal_mask[i, t:] = float('-inf')  # block positions t..FT-1
+
+        # Expand for batch: (N*FT1, FT) → (N*FT1*num_heads, 1, FT)
+        # NOTE: must use expand (batch-major) not repeat (head-major) to match
+        # MHA's internal ordering: (B, nhead, ...) → (B*nhead, ...)
+        num_heads = self.cross_attn.num_heads
+        t_indices = torch.arange(FT1, device=device).unsqueeze(0).expand(N, FT1).reshape(N * FT1)
+        batch_mask = causal_mask[t_indices]  # (N*FT1, FT)
+        batch_mask = batch_mask.unsqueeze(1).unsqueeze(1)  # (N*FT1, 1, 1, FT)
+        batch_mask = batch_mask.expand(-1, num_heads, -1, -1).reshape(
+            N * FT1 * num_heads, 1, FT)  # (N*FT1*num_heads, 1, FT)
+
+        attn_out, _ = self.cross_attn(Q, KV, KV, attn_mask=batch_mask)
+        attn_out = attn_out.squeeze(1).reshape(N, FT1, D)  # (N, FT1, D)
+
+        output[:, 1:, :] = attn_out
+
+        return output
 
 
 class MapCrossAttention(nn.Module):
@@ -812,11 +870,20 @@ class TrafficPlannerModel(nn.Module):
             # ============================================================
             # STEP 3: Map Cross-Attention
             # ============================================================
-            if self.map_recrop and not mult_samp:
-                cur_map_tokens = self._recompute_map_tokens(
-                    cur_state_6d[:, :4], map_idx, map_env, scene_graph)
-                ego_map_tokens = cur_map_tokens[ego_mask]
-                sur_map_tokens = cur_map_tokens[~ego_mask]
+            if self.map_recrop and map_idx is not None and map_env is not None:
+                if mult_samp:
+                    cur_map_tokens = self._recompute_map_tokens(
+                        cur_state_6d[:, :4], map_idx, map_env, scene_graph,
+                        mult_samp=True, NS=NS)
+                    ego_map_tokens = cur_map_tokens.reshape(NA, NS, -1, self.map_token_ch)[ego_mask].reshape(
+                        num_ego * NS, self.map_num_tokens, self.map_token_ch)
+                    sur_map_tokens = cur_map_tokens.reshape(NA, NS, -1, self.map_token_ch)[~ego_mask].reshape(
+                        num_sur * NS, self.map_num_tokens, self.map_token_ch)
+                else:
+                    cur_map_tokens = self._recompute_map_tokens(
+                        cur_state_6d[:, :4], map_idx, map_env, scene_graph)
+                    ego_map_tokens = cur_map_tokens[ego_mask]
+                    sur_map_tokens = cur_map_tokens[~ego_mask]
 
             ego_map_ctx, ego_map_attn_w = self.ego_map_attn(ego_gru_h_last, ego_map_tokens)
             sur_map_ctx, sur_map_attn_w = self.sur_map_attn(sur_gru_h_last, sur_map_tokens)
@@ -1029,14 +1096,12 @@ class TrafficPlannerModel(nn.Module):
     def _sur_loop_decoder(self, scene_graph, z_sur, ego_mask, gt_future,
                               sur_map_tokens, cur_lw, cur_sem, cur_veh_len,
                               map_idx=None, map_env=None):
-        """Sur loop: ego=GT, sur=GT-cached independent 1-step prediction.
+        """Sur loop: ego=GT, sur=GT-cached independent 1-step prediction (BATCHED).
 
-        Same pattern as ego loop: GT-based pre-computation removes AR dependency.
-
-        Structure:
-        Step A: Pre-compute GT GCN features (ego=GT, sur=GT) for all FT
-        Step B: GT forward pass -> GRU hidden snapshots (no_grad)
-        Step C: Independent 1-step prediction at each t
+        All 3 steps are parallelized:
+        Step A: Batch.from_data_list → 1 GCN call for all FT timesteps
+        Step B: Batched input prep + sequential GRU for hidden snapshots (no_grad)
+        Step C: (num_sur*FT) batched 1-step prediction
         """
         NA = ego_mask.size(0)
         FT = self.FT
@@ -1045,53 +1110,54 @@ class TrafficPlannerModel(nn.Module):
         device = z_sur.device
 
         # ================================================================
-        # Step A: Pre-compute GT GCN features (ego=GT, sur=GT)
+        # Step A: Batched GCN — 12 graphs → 1 Batch call
         # ================================================================
-        gt_gcn_cache = torch.zeros(num_sur, FT, self.d_model, device=device)
-        for t in range(FT):
-            if t == 0:
-                gt_state = scene_graph.past[:, -1, :]
-            else:
-                gt_state = gt_future[:, t - 1, :]
+        # Prepare GT states for all FT: t=0 uses past[:,-1,:], t>0 uses gt_future[:,t-1,:]
+        gt_state_t0 = scene_graph.past[:, -1, :]  # (NA, S)
+        all_gt_states = torch.cat([gt_state_t0.unsqueeze(1), gt_future[:, :FT-1, :]], dim=1)  # (NA, FT, S)
 
-            cur_state_6d = gt_state if gt_state.size(-1) >= 6 else \
-                torch.cat([gt_state, torch.zeros(NA, 6 - gt_state.size(-1), device=device)], dim=-1)
-            gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
-            scene_graph.x = gcn_in
-            scene_graph.pos = cur_state_6d[:, :4]
-            _, sur_gcn_feat = self.interaction_gcn(scene_graph, ego_mask)
-            gt_gcn_cache[:, t, :] = sur_gcn_feat
+        # Ensure 6d states
+        S = all_gt_states.size(-1)
+        if S < 6:
+            pad = torch.zeros(NA, FT, 6 - S, device=device)
+            all_gt_states_6d = torch.cat([all_gt_states, pad], dim=-1)
+        else:
+            all_gt_states_6d = all_gt_states
+
+        # Build manually batched graph: FT copies with edge_index offset
+        batched_graph = self._build_temporal_graph(
+            scene_graph, all_gt_states_6d, cur_lw, cur_sem, FT)
+        batched_ego_mask = ego_mask.repeat(FT)
+        _, sur_gcn_all = self.interaction_gcn(batched_graph, batched_ego_mask)
+        # sur_gcn_all: (num_sur*FT, D) → reshape to (FT, num_sur, D) → (num_sur, FT, D)
+        gt_gcn_cache = sur_gcn_all.reshape(FT, num_sur, self.d_model).permute(1, 0, 2).contiguous()
 
         # Pre-compute GT map tokens if re-crop enabled
         gt_map_tokens_cache = None
         if self.map_recrop and map_idx is not None and map_env is not None:
             gt_map_tokens_cache = []
             for t in range(FT):
-                if t == 0:
-                    gt_pos = scene_graph.past[:, -1, :4]
-                else:
-                    gt_pos = gt_future[:, t - 1, :4]
+                gt_pos = all_gt_states_6d[:, t, :4]
                 cur_map_tokens = self._recompute_map_tokens(
                     gt_pos, map_idx, map_env, scene_graph)
                 gt_map_tokens_cache.append(cur_map_tokens[~ego_mask])
 
         # ================================================================
         # Step B: Warmup (with grad) + GT forward pass for hidden snapshots (no_grad)
-        # Warmup GRU needs gradient so it learns proper hidden initialization.
-        # The GT cache loop does NOT need gradient (Step C re-computes independently).
+        # GRU hidden accumulation is sequential (h[t] depends on h[t-1]).
+        # But GRU inputs at each step are pre-computable from GT.
         # ================================================================
         sur_gru_hidden_init = self._warmup_gru_hidden(
             scene_graph, ego_mask, is_ego=False, gt_future=None, target_t=0)
 
         with torch.no_grad():
             sur_gru_hidden = sur_gru_hidden_init.detach().clone()
-
-            gt_history_buffer = torch.zeros(num_sur, FT, self.d_model, device=device)
             gt_hidden_snapshots = [sur_gru_hidden.clone()]
 
-            for t in range(FT):
-                gt_history_buffer[:, t, :] = gt_gcn_cache[:, t, :]
+            # gt_gcn_cache is the history buffer itself
+            gt_history_buffer = gt_gcn_cache  # (num_sur, FT, D)
 
+            for t in range(FT):
                 sur_gru_h_last = sur_gru_hidden[-1]
                 sur_hist_ctx = self.sur_history_attn(sur_gru_h_last, gt_history_buffer, t)
 
@@ -1100,11 +1166,8 @@ class TrafficPlannerModel(nn.Module):
                 cur_sur_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else sur_map_tokens
                 sur_map_ctx, _ = self.sur_map_attn(sur_gru_h_last, cur_sur_map_tokens)
 
-                # Sur intent (Step B: no output storage needed)
-                if t == 0:
-                    sur_state_for_intent = scene_graph.past[:, -1, :][~ego_mask]
-                else:
-                    sur_state_for_intent = gt_future[:, t - 1, :][~ego_mask]
+                # Sur intent
+                sur_state_for_intent = all_gt_states[:, t, :][~ego_mask]
                 if sur_state_for_intent.size(-1) < 6:
                     sur_state_for_intent = torch.cat([sur_state_for_intent,
                         torch.zeros(num_sur, 6 - sur_state_for_intent.size(-1), device=device)], dim=-1)
@@ -1127,85 +1190,122 @@ class TrafficPlannerModel(nn.Module):
         gt_hidden_snapshots[0] = sur_gru_hidden_init
 
         # ================================================================
-        # Step C: Independent 1-step prediction at each t (GT-cached)
+        # Step C: Batched independent 1-step prediction (num_sur*FT batch)
         # ================================================================
-        sur_traj_all = torch.zeros(num_sur, FT, 4, device=device)
 
+        # Stack hidden snapshots: (FT+1) × (3, num_sur, D) → use [0..FT-1]
+        # gt_hidden_snapshots[t] is the hidden state BEFORE step t
+        all_hidden = torch.stack(gt_hidden_snapshots[:FT], dim=0)  # (FT, 3, num_sur, D)
+
+        # ---- ALL flat tensors below use TIME-MAJOR layout ----
+        # time-major: [t0a0, t0a1, ..., t0aN, t1a0, ...] = (FT, N, D).reshape(N*FT, D)
+        # This matches all_hidden_gru = (3, FT, N, D).reshape(3, N*FT, D)
+
+        # GT prev_state for bicycle model: (num_sur, FT, S) → time-major
+        if self.output_bicycle:
+            sur_prev_states = all_gt_states[:, :FT, :][~ego_mask]  # (num_sur, FT, S)
+        else:
+            sur_prev_states = all_gt_states_6d[:, :FT, :4][~ego_mask]  # (num_sur, FT, 4)
+        sur_prev_flat = sur_prev_states.permute(1, 0, 2).reshape(num_sur * FT, -1)  # time-major
+
+        # History Attention (batched with causal mask)
+        # forward_batched expects (N, FT, D) and returns (N, FT, D) — agent-major internally
+        queries = all_hidden[:, -1, :, :]  # (FT, num_sur, D)
+        queries = queries.permute(1, 0, 2)  # (num_sur, FT, D) for forward_batched
+        sur_hist_ctx_all = self.sur_history_attn.forward_batched(queries, gt_gcn_cache, FT)  # (num_sur, FT, D)
+        # Convert to time-major for flat operations
+        sur_hist_ctx_flat = sur_hist_ctx_all.permute(1, 0, 2).reshape(num_sur * FT, self.d_model)  # time-major
+
+        # Auxiliary: ego prediction from sur history context
+        predicted_ego_delta_flat = self.ego_pred_head(sur_hist_ctx_flat)  # (num_sur*FT, 2) time-major
+        # Store per-timestep for loss (need agent-major → reshape as time-major then permute)
+        predicted_ego_delta_per_t = predicted_ego_delta_flat.reshape(FT, num_sur, -1).permute(1, 0, 2)  # (num_sur, FT, ...)
         for t in range(FT):
-            # Restore GT state
-            sur_gru_hidden = gt_hidden_snapshots[t].clone()
+            self._ego_pred_outputs.append(predicted_ego_delta_per_t[:, t, :].detach())
 
-            # GT position for bicycle model
-            if t == 0:
-                sur_prev_state = scene_graph.past[:, -1, :][~ego_mask] if self.output_bicycle else scene_graph.past[:, -1, :4][~ego_mask]
-            else:
-                sur_prev_state = gt_future[:, t - 1, :][~ego_mask] if self.output_bicycle else gt_future[:, t - 1, :4][~ego_mask]
+        # Map Attention (batched) — already time-major
+        if gt_map_tokens_cache is not None:
+            # Stack map tokens: (FT, num_sur, tokens, ch) → (num_sur*FT, tokens, ch) time-major
+            sur_map_tokens_stacked = torch.stack(gt_map_tokens_cache, dim=0)  # (FT, num_sur, T, ch)
+            sur_map_tokens_flat = sur_map_tokens_stacked.reshape(num_sur * FT, -1, self.map_token_ch)
+        else:
+            # Repeat same tokens for each timestep — time-major
+            sur_map_tokens_flat = sur_map_tokens.unsqueeze(0).expand(FT, -1, -1, -1).reshape(
+                num_sur * FT, -1, self.map_token_ch)
 
-            # History buffer from GT GCN cache (0~t)
-            sur_history_buffer = torch.zeros(num_sur, FT, self.d_model, device=device)
-            sur_history_buffer[:, :t + 1, :] = gt_gcn_cache[:, :t + 1, :]
+        # GRU hidden last layer for Map Attention queries — time-major
+        # all_hidden: (FT, 3, num_sur, D), last GRU layer = [:, -1, :, :]
+        gru_h_last_per_t = all_hidden[:, -1, :, :]  # (FT, num_sur, D)
+        gru_h_last_flat = gru_h_last_per_t.reshape(num_sur * FT, self.d_model)  # time-major (no permute!)
 
-            # History Attention
-            sur_gru_h_last = sur_gru_hidden[-1]
-            sur_hist_ctx = self.sur_history_attn(sur_gru_h_last, sur_history_buffer, t)
+        sur_map_ctx_flat, sur_map_attn_w_flat = self.sur_map_attn(gru_h_last_flat, sur_map_tokens_flat)
+        # Store per-timestep
+        sur_map_attn_w_per_t = sur_map_attn_w_flat.reshape(FT, num_sur, 1, -1).permute(1, 0, 2, 3)  # (num_sur, FT, 1, ...)
+        for t in range(FT):
+            self._sur_map_attn_weights_outputs.append(sur_map_attn_w_per_t[:, t, :, :])
 
-            # Auxiliary: ego prediction from sur history context
-            predicted_ego_delta = self.ego_pred_head(sur_hist_ctx)
-            self._ego_pred_outputs.append(predicted_ego_delta.detach())
+        # Sur Intent (batched) — time-major
+        sur_states_for_intent = all_gt_states[:, :FT, :][~ego_mask]  # (num_sur, FT, S)
+        if sur_states_for_intent.size(-1) < 6:
+            pad = torch.zeros(num_sur, FT, 6 - sur_states_for_intent.size(-1), device=device)
+            sur_states_for_intent = torch.cat([sur_states_for_intent, pad], dim=-1)
+        sur_states_intent_flat = sur_states_for_intent.permute(1, 0, 2).reshape(num_sur * FT, -1)  # time-major
+        sur_intent_input_flat = torch.cat([
+            sur_states_intent_flat,
+            predicted_ego_delta_flat,
+            sur_map_ctx_flat.detach()
+        ], dim=-1)
 
-            # Map Attention
-            cur_sur_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else sur_map_tokens
-            sur_map_ctx, sur_map_attn_w = self.sur_map_attn(sur_gru_h_last, cur_sur_map_tokens)
-            self._sur_map_attn_weights_outputs.append(sur_map_attn_w)
+        if self.use_sur_intent:
+            z_local_sur_flat, sur_intent_weights_flat = self.sur_intent_codebook(
+                sur_intent_input_flat, self.gumbel_temperature)
+        else:
+            z_local_sur_flat = torch.zeros(num_sur * FT, self.intent_dim, device=device)
+            sur_intent_weights_flat = torch.zeros(num_sur * FT, self.num_intents, device=device)
 
-            # Sur Intent
-            if t == 0:
-                sur_state_for_intent = scene_graph.past[:, -1, :][~ego_mask]
-            else:
-                sur_state_for_intent = gt_future[:, t - 1, :][~ego_mask]
-            if sur_state_for_intent.size(-1) < 6:
-                sur_state_for_intent = torch.cat([sur_state_for_intent,
-                    torch.zeros(num_sur, 6 - sur_state_for_intent.size(-1), device=device)], dim=-1)
-            sur_intent_input = torch.cat([sur_state_for_intent, predicted_ego_delta, sur_map_ctx.detach()], dim=-1)
-            if self.use_sur_intent:
-                z_local_sur, sur_intent_weights = self.sur_intent_codebook(sur_intent_input, self.gumbel_temperature)
-            else:
-                z_local_sur = torch.zeros(num_sur, self.intent_dim, device=device)
-                sur_intent_weights = torch.zeros(num_sur, self.num_intents, device=device)
-            self._z_local_sur_outputs.append(z_local_sur.detach())
-            self._sur_intent_weights_outputs.append(sur_intent_weights.detach())
+        # Store per-timestep (time-major → agent-major for indexing)
+        z_local_sur_per_t = z_local_sur_flat.reshape(FT, num_sur, -1).permute(1, 0, 2)  # (num_sur, FT, ...)
+        sur_intent_w_per_t = sur_intent_weights_flat.reshape(FT, num_sur, -1).permute(1, 0, 2)
+        for t in range(FT):
+            self._z_local_sur_outputs.append(z_local_sur_per_t[:, t, :].detach())
+            self._sur_intent_weights_outputs.append(sur_intent_w_per_t[:, t, :].detach())
 
-            # Sur GRU (1-step)
-            sur_lw_flat = cur_lw[~ego_mask]
-            sur_sem_flat = cur_sem[~ego_mask]
-            sur_gru_in = torch.cat([
-                sur_hist_ctx, sur_map_ctx, z_sur, z_local_sur, sur_lw_flat, sur_sem_flat
-            ], dim=-1).unsqueeze(1)
+        # Sur GRU 1-step (batched): all time-major (num_sur*FT, ...)
+        sur_lw_flat = cur_lw[~ego_mask].unsqueeze(0).expand(FT, -1, -1).reshape(num_sur * FT, -1)  # time-major
+        sur_sem_flat = cur_sem[~ego_mask].unsqueeze(0).expand(FT, -1, -1).reshape(num_sur * FT, -1)  # time-major
+        z_sur_flat = z_sur.unsqueeze(0).expand(FT, -1, -1).reshape(num_sur * FT, -1)  # time-major
 
-            sur_gru_out, _ = self.sur_decoder_gru(sur_gru_in, sur_gru_hidden)
-            sur_traj_step = self.sur_output_head(sur_gru_out[:, 0])
+        sur_gru_in_flat = torch.cat([
+            sur_hist_ctx_flat, sur_map_ctx_flat, z_sur_flat, z_local_sur_flat,
+            sur_lw_flat, sur_sem_flat
+        ], dim=-1).unsqueeze(1)  # (num_sur*FT, 1, in_dim) time-major
 
-            # Bicycle model for sur
-            sur_state_global, _ = self._apply_dynamics_single(
-                sur_traj_step, sur_prev_state, cur_veh_len[~ego_mask])
+        # Hidden for GRU: (3, FT, num_sur, D) → (3, num_sur*FT, D) time-major
+        all_hidden_contiguous = all_hidden.permute(1, 0, 2, 3).contiguous()  # (3, FT, num_sur, D)
+        all_hidden_gru = all_hidden_contiguous.reshape(3, num_sur * FT, self.d_model).contiguous()  # time-major
 
-            sur_traj_all[:, t, :] = sur_state_global
+        sur_gru_out_flat, _ = self.sur_decoder_gru(sur_gru_in_flat, all_hidden_gru)
+        sur_traj_step_flat = self.sur_output_head(sur_gru_out_flat[:, 0])  # (num_sur*FT, 2) time-major
+
+        # Bicycle model (batched) — time-major
+        sur_veh_len_flat = cur_veh_len[~ego_mask].unsqueeze(0).expand(FT, -1, -1).reshape(num_sur * FT, -1)
+        sur_state_global_flat, _ = self._apply_dynamics_single(
+            sur_traj_step_flat, sur_prev_flat, sur_veh_len_flat)
+
+        # Reshape: time-major (num_sur*FT, 4) → (FT, num_sur, 4) → (num_sur, FT, 4)
+        sur_traj_all = sur_state_global_flat.reshape(FT, num_sur, 4).permute(1, 0, 2).contiguous()
 
         return sur_traj_all  # (num_sur, FT, 4)
 
     def _ego_loop_decoder(self, scene_graph, z_ego, ego_mask, gt_future,
                               ego_map_tokens, cur_lw, cur_sem, cur_veh_len,
                               map_idx=None, map_env=None):
-        """Ego loop: sur=GT fixed, ego=GT-cached independent 1-step prediction.
+        """Ego loop: sur=GT fixed, ego=GT-cached independent 1-step prediction (BATCHED).
 
-        Removes AR dependency entirely: every step uses GT-cached state.
-        No inter-step dependency -> parallelizable.
-
-        Structure:
-        Step A: Pre-compute GT GCN features for all FT timesteps
-        Step B: GT forward pass -> GRU hidden snapshots at each step (no_grad)
-        Step C: Independent 1-step prediction at each t:
-                gt_hidden[t] + gt_gcn[:t+1] -> history attn -> map attn -> intent -> GRU 1-step -> pred[t]
+        All 3 steps are parallelized:
+        Step A: Batch.from_data_list → 1 GCN call for all FT timesteps
+        Step B: Batched input prep + sequential GRU for hidden snapshots (no_grad)
+        Step C: (num_ego*FT) batched 1-step prediction
         """
         NA = ego_mask.size(0)
         FT = self.FT
@@ -1213,54 +1313,46 @@ class TrafficPlannerModel(nn.Module):
         device = z_ego.device
 
         # ================================================================
-        # Step A: Pre-compute GT GCN features for future FT timesteps
+        # Step A: Batched GCN — 12 graphs → 1 Batch call
         # ================================================================
-        gt_gcn_cache = torch.zeros(num_ego, FT, self.d_model, device=device)
-        for t in range(FT):
-            if t == 0:
-                gt_state = scene_graph.past[:, -1, :]
-            else:
-                gt_state = gt_future[:, t - 1, :]
+        gt_state_t0 = scene_graph.past[:, -1, :]
+        all_gt_states = torch.cat([gt_state_t0.unsqueeze(1), gt_future[:, :FT-1, :]], dim=1)  # (NA, FT, S)
 
-            cur_state_6d = gt_state if gt_state.size(-1) >= 6 else \
-                torch.cat([gt_state, torch.zeros(NA, 6 - gt_state.size(-1), device=device)], dim=-1)
-            gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
-            scene_graph.x = gcn_in
-            scene_graph.pos = cur_state_6d[:, :4]
-            ego_gcn_feat, _ = self.interaction_gcn(scene_graph, ego_mask)
-            gt_gcn_cache[:, t, :] = ego_gcn_feat
+        S = all_gt_states.size(-1)
+        if S < 6:
+            pad = torch.zeros(NA, FT, 6 - S, device=device)
+            all_gt_states_6d = torch.cat([all_gt_states, pad], dim=-1)
+        else:
+            all_gt_states_6d = all_gt_states
+
+        batched_graph = self._build_temporal_graph(
+            scene_graph, all_gt_states_6d, cur_lw, cur_sem, FT)
+        batched_ego_mask = ego_mask.repeat(FT)
+        ego_gcn_all, _ = self.interaction_gcn(batched_graph, batched_ego_mask)
+        gt_gcn_cache = ego_gcn_all.reshape(FT, num_ego, self.d_model).permute(1, 0, 2).contiguous()
 
         # Pre-compute GT map tokens if re-crop enabled
         gt_map_tokens_cache = None
         if self.map_recrop and map_idx is not None and map_env is not None:
             gt_map_tokens_cache = []
             for t in range(FT):
-                if t == 0:
-                    gt_pos = scene_graph.past[:, -1, :4]
-                else:
-                    gt_pos = gt_future[:, t - 1, :4]
+                gt_pos = all_gt_states_6d[:, t, :4]
                 cur_map_tokens = self._recompute_map_tokens(
                     gt_pos, map_idx, map_env, scene_graph)
                 gt_map_tokens_cache.append(cur_map_tokens[ego_mask])
 
         # ================================================================
         # Step B: Warmup (with grad) + GT forward pass for hidden snapshots (no_grad)
-        # Warmup GRU needs gradient so it learns proper hidden initialization.
-        # The GT cache loop does NOT need gradient (Step C re-computes independently).
         # ================================================================
         ego_gru_hidden_init = self._warmup_gru_hidden(
             scene_graph, ego_mask, is_ego=True, gt_future=gt_future, target_t=0)
 
         with torch.no_grad():
-            # Detach warmup result for the no_grad cache loop
             ego_gru_hidden = ego_gru_hidden_init.detach().clone()
-
-            gt_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
             gt_hidden_snapshots = [ego_gru_hidden.clone()]
+            gt_history_buffer = gt_gcn_cache  # (num_ego, FT, D)
 
             for t in range(FT):
-                gt_history_buffer[:, t, :] = gt_gcn_cache[:, t, :]
-
                 ego_gru_h_last = ego_gru_hidden[-1]
                 ego_hist_ctx = self.ego_history_attn(ego_gru_h_last, gt_history_buffer, t)
 
@@ -1269,10 +1361,7 @@ class TrafficPlannerModel(nn.Module):
                 cur_ego_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else ego_map_tokens
                 ego_map_ctx, _ = self.ego_map_attn(ego_gru_h_last, cur_ego_map_tokens)
 
-                if t == 0:
-                    ego_state_for_intent = scene_graph.past[:, -1, :][ego_mask]
-                else:
-                    ego_state_for_intent = gt_future[:, t - 1, :][ego_mask]
+                ego_state_for_intent = all_gt_states[:, t, :][ego_mask]
                 if ego_state_for_intent.size(-1) < 6:
                     ego_state_for_intent = torch.cat([ego_state_for_intent,
                         torch.zeros(num_ego, 6 - ego_state_for_intent.size(-1), device=device)], dim=-1)
@@ -1291,78 +1380,104 @@ class TrafficPlannerModel(nn.Module):
                 _, ego_gru_hidden = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
                 gt_hidden_snapshots.append(ego_gru_hidden.clone())
 
-        # Replace snapshot[0] with the grad-carrying warmup result
-        # so Step C t=0 can backprop through ego_warmup_gru
         gt_hidden_snapshots[0] = ego_gru_hidden_init
 
         # ================================================================
-        # Step C: Independent 1-step prediction at each t (GT-cached)
-        # Each t: gt_hidden[t] + gt_gcn[:t+1] -> pipeline -> pred[t]
-        # No inter-step dependency
+        # Step C: Batched independent 1-step prediction (num_ego*FT batch)
         # ================================================================
-        ego_traj_all = torch.zeros(num_ego, FT, 4, device=device)
 
+        # Stack hidden snapshots: use [0..FT-1] as initial hidden for each timestep
+        all_hidden = torch.stack(gt_hidden_snapshots[:FT], dim=0)  # (FT, 3, num_ego, D)
+
+        # ---- ALL flat tensors below use TIME-MAJOR layout ----
+        # time-major: [t0a0, t0a1, ..., t0aN, t1a0, ...] = (FT, N, D).reshape(N*FT, D)
+        # This matches all_hidden_gru = (3, FT, N, D).reshape(3, N*FT, D)
+
+        # GT prev_state for bicycle model — time-major
+        if self.output_bicycle:
+            ego_prev_states = all_gt_states[:, :FT, :][ego_mask]  # (num_ego, FT, S)
+        else:
+            ego_prev_states = all_gt_states_6d[:, :FT, :4][ego_mask]
+        ego_prev_flat = ego_prev_states.permute(1, 0, 2).reshape(num_ego * FT, -1)  # time-major
+
+        # History Attention (batched with causal mask)
+        # forward_batched expects (N, FT, D) and returns (N, FT, D) — agent-major internally
+        queries = all_hidden[:, -1, :, :]  # (FT, num_ego, D)
+        queries = queries.permute(1, 0, 2)  # (num_ego, FT, D) for forward_batched
+        ego_hist_ctx_all = self.ego_history_attn.forward_batched(queries, gt_gcn_cache, FT)
+        # Convert to time-major for flat operations
+        ego_hist_ctx_flat = ego_hist_ctx_all.permute(1, 0, 2).reshape(num_ego * FT, self.d_model)  # time-major
+
+        # Auxiliary: sur prediction
+        predicted_sur_delta_flat = self.sur_pred_head(ego_hist_ctx_flat)  # time-major
+        predicted_sur_delta_per_t = predicted_sur_delta_flat.reshape(FT, num_ego, -1).permute(1, 0, 2)  # (num_ego, FT, ...)
         for t in range(FT):
-            # Restore GT state
-            ego_gru_hidden = gt_hidden_snapshots[t].clone()
+            self._sur_pred_outputs.append(predicted_sur_delta_per_t[:, t, :].detach())
 
-            # GT position for bicycle model
-            if t == 0:
-                ego_prev_state = scene_graph.past[:, -1, :][ego_mask] if self.output_bicycle else scene_graph.past[:, -1, :4][ego_mask]
-            else:
-                ego_prev_state = gt_future[:, t - 1, :][ego_mask] if self.output_bicycle else gt_future[:, t - 1, :4][ego_mask]
+        # Map Attention (batched) — already time-major
+        if gt_map_tokens_cache is not None:
+            ego_map_tokens_stacked = torch.stack(gt_map_tokens_cache, dim=0)  # (FT, num_ego, T, ch)
+            ego_map_tokens_flat = ego_map_tokens_stacked.reshape(num_ego * FT, -1, self.map_token_ch)
+        else:
+            ego_map_tokens_flat = ego_map_tokens.unsqueeze(0).expand(FT, -1, -1, -1).reshape(
+                num_ego * FT, -1, self.map_token_ch)
 
-            # History buffer from GT GCN cache (0~t)
-            ego_history_buffer = torch.zeros(num_ego, FT, self.d_model, device=device)
-            ego_history_buffer[:, :t + 1, :] = gt_gcn_cache[:, :t + 1, :]
+        # GRU hidden last layer — time-major (no permute!)
+        gru_h_last_per_t = all_hidden[:, -1, :, :]  # (FT, num_ego, D)
+        gru_h_last_flat = gru_h_last_per_t.reshape(num_ego * FT, self.d_model)  # time-major
 
-            # History Attention
-            ego_gru_h_last = ego_gru_hidden[-1]
-            ego_hist_ctx = self.ego_history_attn(ego_gru_h_last, ego_history_buffer, t)
+        ego_map_ctx_flat, ego_map_attn_w_flat = self.ego_map_attn(gru_h_last_flat, ego_map_tokens_flat)
+        ego_map_attn_w_per_t = ego_map_attn_w_flat.reshape(FT, num_ego, 1, -1).permute(1, 0, 2, 3)  # (num_ego, FT, 1, ...)
+        for t in range(FT):
+            self._ego_map_attn_weights_outputs.append(ego_map_attn_w_per_t[:, t, :, :])
 
-            # Auxiliary: sur prediction
-            predicted_sur_delta = self.sur_pred_head(ego_hist_ctx)
-            self._sur_pred_outputs.append(predicted_sur_delta.detach())
+        # Intent (batched) — time-major
+        ego_states_for_intent = all_gt_states[:, :FT, :][ego_mask]  # (num_ego, FT, S)
+        if ego_states_for_intent.size(-1) < 6:
+            pad = torch.zeros(num_ego, FT, 6 - ego_states_for_intent.size(-1), device=device)
+            ego_states_for_intent = torch.cat([ego_states_for_intent, pad], dim=-1)
+        ego_states_intent_flat = ego_states_for_intent.permute(1, 0, 2).reshape(num_ego * FT, -1)  # time-major
 
-            # Map Attention
-            cur_ego_map_tokens = gt_map_tokens_cache[t] if gt_map_tokens_cache is not None else ego_map_tokens
-            ego_map_ctx, ego_map_attn_w = self.ego_map_attn(ego_gru_h_last, cur_ego_map_tokens)
-            self._ego_map_attn_weights_outputs.append(ego_map_attn_w)
+        intent_input_flat = torch.cat([
+            ego_states_intent_flat,
+            predicted_sur_delta_flat,
+            ego_map_ctx_flat.detach()
+        ], dim=-1)
 
-            # Intent
-            if t == 0:
-                ego_state_for_intent = scene_graph.past[:, -1, :][ego_mask]
-            else:
-                ego_state_for_intent = gt_future[:, t - 1, :][ego_mask]
+        z_local_flat, intent_weights_flat = self.intent_codebook(intent_input_flat, self.gumbel_temperature)
+        if not self.use_ego_intent:
+            z_local_flat = torch.zeros_like(z_local_flat)
 
-            if ego_state_for_intent.size(-1) < 6:
-                ego_state_for_intent = torch.cat([ego_state_for_intent,
-                    torch.zeros(num_ego, 6 - ego_state_for_intent.size(-1), device=device)], dim=-1)
+        z_local_per_t = z_local_flat.reshape(FT, num_ego, -1).permute(1, 0, 2)  # (num_ego, FT, ...)
+        intent_w_per_t = intent_weights_flat.reshape(FT, num_ego, -1).permute(1, 0, 2)
+        for t in range(FT):
+            self._z_local_outputs.append(z_local_per_t[:, t, :].detach())
+            self._intent_weights_outputs.append(intent_w_per_t[:, t, :].detach())
 
-            intent_input = torch.cat([ego_state_for_intent, predicted_sur_delta, ego_map_ctx.detach()], dim=-1)
-            z_local, intent_weights = self.intent_codebook(intent_input, self.gumbel_temperature)
+        # Ego GRU 1-step (batched) — all time-major
+        ego_lw_flat = cur_lw[ego_mask].unsqueeze(0).expand(FT, -1, -1).reshape(num_ego * FT, -1)  # time-major
+        ego_sem_flat = cur_sem[ego_mask].unsqueeze(0).expand(FT, -1, -1).reshape(num_ego * FT, -1)  # time-major
+        z_ego_flat = z_ego.unsqueeze(0).expand(FT, -1, -1).reshape(num_ego * FT, -1)  # time-major
 
-            if not self.use_ego_intent:
-                z_local = torch.zeros_like(z_local)
+        ego_gru_in_flat = torch.cat([
+            ego_hist_ctx_flat, ego_map_ctx_flat, z_ego_flat, z_local_flat,
+            ego_lw_flat, ego_sem_flat
+        ], dim=-1).unsqueeze(1)  # (num_ego*FT, 1, in_dim) time-major
 
-            self._z_local_outputs.append(z_local.detach())
-            self._intent_weights_outputs.append(intent_weights.detach())
+        # Hidden for GRU: (3, FT, num_ego, D) → (3, num_ego*FT, D) time-major
+        all_hidden_contiguous = all_hidden.permute(1, 0, 2, 3).contiguous()  # (3, FT, num_ego, D)
+        all_hidden_gru = all_hidden_contiguous.reshape(3, num_ego * FT, self.d_model).contiguous()  # time-major
 
-            # Ego GRU (1-step)
-            ego_lw_flat = cur_lw[ego_mask]
-            ego_sem_flat = cur_sem[ego_mask]
-            ego_gru_in = torch.cat([
-                ego_hist_ctx, ego_map_ctx, z_ego, z_local, ego_lw_flat, ego_sem_flat
-            ], dim=-1).unsqueeze(1)
+        ego_gru_out_flat, _ = self.ego_decoder_gru(ego_gru_in_flat, all_hidden_gru)
+        ego_traj_out_flat = self.ego_output_head(ego_gru_out_flat[:, 0])
 
-            ego_gru_out, _ = self.ego_decoder_gru(ego_gru_in, ego_gru_hidden)
-            ego_traj_out = self.ego_output_head(ego_gru_out[:, 0])
+        # Bicycle model (batched) — time-major
+        ego_veh_len_flat = cur_veh_len[ego_mask].unsqueeze(0).expand(FT, -1, -1).reshape(num_ego * FT, -1)
+        ego_state_global_flat, _ = self._apply_dynamics_single(
+            ego_traj_out_flat, ego_prev_flat, ego_veh_len_flat)
 
-            # Bicycle model
-            ego_state_global, _ = self._apply_dynamics_single(
-                ego_traj_out, ego_prev_state, cur_veh_len[ego_mask])
-
-            ego_traj_all[:, t, :] = ego_state_global
+        # Reshape: time-major (num_ego*FT, 4) → (FT, num_ego, 4) → (num_ego, FT, 4)
+        ego_traj_all = ego_state_global_flat.reshape(FT, num_ego, 4).permute(1, 0, 2).contiguous()
 
         return ego_traj_all  # (num_ego, FT, 4)
 
@@ -1451,6 +1566,71 @@ class TrafficPlannerModel(nn.Module):
         return cur_state_global, cur_state_local, cur_bike_state
 
     # ============================================================
+    # Temporal GCN batching helper
+    # ============================================================
+
+    def _build_temporal_graph(self, scene_graph, all_states_6d, cur_lw, cur_sem, FT):
+        """
+        Manually build a batched graph for FT timesteps.
+        Each timestep reuses the same edge topology but with different node features/positions.
+
+        Unlike Batch.from_data_list, this preserves the original sub-graph structure
+        (ptr/batch from DataLoader) by correctly repeating and offsetting them.
+
+        :param scene_graph: original batched graph from DataLoader
+        :param all_states_6d: (NA, FT, 6) GT states for all timesteps
+        :param cur_lw: (NA, 2) vehicle length/width
+        :param cur_sem: (NA, NC) semantic class
+        :param FT: number of future timesteps
+        :return: batched_graph (Data-like), batched_ego_mask
+        """
+        NA = all_states_6d.size(0)
+        device = all_states_6d.device
+
+        # x: (NA*FT, feat_dim), pos: (NA*FT, 4), sem: (NA*FT, NC)
+        # Layout: time-major — [t0_agent0, t0_agent1, ..., t0_agentNA-1, t1_agent0, ...]
+        # This matches edge_index offset: t0 nodes = 0..NA-1, t1 nodes = NA..2*NA-1
+        gcn_in_list = []
+        for t in range(FT):
+            gcn_in_t = torch.cat([all_states_6d[:, t, :], cur_lw, cur_sem], dim=-1)
+            gcn_in_list.append(gcn_in_t)
+        x_cat = torch.cat(gcn_in_list, dim=0)  # (NA*FT, feat_dim) — time-major
+        # pos & sem must also be time-major: permute (NA,FT,...) → (FT,NA,...) then reshape
+        pos_cat = all_states_6d[:, :, :4].permute(1, 0, 2).reshape(NA * FT, 4)  # (NA*FT, 4)
+        sem_cat = cur_sem.unsqueeze(0).expand(FT, -1, -1).reshape(NA * FT, -1)  # already time-major
+
+        # edge_index: repeat with +NA*t offset per timestep
+        orig_edge_index = scene_graph.edge_index  # (2, E)
+        E = orig_edge_index.size(1)
+        edge_list = []
+        for t in range(FT):
+            edge_list.append(orig_edge_index + NA * t)
+        edge_cat = torch.cat(edge_list, dim=1)  # (2, E*FT)
+
+        # batch: repeat with offset per timestep
+        orig_batch = scene_graph.batch  # (NA,)
+        B = orig_batch.max().item() + 1  # number of scenes in original batch
+        batch_list = []
+        for t in range(FT):
+            batch_list.append(orig_batch + B * t)
+        batch_cat = torch.cat(batch_list, dim=0)  # (NA*FT,)
+
+        # ptr: repeat with offset per timestep
+        orig_ptr = scene_graph.ptr  # (B+1,)
+        ptr_list = []
+        for t in range(FT):
+            ptr_list.append(orig_ptr[:-1] + NA * t)
+        ptr_list.append(torch.tensor([NA * FT], device=device))
+        ptr_cat = torch.cat(ptr_list, dim=0)  # (B*FT + 1,)
+
+        # Build Data object (not Batch — just a plain Data with batch/ptr)
+        batched_graph = Data(x=x_cat, edge_index=edge_cat, pos=pos_cat, sem=sem_cat)
+        batched_graph.batch = batch_cat
+        batched_graph.ptr = ptr_cat
+
+        return batched_graph
+
+    # ============================================================
     # Warmup & utility methods
     # ============================================================
 
@@ -1524,21 +1704,29 @@ class TrafficPlannerModel(nn.Module):
             merged[~ego_mask] = other_feat
         return merged
 
-    def _recompute_map_tokens(self, pos_normalized, map_idx, map_env, scene_graph):
+    def _recompute_map_tokens(self, pos_normalized, map_idx, map_env, scene_graph,
+                              mult_samp=False, NS=None):
         """
         Re-crop and re-encode map tokens at given normalized positions.
 
-        :param pos_normalized: (NA, 4) normalized positions (x, y, hx, hy)
+        :param pos_normalized: (NA, 4) or (NA*NS, 4) normalized positions
         :param map_idx: (B,) map index per batch
         :param map_env: map environment for cropping
         :param scene_graph: scene graph (for .batch attribute)
-        :return: map_tokens (NA, num_tokens, map_token_ch)
+        :param mult_samp: if True, pos is (NA*NS, 4), expand batch accordingly
+        :param NS: number of samples (required if mult_samp=True)
+        :return: map_tokens (NA, num_tokens, ch) or (NA*NS, num_tokens, ch)
         """
         pos_unnorm = self.normalizer.unnormalize(pos_normalized)
-        mapixes = map_idx[scene_graph.batch]
-        map_obs = map_env.get_map_crop_pos(pos_unnorm, mapixes).to(torch.float)  # (NA, C, H, W)
-        map_early = self.map_conv_early(map_obs)  # (NA, ch, H', W')
-        map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (NA, num_tokens, ch)
+        if mult_samp and NS is not None:
+            # scene_graph.batch is (NA,), expand to (NA*NS,)
+            mapixes = map_idx[scene_graph.batch]  # (NA,)
+            mapixes = mapixes.unsqueeze(1).expand(-1, NS).reshape(-1)  # (NA*NS,)
+        else:
+            mapixes = map_idx[scene_graph.batch]
+        map_obs = map_env.get_map_crop_pos(pos_unnorm, mapixes).to(torch.float)
+        map_early = self.map_conv_early(map_obs)
+        map_tokens = map_early.flatten(2).permute(0, 2, 1)
         return map_tokens
 
     def rsample(self, mean, var):

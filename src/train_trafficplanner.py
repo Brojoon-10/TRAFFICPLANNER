@@ -16,6 +16,7 @@ import tqdm
 import torch
 import torch.optim as optim
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 from torch_geometric.data import DataLoader as GraphDataLoader
 
@@ -89,7 +90,11 @@ def parse_cfg():
     parser.add_argument('--lr_min', type=float, default=1e-6,
                         help='Min LR for cosine annealing')
     parser.add_argument('--lr_anneal_epochs', type=int, default=None,
-                        help='T_max for cosine annealing (default: use --epochs)')
+                        help='(deprecated) T_max for epoch-based cosine annealing')
+    parser.add_argument('--lr_warmup_steps', type=int, default=0,
+                        help='Number of warmup steps for step-based LR scheduler')
+    parser.add_argument('--lr_total_steps', type=int, default=None,
+                        help='Total steps for LR scheduler (auto: epochs * steps_per_epoch)')
 
     # TrafficPlannerModel architecture parameters (past_feat_size, future_feat_size in base_args)
     parser.add_argument('--z_local_size', type=int, default=32,
@@ -178,6 +183,12 @@ def parse_cfg():
                         help='Number of future GT steps for map attention soft label')
     parser.add_argument('--map_gt_decay_lambda', type=float, default=0.3,
                         help='Exponential decay lambda for map attention GT weights: w_t = exp(-lambda*t) / sum')
+    parser.add_argument('--map_gauss_sigma_d', type=float, default=0.8,
+                        help='Lateral Gaussian sigma for map attention soft label (grid cells)')
+    parser.add_argument('--map_attn_anneal', type=str2bool, default=False,
+                        help='Enable epoch-based cosine annealing for map attn loss (full → 0)')
+    parser.add_argument('--map_attn_anneal_epochs', type=int, default=0,
+                        help='Number of epochs over which map attn weight decays to 0 (0=use total epochs)')
 
     args = parser.parse_args()
     config_dict = vars(args)
@@ -192,7 +203,11 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                   optimizer=None,
                   step_counter=0,
                   use_wandb=False,
-                  use_teacher_forcing=False):
+                  use_teacher_forcing=False,
+                  current_epoch=0,
+                  tb_writer=None,
+                  global_step=0,
+                  scheduler=None):
     '''
     Run through dataset and for a single epoch. Trains if desired.
     '''
@@ -275,7 +290,10 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                 # training step for generator
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
             # compute interpretable errors
             err_dict = loss_fn.compute_err(scene_graph, pred,
@@ -324,17 +342,28 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
         # Log the loss to the tqdm progress bar
         pbar.set_postfix(progress_bar_metrics)
 
+        # TensorBoard: per-batch logging (train only, every 10 batches)
+        if tb_writer is not None and train:
+            global_step += 1
+            if global_step % 10 == 0:
+                for k, v in progress_bar_metrics.items():
+                    tb_writer.add_scalar(f'batch/{k}', v, global_step)
+                if scheduler is not None:
+                    tb_writer.add_scalar('batch/lr', scheduler.get_last_lr()[0], global_step)
+
     wandb_epoch_metrics = {}
+    epoch_metrics = {}
     for k, v in metrics.items():
         metrics[k] = np.concatenate(metrics[k])
-        wandb_epoch_metrics[prefix + " Epoch Mean " + k] = np.mean(metrics[k])
+        epoch_metrics[k] = np.mean(metrics[k])
+        wandb_epoch_metrics[prefix + " Epoch Mean " + k] = epoch_metrics[k]
 
     mean_epoch_loss = wandb_epoch_metrics[prefix + " Epoch Mean loss"]
 
     if use_wandb and len(wandb_epoch_metrics) > 0:
         wandb.log(wandb_epoch_metrics, step=step_counter)
 
-    return step_counter, mean_epoch_loss
+    return step_counter, mean_epoch_loss, epoch_metrics, global_step
 
 
 def main():
@@ -504,6 +533,7 @@ def main():
         'map_gt_steps': getattr(cfg, 'map_gt_steps', 6),
         'map_gt_decay_lambda': getattr(cfg, 'map_gt_decay_lambda', 0.3),
         'intent_sigma': getattr(cfg, 'intent_sigma', 0.5),
+        'map_gauss_sigma_d': getattr(cfg, 'map_gauss_sigma_d', 0.8),
     }
 
     loss_fn = TrafficPlannerLoss(
@@ -533,9 +563,9 @@ def main():
     # Phase 2: Load Phase 1 checkpoint
     if cfg.phase == 2 and cfg.phase1_ckpt is not None:
         Logger.log('Loading Phase 1 checkpoint for Phase 2 training...')
-        ckpt_epoch, ckpt_eval_loss = load_state(cfg.phase1_ckpt, model,
-                                                optimizer=None,  # Don't load optimizer for Phase 2
-                                                map_location=device)
+        ckpt_epoch, ckpt_eval_loss, _ = load_state(cfg.phase1_ckpt, model,
+                                                   optimizer=None,  # Don't load optimizer for Phase 2
+                                                   map_location=device)
         Logger.log('Loaded Phase 1 checkpoint from epoch %d' % (ckpt_epoch))
         ckpt_epoch = 0  # Reset epoch counter for Phase 2
         ckpt_eval_loss = float('inf')  # Reset eval loss tracking
@@ -551,26 +581,57 @@ def main():
                                weight_decay=cfg.weight_decay)
         Logger.log('Created optimizer with %d trainable parameters' % len(trainable_params))
     elif cfg.ckpt is not None:
-        ckpt_epoch, ckpt_eval_loss = load_state(cfg.ckpt, model,
-                                                optimizer=optimizer,
-                                                map_location=device)
+        ckpt_epoch, ckpt_eval_loss, global_step_loaded = load_state(cfg.ckpt, model,
+                                                                     optimizer=optimizer,
+                                                                     map_location=device)
         Logger.log('Loaded checkpoint from epoch %d with validation loss %f...' % (ckpt_epoch, ckpt_eval_loss))
 
-    # LR scheduler (cosine annealing)
+    # LR scheduler (step-based warmup + cosine decay)
     scheduler = None
+    global_step = 0
     if cfg.use_lr_anneal:
         lr_max = cfg.lr_max if cfg.lr_max is not None else cfg.lr
         lr_min = cfg.lr_min
-        T_max = cfg.lr_anneal_epochs if cfg.lr_anneal_epochs is not None else cfg.epochs
-        # Set optimizer lr to lr_max
+        warmup_steps = cfg.lr_warmup_steps
+
+        # Estimate total steps
+        est_steps_per_epoch = len(train_loader)
+        if cfg.lr_total_steps is not None:
+            total_steps = cfg.lr_total_steps
+        else:
+            total_steps = est_steps_per_epoch * cfg.epochs
+        Logger.log(f'LR: estimated {est_steps_per_epoch} steps/epoch, {total_steps} total steps')
+
+        # Step-based warmup + cosine decay
+        # ~0 → lr_max (warmup) → lr_min (cosine decay)
+        warmup_floor = 5e-7 / lr_max  # near-zero start for warmup
+        decay_floor = lr_min / lr_max  # cosine decay end
+        def lr_lambda(step):
+            if step < warmup_steps:
+                # Linear warmup: ~0 → lr_max
+                return max(warmup_floor, step / max(warmup_steps, 1))
+            else:
+                # Cosine decay: lr_max → lr_min
+                progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+                progress = min(progress, 1.0)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return max(decay_floor, cosine_decay)
+
+        # Set optimizer to lr_max (lambda will scale it)
         for pg in optimizer.param_groups:
             pg['lr'] = lr_max
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=lr_min)
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
         # If resuming from checkpoint, advance scheduler
-        if ckpt_epoch > 0:
-            for _ in range(ckpt_epoch):
+        if cfg.ckpt is not None and 'global_step_loaded' in dir():
+            global_step = global_step_loaded
+            for _ in range(global_step):
                 scheduler.step()
-        Logger.log(f'LR Cosine Annealing: max={lr_max}, min={lr_min}, T_max={T_max}')
+            Logger.log(f'Restored LR scheduler to global_step={global_step}')
+
+        actual_lr = optimizer.param_groups[0]['lr']
+        Logger.log(f'LR Step-based: max={lr_max}, min={lr_min}, warmup={warmup_steps}, total={total_steps}')
+        Logger.log(f'LR (actual): {actual_lr}')
 
     # Freeze z_global if requested (for custom training scenarios)
     if cfg.freeze_z_global and cfg.phase == 1:
@@ -634,7 +695,11 @@ def main():
 
     # Optimizer
     Logger.log('\n[Optimizer]')
-    Logger.log(f'  lr: {cfg.lr}')
+    actual_init_lr = optimizer.param_groups[0]['lr']
+    Logger.log(f'  lr: {actual_init_lr}')
+    if cfg.use_lr_anneal:
+        Logger.log(f'  lr_max: {cfg.lr_max}, lr_min: {cfg.lr_min}')
+        Logger.log(f'  warmup_steps: {cfg.lr_warmup_steps}')
     Logger.log(f'  weight_decay: {cfg.weight_decay}')
 
     Logger.log('=' * 80)
@@ -645,6 +710,11 @@ def main():
     if use_kl_anneal:
         assert cfg.kl_anneal_end > 0
         Logger.log('Using KL annealing...')
+
+    # TensorBoard
+    tb_log_dir = os.path.join(cfg.out, 'tb_logs')
+    tb_writer = SummaryWriter(log_dir=tb_log_dir)
+    Logger.log(f'TensorBoard logs: {tb_log_dir}')
 
     # run training
     ckpts_path = os.path.join(cfg.out, 'checkpoints_trafficplanner')
@@ -669,26 +739,48 @@ def main():
                 Logger.log('KL ANNEALING FINISHED: resetting val loss tracking...')
                 min_eval_loss = float('inf')
 
+        # Map attention loss annealing: cosine decay from full weight to 0
+        if getattr(cfg, 'map_attn_anneal', False) and cfg.loss_map_attn > 0:
+            anneal_total = cfg.map_attn_anneal_epochs if cfg.map_attn_anneal_epochs > 0 else cfg.epochs
+            progress = min(epoch / max(anneal_total, 1), 1.0)
+            map_attn_w = cfg.loss_map_attn * 0.5 * (1 + math.cos(math.pi * progress))
+            loss_fn.loss_weights['map_attn'] = map_attn_w
+            Logger.log('Map attn weight %.6f...' % map_attn_w)
+            if use_wandb:
+                wandb.log({'map_attn_weight': map_attn_w}, step=step_counter)
+
         # train for one epoch
         start_t = time.time()
         model.train()
-        step_counter, _ = run_one_epoch(train_loader, model, map_env, loss_fn, device, cfg.out,
+        step_counter, mean_train_loss, train_epoch_metrics, global_step = run_one_epoch(
+                                        train_loader, model, map_env, loss_fn, device, cfg.out,
                                         train=True,
                                         optimizer=optimizer,
                                         step_counter=step_counter,
                                         use_wandb=use_wandb,
-                                        use_teacher_forcing=cfg.use_teacher_forcing)
-        train_loss.append(_)
+                                        use_teacher_forcing=cfg.use_teacher_forcing,
+                                        current_epoch=epoch,
+                                        tb_writer=tb_writer,
+                                        global_step=global_step,
+                                        scheduler=scheduler)
+        train_loss.append(mean_train_loss)
+
+        # TensorBoard: epoch-level train metrics
+        if tb_writer is not None:
+            for k, v in train_epoch_metrics.items():
+                tb_writer.add_scalar(f'train/{k}', v, epoch)
+            if scheduler is not None:
+                tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
+
         ax1.clear()
         ax1.plot(train_loss)
         ax1.set_title(f"Train Loss (Phase {cfg.phase})")
         plt.savefig(f'loss_{cfg.loss_plot_suffix}.jpg', format='jpeg')
 
-        # Step LR scheduler
+        # Log LR after epoch
         if scheduler is not None:
-            scheduler.step()
             if use_wandb:
-                wandb.log({'lr': scheduler.get_last_lr()[0]}, step=step_counter)
+                wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=step_counter)
 
         # lot of excess memory used by pygeometric
         torch.cuda.empty_cache()
@@ -699,12 +791,20 @@ def main():
             Logger.log('Validating...')
             with torch.no_grad():
                 model.eval()
-                step_counter, mean_eval_loss = run_one_epoch(val_loader, model, map_env, loss_fn, device, cfg.out,
+                step_counter, mean_eval_loss, val_epoch_metrics, _ = run_one_epoch(
+                                                            val_loader, model, map_env, loss_fn, device, cfg.out,
                                                             train=False,
                                                             step_counter=step_counter,
                                                             use_wandb=use_wandb,
-                                                            use_teacher_forcing=False)
+                                                            use_teacher_forcing=False,
+                                                            current_epoch=epoch)
                 valid_loss.append(mean_eval_loss)
+
+                # TensorBoard: epoch-level val metrics
+                if tb_writer is not None:
+                    for k, v in val_epoch_metrics.items():
+                        tb_writer.add_scalar(f'val/{k}', v, epoch)
+
                 print(f'min_eval_loss = ', min_eval_loss)
                 print(f'mean_eval_loss = ', mean_eval_loss)
                 ax2.clear()
@@ -716,7 +816,7 @@ def main():
                     Logger.log('Lowest eval loss so far! Saving checkpoint...')
                     min_eval_loss = mean_eval_loss
                     save_file = os.path.join(ckpts_path, f'best_eval_model_phase{cfg.phase}.pth')
-                    save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss)
+                    save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=step_counter)
                     if use_wandb:
                         wandb.save(save_file)
                 torch.cuda.empty_cache()
@@ -725,11 +825,16 @@ def main():
         if epoch % cfg.save_every == 0:
             Logger.log('Saving checkpoint...')
             save_file = os.path.join(ckpts_path, 'epoch_%08d_model.pth' % (epoch))
-            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss)
+            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=step_counter)
             save_file = os.path.join(ckpts_path, f'latest_model_phase{cfg.phase}.pth')
-            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss)
+            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=step_counter)
             if use_wandb:
                 wandb.save(save_file)
+
+    # Close TensorBoard writer
+    if tb_writer is not None:
+        tb_writer.close()
+    Logger.log(f'Training complete. TensorBoard: tensorboard --logdir {tb_log_dir}')
 
     if use_wandb:
         # save full log after training

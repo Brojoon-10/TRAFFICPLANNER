@@ -307,7 +307,7 @@ def main():
 
     # Load pre-trained checkpoint
     Logger.log('Loading pre-trained checkpoint: %s' % cfg.pretrained_ckpt)
-    ckpt_epoch, _ = load_state(cfg.pretrained_ckpt, model, optimizer=None, map_location=device)
+    ckpt_epoch, _, _ = load_state(cfg.pretrained_ckpt, model, optimizer=None, map_location=device)
     Logger.log('Loaded checkpoint from epoch %d' % ckpt_epoch)
 
     # Freeze for fine-tuning (z_global + GCN + map + sur decoder)

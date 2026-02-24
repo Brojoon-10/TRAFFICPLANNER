@@ -238,17 +238,16 @@ class FITDataset(Dataset):
         
         scene_full_list = sorted(glob.glob(os.path.join(scenario_path, 'driving_data_scenario_*.xlsx')))
         n = len(scene_full_list)
-        half = n // 2
-        rest = n - half
-        val_num = rest // 3
-        test_num = rest - val_num
+        # 85% train / 10% val / 5% test
+        n_train = int(n * 0.85)
+        n_val = int(n * 0.10)
 
         if self.split == "train":
-            scene_separated_list = scene_full_list[:half]
+            scene_separated_list = scene_full_list[:n_train]
         elif self.split == "val":
-            scene_separated_list = scene_full_list[half:half+val_num]
+            scene_separated_list = scene_full_list[n_train:n_train+n_val]
         elif self.split == "test":
-            scene_separated_list = scene_full_list[half+val_num:]
+            scene_separated_list = scene_full_list[n_train+n_val:]
         elif self.split == "adv" :
             scene_separated_list = scene_full_list
         else:
