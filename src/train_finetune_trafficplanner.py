@@ -13,10 +13,12 @@
 import os, argparse, time
 
 import gc
+import math
 import tqdm
 import torch
 import torch.optim as optim
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 from torch_geometric.data import DataLoader as GraphDataLoader
 
@@ -69,20 +71,22 @@ def parse_cfg():
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=0.0)
 
-    # LR scheduler (cosine annealing)
+    # LR scheduler (step-based warmup + cosine decay)
     parser.add_argument('--use_lr_anneal', type=str2bool, default=False,
-                        help='Enable cosine annealing LR scheduler')
+                        help='Enable step-based LR scheduler')
     parser.add_argument('--lr_max', type=float, default=None,
-                        help='Max LR for cosine annealing (default: use --lr)')
+                        help='Max LR (default: use --lr)')
     parser.add_argument('--lr_min', type=float, default=1e-6,
-                        help='Min LR for cosine annealing')
-    parser.add_argument('--lr_anneal_epochs', type=int, default=None,
-                        help='T_max for cosine annealing (default: use --epochs)')
+                        help='Min LR for cosine decay')
+    parser.add_argument('--lr_warmup_steps', type=int, default=0,
+                        help='Number of warmup steps')
+    parser.add_argument('--lr_total_steps', type=int, default=None,
+                        help='Total steps (auto: epochs * steps_per_epoch)')
 
     # TrafficPlannerModel architecture (must match pretrained)
     parser.add_argument('--z_local_size', type=int, default=32)
-    parser.add_argument('--num_intents', type=int, default=8,
-                        help='Number of intent codebook entries (K)')
+    parser.add_argument('--num_intents', type=int, default=9,
+                        help='Number of intent codebook entries (3acc x 3yaw)')
     parser.add_argument('--hist_attn_nhead', type=int, default=4,
                         help='Number of heads for decoder history attention')
     parser.add_argument('--map_attn_nhead', type=int, default=4,
@@ -91,6 +95,10 @@ def parse_cfg():
                         help='Predicted surrounding agent delta dimension (dx, dy)')
     parser.add_argument('--map_recrop', type=str2bool, default=False,
                         help='Re-crop map tokens at each decode step')
+    parser.add_argument('--use_ego_intent', type=str2bool, default=True,
+                        help='Enable ego intent codebook')
+    parser.add_argument('--use_sur_intent', type=str2bool, default=False,
+                        help='Enable sur intent codebook')
 
     # Loss weights
     parser.add_argument('--loss_recon', type=float, default=1.0)
@@ -99,33 +107,41 @@ def parse_cfg():
     parser.add_argument('--loss_veh_coll_prior', type=float, default=0.05)
     parser.add_argument('--loss_env_coll_prior', type=float, default=0.1)
 
-    # Potential loss (disabled by default)
+    # Potential loss
     parser.add_argument('--use_potential_loss', type=str2bool, default=False)
     parser.add_argument('--use_veh_potential', type=str2bool, default=False)
     parser.add_argument('--loss_potential_veh', type=float, default=0.0)
     parser.add_argument('--loss_potential_env', type=float, default=0.0)
 
-    # Potential field parameters (needed for config compatibility)
+    # Potential field parameters
     parser.add_argument('--k_veh_repel', type=float, default=1.0)
-    parser.add_argument('--sigma_veh', type=float, default=1.5)
+    parser.add_argument('--sigma_veh', type=float, default=0.5)
     parser.add_argument('--k_env_boundary', type=float, default=1.0)
     parser.add_argument('--sigma_env_boundary', type=float, default=0.5)
     parser.add_argument('--k_env_solid', type=float, default=0.8)
     parser.add_argument('--sigma_env_solid', type=float, default=0.5)
     parser.add_argument('--k_env_dashed', type=float, default=0.1)
     parser.add_argument('--sigma_env_dashed', type=float, default=0.3)
-    parser.add_argument('--use_lane_lines', type=str2bool, default=True)
+    parser.add_argument('--use_lane_lines', type=str2bool, default=False)
     parser.add_argument('--env_loss_ego_only', type=str2bool, default=True)
 
-    # Sparsity loss (disabled)
+    # Sparsity loss
     parser.add_argument('--use_sparse_loss', type=str2bool, default=False)
     parser.add_argument('--loss_sparse', type=float, default=0.0)
     parser.add_argument('--target_sparsity', type=float, default=0.1)
 
     # Teacher forcing
     parser.add_argument('--use_teacher_forcing', type=str2bool, default=True)
-    parser.add_argument('--tf_init_segment_len', type=int, default=1)
-    parser.add_argument('--tf_max_annealing_epoch', type=int, default=300)
+
+    # Auxiliary loss weights
+    parser.add_argument('--loss_sur_pred', type=float, default=0.0,
+                        help='Sur prediction aux loss (frozen in finetune)')
+    parser.add_argument('--loss_ego_pred', type=float, default=0.0,
+                        help='Ego prediction aux loss (frozen in finetune)')
+    parser.add_argument('--loss_intent_ce', type=float, default=0.1,
+                        help='Intent CE loss (Phase 2)')
+    parser.add_argument('--loss_map_attn', type=float, default=0.0,
+                        help='Map attention guidance loss')
 
     # Loss plot
     parser.add_argument('--loss_plot_suffix', type=str, default='finetune_trafficplanner')
@@ -139,8 +155,11 @@ def parse_cfg():
 def run_one_epoch(data_loader, model, map_env, loss_fn, device,
                   train=True,
                   optimizer=None,
+                  step_counter=0,
                   use_teacher_forcing=False,
-                  current_epoch=0):
+                  tb_writer=None,
+                  global_step=0,
+                  scheduler=None):
     """Same structure as train_trafficplanner.py run_one_epoch."""
     if train and optimizer is None:
         throw_err('Must give optimizer to train!')
@@ -152,6 +171,7 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device,
 
     for i, data in enumerate(pbar):
         scene_graph, map_idx = data
+        pred = loss_dict = None
 
         if empty_cache:
             empty_cache = False
@@ -161,14 +181,14 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device,
         try:
             scene_graph = scene_graph.to(device)
             map_idx = map_idx.to(device)
+            B = map_idx.size(0)
 
             do_sample = loss_fn.loss_weights.get('coll_veh_prior', 0.0) > 0.0 or \
                         loss_fn.loss_weights.get('coll_env_prior', 0.0) > 0.0
 
             pred = model(scene_graph, map_idx, map_env,
                          future_sample=do_sample,
-                         teacher_forcing=use_teacher_forcing if train else False,
-                         current_epoch=current_epoch)
+                         teacher_forcing=use_teacher_forcing if train else False)
 
             loss_dict = loss_fn(scene_graph, pred,
                                 map_idx=map_idx,
@@ -181,7 +201,10 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device,
             if train:
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
             err_dict = loss_fn.compute_err(scene_graph, pred, model.get_normalizer())
 
@@ -190,6 +213,10 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device,
             Logger.log('Caught error in batch %d: %s' % (i, str(e)))
             traceback.print_exc()
             Logger.log('Skipping batch')
+            if pred is not None:
+                del pred
+            if loss_dict is not None:
+                del loss_dict
             for p in model.parameters():
                 if p.grad is not None:
                     del p.grad
@@ -198,6 +225,7 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device,
 
         batch_metrics = {**loss_dict, **err_dict}
 
+        # Metrics for progress bar
         progress_bar_metrics = {}
         for k, v in batch_metrics.items():
             if v is None:
@@ -208,11 +236,22 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device,
             progress_bar_metrics[k] = torch.mean(v).item()
         pbar.set_postfix(progress_bar_metrics)
 
+        # TensorBoard: per-batch logging (train only, every 10 batches)
+        if tb_writer is not None and train:
+            global_step += 1
+            if global_step % 10 == 0:
+                for k, v in progress_bar_metrics.items():
+                    tb_writer.add_scalar(f'batch/{k}', v, global_step)
+                if scheduler is not None:
+                    tb_writer.add_scalar('batch/lr', scheduler.get_last_lr()[0], global_step)
+
+    epoch_metrics = {}
     for k, v in metrics.items():
         metrics[k] = np.concatenate(metrics[k])
+        epoch_metrics[k] = np.mean(metrics[k])
 
-    mean_epoch_loss = np.mean(metrics['loss']) if 'loss' in metrics else float('inf')
-    return mean_epoch_loss
+    mean_epoch_loss = epoch_metrics.get('loss', float('inf'))
+    return step_counter, mean_epoch_loss, epoch_metrics, global_step
 
 
 def main():
@@ -243,7 +282,7 @@ def main():
                         layers=cfg.map_layers,
                         device=device)
 
-    # Dataset (flat: each scene → 2 samples, shuffled together)
+    # Dataset
     Logger.log('Creating fine-tuning dataset...')
     train_dataset = FinetuneTrafficPlannerDataset(
         scenario_path=cfg.scenario_dir,
@@ -295,14 +334,14 @@ def main():
         conv_kernel_list=cfg.conv_kernel_list,
         conv_stride_list=cfg.conv_stride_list,
         conv_filter_list=cfg.conv_filter_list,
-        tf_max_annealing_epoch=cfg.tf_max_annealing_epoch,
-        tf_init_segment_len=cfg.tf_init_segment_len,
         # Redesign params
         num_intents=cfg.num_intents,
         hist_attn_nhead=cfg.hist_attn_nhead,
         map_attn_nhead=cfg.map_attn_nhead,
         sur_pred_dim=cfg.sur_pred_dim,
         map_recrop=cfg.map_recrop,
+        use_ego_intent=cfg.use_ego_intent,
+        use_sur_intent=cfg.use_sur_intent,
     ).to(device)
 
     # Load pre-trained checkpoint
@@ -319,16 +358,36 @@ def main():
     Logger.log('Optimizer created with %d trainable parameter groups' % len(trainable_params))
     Logger.log('Total model params: %d' % count_params(model))
 
-    # LR scheduler (cosine annealing)
+    # LR scheduler (step-based warmup + cosine decay)
     scheduler = None
+    global_step = 0
     if cfg.use_lr_anneal:
         lr_max = cfg.lr_max if cfg.lr_max is not None else cfg.lr
         lr_min = cfg.lr_min
-        T_max = cfg.lr_anneal_epochs if cfg.lr_anneal_epochs is not None else cfg.epochs
+        warmup_steps = cfg.lr_warmup_steps
+
+        est_steps_per_epoch = len(train_loader)
+        if cfg.lr_total_steps is not None:
+            total_steps = cfg.lr_total_steps
+        else:
+            total_steps = est_steps_per_epoch * cfg.epochs
+        Logger.log(f'LR: estimated {est_steps_per_epoch} steps/epoch, {total_steps} total steps')
+
+        warmup_floor = 5e-7 / lr_max
+        decay_floor = lr_min / lr_max
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return max(warmup_floor, step / max(warmup_steps, 1))
+            else:
+                progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+                progress = min(progress, 1.0)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return max(decay_floor, cosine_decay)
+
         for pg in optimizer.param_groups:
             pg['lr'] = lr_max
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=lr_min)
-        Logger.log(f'LR Cosine Annealing: max={lr_max}, min={lr_min}, T_max={T_max}')
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        Logger.log(f'LR Step-based: max={lr_max}, min={lr_min}, warmup={warmup_steps}, total={total_steps}')
 
     # Set normalizers
     model.set_normalizer(train_dataset.get_state_normalizer())
@@ -346,6 +405,11 @@ def main():
         'potential_veh': cfg.loss_potential_veh if cfg.use_potential_loss else 0.0,
         'potential_env': cfg.loss_potential_env if cfg.use_potential_loss else 0.0,
         'sparse': cfg.loss_sparse if cfg.use_sparse_loss else 0.0,
+        # Auxiliary losses
+        'sur_pred': cfg.loss_sur_pred,
+        'ego_pred': cfg.loss_ego_pred,
+        'intent_ce': cfg.loss_intent_ce,
+        'map_attn': cfg.loss_map_attn,
     }
 
     potential_cfg = {
@@ -397,19 +461,26 @@ def main():
 
     Logger.log(f'\n[Teacher Forcing]')
     Logger.log(f'  use_teacher_forcing: {cfg.use_teacher_forcing}')
-    if cfg.use_teacher_forcing:
-        Logger.log(f'  tf_init_segment_len: {cfg.tf_init_segment_len}')
-        Logger.log(f'  tf_max_annealing_epoch: {cfg.tf_max_annealing_epoch}')
 
     Logger.log(f'\n[Optimizer]')
-    Logger.log(f'  lr: {cfg.lr}')
+    actual_init_lr = optimizer.param_groups[0]['lr']
+    Logger.log(f'  lr: {actual_init_lr}')
+    if cfg.use_lr_anneal:
+        Logger.log(f'  lr_max: {cfg.lr_max}, lr_min: {cfg.lr_min}')
+        Logger.log(f'  warmup_steps: {cfg.lr_warmup_steps}')
     Logger.log(f'  weight_decay: {cfg.weight_decay}')
     Logger.log('=' * 80)
+
+    # TensorBoard
+    tb_log_dir = os.path.join(cfg.out, 'tb_logs')
+    tb_writer = SummaryWriter(log_dir=tb_log_dir)
+    Logger.log(f'TensorBoard logs: {tb_log_dir}')
 
     # Training loop
     ckpts_path = os.path.join(cfg.out, 'checkpoints_finetune')
     mkdir(ckpts_path)
     min_eval_loss = float('inf')
+    step_counter = 0
 
     train_loss = []
     valid_loss = []
@@ -421,22 +492,28 @@ def main():
         # Train
         start_t = time.time()
         model.train()
-        mean_train_loss = run_one_epoch(
+        step_counter, mean_train_loss, train_epoch_metrics, global_step = run_one_epoch(
             train_loader, model, map_env, loss_fn, device,
             train=True,
             optimizer=optimizer,
+            step_counter=step_counter,
             use_teacher_forcing=cfg.use_teacher_forcing,
-            current_epoch=epoch)
+            tb_writer=tb_writer,
+            global_step=global_step,
+            scheduler=scheduler)
         train_loss.append(mean_train_loss)
+
+        # TensorBoard: epoch-level train metrics
+        if tb_writer is not None:
+            for k, v in train_epoch_metrics.items():
+                tb_writer.add_scalar(f'train/{k}', v, epoch)
+            if scheduler is not None:
+                tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
 
         ax1.clear()
         ax1.plot(train_loss)
         ax1.set_title('Train Loss (Fine-tune)')
         plt.savefig(os.path.join(cfg.out, f'loss_{cfg.loss_plot_suffix}.png'), format='png')
-
-        # Step LR scheduler
-        if scheduler is not None:
-            scheduler.step()
 
         torch.cuda.empty_cache()
         Logger.log('Epoch %d - Train loss: %.6f - Time: %.1fs' % (epoch, mean_train_loss, time.time() - start_t))
@@ -446,12 +523,17 @@ def main():
             Logger.log('Validating...')
             with torch.no_grad():
                 model.eval()
-                mean_eval_loss = run_one_epoch(
+                step_counter, mean_eval_loss, val_epoch_metrics, _ = run_one_epoch(
                     val_loader, model, map_env, loss_fn, device,
                     train=False,
-                    use_teacher_forcing=False,
-                    current_epoch=epoch)
+                    step_counter=step_counter,
+                    use_teacher_forcing=False)
                 valid_loss.append(mean_eval_loss)
+
+                # TensorBoard: epoch-level val metrics
+                if tb_writer is not None:
+                    for k, v in val_epoch_metrics.items():
+                        tb_writer.add_scalar(f'val/{k}', v, epoch)
 
                 ax2.clear()
                 ax2.plot(valid_loss)
@@ -464,18 +546,21 @@ def main():
                     Logger.log('New best! Saving checkpoint...')
                     min_eval_loss = mean_eval_loss
                     save_file = os.path.join(ckpts_path, 'best_finetune_model.pth')
-                    save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss)
+                    save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=global_step)
 
                 torch.cuda.empty_cache()
 
         # Periodic checkpoint
         if epoch % cfg.save_every == 0:
             save_file = os.path.join(ckpts_path, 'epoch_%08d_model.pth' % epoch)
-            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss)
+            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=global_step)
             save_file = os.path.join(ckpts_path, 'latest_finetune_model.pth')
-            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss)
+            save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=global_step)
 
-    Logger.log('Fine-tuning complete!')
+    # Close TensorBoard writer
+    if tb_writer is not None:
+        tb_writer.close()
+    Logger.log(f'Fine-tuning complete. TensorBoard: tensorboard --logdir {tb_log_dir}')
 
 
 if __name__ == '__main__':

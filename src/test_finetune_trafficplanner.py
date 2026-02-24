@@ -72,6 +72,10 @@ def parse_cfg():
                         help='Predicted surrounding agent delta dimension (dx, dy)')
     parser.add_argument('--map_recrop', type=str2bool, default=False,
                         help='Re-crop map tokens at each decode step')
+    parser.add_argument('--use_ego_intent', type=str2bool, default=True,
+                        help='Enable ego intent codebook')
+    parser.add_argument('--use_sur_intent', type=str2bool, default=False,
+                        help='Enable sur intent codebook')
 
     # Potential field parameters (for config compatibility)
     parser.add_argument('--k_veh_repel', type=float, default=1.0)
@@ -722,6 +726,8 @@ def main():
         map_attn_nhead=cfg.map_attn_nhead,
         sur_pred_dim=cfg.sur_pred_dim,
         map_recrop=cfg.map_recrop,
+        use_ego_intent=cfg.use_ego_intent,
+        use_sur_intent=cfg.use_sur_intent,
     ).to(device)
 
     # Loss (eval only)
