@@ -626,6 +626,16 @@ class TrafficPlannerLoss(nn.Module):
                 aux_loss = aux_loss + map_attn_w * map_attn_loss
                 loss_out_dict['map_attn_loss'] = map_attn_loss.detach().view((1,))
 
+        # ---- (E) z_global Auxiliary Decoder Loss: z-only action prediction ----
+        z_aux_w = self.loss_weights.get('z_aux', 0.0)
+        if z_aux_w > 0.0 and model is not None:
+            z_aux_traj = getattr(model, '_z_aux_traj', None)
+            if z_aux_traj is not None:
+                gt_actions = model._compute_gt_actions(scene_graph, ego_only=True)  # (N_ego, FT, 2)
+                z_aux_loss = nn.functional.mse_loss(z_aux_traj, gt_actions)
+                aux_loss = aux_loss + z_aux_w * z_aux_loss
+                loss_out_dict['z_aux_loss'] = z_aux_loss.detach().view((1,))
+
         return aux_loss
 
     def _compute_map_attn_guidance_loss(self, model, scene_graph, ego_mask, gt_future, FT):
@@ -766,8 +776,9 @@ class TrafficPlannerLoss(nn.Module):
         frame_unnorm = normalizer.unnormalize(frame)  # (N, 4)
 
         # Collect GT waypoints in grid coordinates: agent pos + K future points
-        agent_gi = (frame_unnorm[:, 0] - bounds[0]) * m2pix_l * pix2grid_l  # (N,)
-        agent_gj = (frame_unnorm[:, 1] - bounds[1]) * m2pix_w * pix2grid_w  # (N,)
+        # Agent's current position in its own local frame is always (0, 0)
+        agent_gi = (0.0 - bounds[0]) * m2pix_l * pix2grid_l * torch.ones(N, device=device)  # (N,)
+        agent_gj = (0.0 - bounds[1]) * m2pix_w * pix2grid_w * torch.ones(N, device=device)  # (N,)
 
         waypoints_i = [agent_gi]
         waypoints_j = [agent_gj]

@@ -101,7 +101,9 @@ class FITDataset(Dataset):
         # self.scenario_path = "/home/hj/RACE_STRIVE/data/race_scenarios/adv_input_05"  # For Train
 
         # self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'trafficplanner_normal_small_datasets')
-        self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'trafficplanner_tf')
+        # self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'trafficplanner_tf')
+        # self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'various_driving_data_20260224')
+        self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'various_500_sample')
 
 
         self.require_full_past = require_full_past

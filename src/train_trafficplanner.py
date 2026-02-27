@@ -185,9 +185,27 @@ def parse_cfg():
     parser.add_argument('--map_gt_decay_lambda', type=float, default=0.3,
                         help='Exponential decay lambda for map attention GT weights: w_t = exp(-lambda*t) / sum')
     parser.add_argument('--map_attn_anneal', type=str2bool, default=False,
-                        help='Enable epoch-based cosine annealing for map attn loss (full → 0)')
+                        help='Enable cosine annealing for map attn loss (full → 0)')
     parser.add_argument('--map_attn_anneal_epochs', type=int, default=0,
-                        help='Epochs for map attn cosine decay (0 = use total epochs)')
+                        help='[LEGACY] Epochs for map attn cosine decay (0 = use total epochs)')
+    parser.add_argument('--map_attn_anneal_steps', type=int, default=0,
+                        help='Steps for map attn cosine decay (overrides epoch-based if > 0)')
+
+    # V5 Redesign: AdaLN, A2A Relative Bias, z_aux, Action Blending
+    parser.add_argument('--use_adaln', type=str2bool, default=False,
+                        help='Enable Adaptive Layer Normalization (z_global injection per layer)')
+    parser.add_argument('--use_a2a_rel_bias', type=str2bool, default=False,
+                        help='Enable A2A relative physical bias (8-feature MLP → attention bias)')
+    parser.add_argument('--loss_z_aux', type=float, default=0.0,
+                        help='z_global auxiliary decoder loss weight')
+    parser.add_argument('--action_blending', type=str2bool, default=False,
+                        help='Enable action blending (GT/predicted action interpolation)')
+    parser.add_argument('--blend_start_step', type=int, default=50000,
+                        help='Global step to start action blending')
+    parser.add_argument('--blend_anneal_steps', type=int, default=100000,
+                        help='Steps over which blend_alpha ramps to target')
+    parser.add_argument('--blend_target_alpha', type=float, default=0.5,
+                        help='Target blend_alpha (0=pure GT, 1=pure predicted)')
 
     args = parser.parse_args()
     config_dict = vars(args)
@@ -206,7 +224,9 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                   current_epoch=0,
                   tb_writer=None,
                   global_step=0,
-                  scheduler=None):
+                  scheduler=None,
+                  blend_alpha=0.0,
+                  cfg=None):
     '''
     Run through dataset and for a single epoch. Trains if desired.
     '''
@@ -235,6 +255,22 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
             gc.collect()
             torch.cuda.empty_cache()
         try:
+            # Step-based annealing: compute blend_alpha and map_attn_w per batch
+            cur_blend_alpha = 0.0
+            if train and cfg is not None:
+                # Action blending: step-based alpha ramp
+                if getattr(cfg, 'action_blending', False) and global_step >= cfg.blend_start_step:
+                    progress = (global_step - cfg.blend_start_step) / max(cfg.blend_anneal_steps, 1)
+                    cur_blend_alpha = min(cfg.blend_target_alpha, cfg.blend_target_alpha * progress)
+
+                # Map attn annealing: step-based cosine decay (overrides epoch-based)
+                if getattr(cfg, 'map_attn_anneal', False) and cfg.loss_map_attn > 0:
+                    anneal_steps = getattr(cfg, 'map_attn_anneal_steps', 0)
+                    if anneal_steps > 0:
+                        progress = min(global_step / max(anneal_steps, 1), 1.0)
+                        map_attn_w = cfg.loss_map_attn * 0.5 * (1 + math.cos(math.pi * progress))
+                        loss_fn.loss_weights['map_attn'] = map_attn_w
+
             scene_graph = scene_graph.to(device)
             map_idx = map_idx.to(device)
             B = map_idx.size(0)
@@ -244,7 +280,8 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
 
             pred = model(scene_graph, map_idx, map_env, future_sample=do_sample,
                          teacher_forcing=use_teacher_forcing if train else False,
-                         current_epoch=current_epoch)
+                         current_epoch=current_epoch,
+                         blend_alpha=cur_blend_alpha if train else 0.0)
 
             # Pass model to loss_fn for z_local sparsity computation
             # use_teacher_forcing only during training
@@ -279,6 +316,20 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                 # training step for generator
                 optimizer.zero_grad()
                 loss.backward()
+
+                # Gradient norm logging (every 50 steps)
+                if global_step % 50 == 0 and tb_writer is not None:
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.data.norm(2).item() ** 2
+                    total_norm = total_norm ** 0.5
+                    tb_writer.add_scalar('grad_norm/total', total_norm, global_step)
+                    # Per-module gradient norms
+                    per_mod = model.compute_per_module_grad_norms()
+                    for mk, mv in per_mod.items():
+                        tb_writer.add_scalar(f'grad_norm/{mk}', mv, global_step)
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 # Step-based LR scheduler (warmup + cosine decay)
@@ -340,6 +391,17 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                     tb_writer.add_scalar(f'batch/{k}', v, global_step)
                 if scheduler is not None:
                     tb_writer.add_scalar('batch/lr', scheduler.get_last_lr()[0], global_step)
+                # Log annealing values
+                if cur_blend_alpha > 0:
+                    tb_writer.add_scalar('anneal/blend_alpha', cur_blend_alpha, global_step)
+                if cfg is not None and getattr(cfg, 'map_attn_anneal', False):
+                    tb_writer.add_scalar('anneal/map_attn_weight',
+                                         loss_fn.loss_weights.get('map_attn', 0), global_step)
+            # Health metrics: log every 500 steps for finer tracking
+            if global_step % 500 == 0:
+                health = model.compute_health_metrics()
+                for hk, hv in health.items():
+                    tb_writer.add_scalar(f'health_step/{hk}', hv, global_step)
 
     wandb_epoch_metrics = {}
     epoch_metrics = {}
@@ -473,6 +535,9 @@ def main():
         trans_dropout=cfg.trans_dropout,
         use_ego_z_local=cfg.use_ego_z_local,
         use_sur_z_local=cfg.use_sur_z_local,
+        # V5 redesign
+        use_adaln=cfg.use_adaln,
+        use_a2a_rel_bias=cfg.use_a2a_rel_bias,
     ).to(device)
 
     train_loss = []
@@ -496,6 +561,7 @@ def main():
         'ego_pred': cfg.loss_ego_pred,
         'intent_ce': cfg.loss_intent_ce,
         'map_attn': cfg.loss_map_attn,
+        'z_aux': cfg.loss_z_aux,
     }
 
     # Potential field configuration
@@ -657,6 +723,16 @@ def main():
     Logger.log(f'  map_num_tokens: {model.map_num_tokens}')
     Logger.log(f'  sur_pred_dim: {model.sur_pred_dim}')
     Logger.log(f'  map_recrop: {model.map_recrop}')
+    Logger.log(f'  use_adaln: {model.use_adaln}')
+    Logger.log(f'  use_a2a_rel_bias: {model.use_a2a_rel_bias}')
+
+    # Action blending
+    Logger.log('\n[Action Blending]')
+    Logger.log(f'  action_blending: {cfg.action_blending}')
+    if cfg.action_blending:
+        Logger.log(f'  blend_start_step: {cfg.blend_start_step}')
+        Logger.log(f'  blend_anneal_steps: {cfg.blend_anneal_steps}')
+        Logger.log(f'  blend_target_alpha: {cfg.blend_target_alpha}')
 
     # Loss function parameters
     Logger.log('\n[Loss Function]')
@@ -746,15 +822,22 @@ def main():
                 Logger.log('KL ANNEALING FINISHED: resetting val loss tracking...')
                 min_eval_loss = float('inf')
 
-        # Map attention loss annealing: cosine decay from full weight to 0
+        # Map attention loss annealing: epoch-based (legacy) or step-based
+        # Step-based overrides epoch-based if map_attn_anneal_steps > 0
         if getattr(cfg, 'map_attn_anneal', False) and cfg.loss_map_attn > 0:
-            anneal_total = cfg.map_attn_anneal_epochs if cfg.map_attn_anneal_epochs > 0 else cfg.epochs
-            progress = min(epoch / max(anneal_total, 1), 1.0)
-            map_attn_w = cfg.loss_map_attn * 0.5 * (1 + math.cos(math.pi * progress))
-            loss_fn.loss_weights['map_attn'] = map_attn_w
-            Logger.log('Map attn weight %.6f...' % map_attn_w)
+            anneal_steps = getattr(cfg, 'map_attn_anneal_steps', 0)
+            if anneal_steps > 0:
+                # Step-based: computed inside run_one_epoch per batch
+                Logger.log('Map attn: step-based annealing (computed per batch)')
+            else:
+                # Legacy epoch-based
+                anneal_total = cfg.map_attn_anneal_epochs if cfg.map_attn_anneal_epochs > 0 else cfg.epochs
+                progress = min(epoch / max(anneal_total, 1), 1.0)
+                map_attn_w = cfg.loss_map_attn * 0.5 * (1 + math.cos(math.pi * progress))
+                loss_fn.loss_weights['map_attn'] = map_attn_w
+                Logger.log('Map attn weight %.6f...' % map_attn_w)
             if tb_writer is not None:
-                tb_writer.add_scalar('train/map_attn_weight', map_attn_w, epoch)
+                tb_writer.add_scalar('train/map_attn_weight', loss_fn.loss_weights.get('map_attn', 0), epoch)
 
         # train for one epoch
         start_t = time.time()
@@ -769,7 +852,8 @@ def main():
                                         current_epoch=epoch,
                                         tb_writer=tb_writer,
                                         global_step=global_step,
-                                        scheduler=scheduler)
+                                        scheduler=scheduler,
+                                        cfg=cfg)
         train_loss.append(mean_train_loss)
 
         # TensorBoard: log train metrics
@@ -778,6 +862,10 @@ def main():
                 tb_writer.add_scalar(f'train/{k}', v, epoch)
             if scheduler is not None:
                 tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
+            # Health monitoring metrics
+            health = model.compute_health_metrics()
+            for k, v in health.items():
+                tb_writer.add_scalar(f'health/{k}', v, epoch)
 
         # CSV: log train metrics
         if csv_train_writer is None:
