@@ -3,6 +3,8 @@ strive_env
 out
 wandb
 data/
+!data/race_scenarios/
+!data/race_scenarios/various_300_sample/
 *.zip
 
 # Byte-compiled / optimized / DLL files
