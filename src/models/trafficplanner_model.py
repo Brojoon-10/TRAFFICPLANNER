@@ -1615,7 +1615,7 @@ class TrafficPlannerModel(nn.Module):
                 is_first_layer = (layer_idx == 0)
                 x_out, extras = layer(
                     x, ego_mask, causal_mask, cur_map,
-                    return_a2a_output=(is_first_layer and t == FT - 1),
+                    return_a2a_output=is_first_layer,
                     return_a2s_weights=is_first_layer,
                     z_global=z if self.use_adaln else None,
                     agent_states=agent_states_for_bias,
@@ -1629,10 +1629,16 @@ class TrafficPlannerModel(nn.Module):
                     if 'sur_map_attn_weights' in extras and extras['sur_map_attn_weights'] is not None:
                         self._sur_map_attn_weights_outputs.append(extras['sur_map_attn_weights'][-1:])
 
-                    # A2A aux outputs (collect at last step for simplicity)
-                    if is_first_layer and t == FT - 1 and 'a2a_output' in extras:
-                        # We don't have full parallel a2a_output, skip sur/ego pred for blended mode
-                        pass
+                    # A2A aux outputs: collect last token at each step
+                    if 'a2a_output' in extras:
+                        a2a_out = extras['a2a_output']  # (1, cur_T, NA, D)
+                        a2a_last = a2a_out[:, -1, :, :]  # (1, NA, D)
+                        # sur_pred: ego tokens → predict sur delta
+                        self._sur_pred_outputs.append(
+                            self.sur_pred_head(a2a_last[:, ego_mask, :]).squeeze(0))  # (num_ego, 2)
+                        # ego_pred: sur tokens → predict ego delta
+                        self._ego_pred_outputs.append(
+                            self.ego_pred_head(a2a_last[:, ~ego_mask, :]).squeeze(0))  # (num_sur, 2)
 
                     last_ego_token = x[:, -1:, ego_mask, :]
                     ego_flat = last_ego_token.reshape(-1, self.trans_d_model)
