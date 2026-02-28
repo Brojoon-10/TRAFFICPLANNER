@@ -24,7 +24,7 @@ cur_file_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(cur_file_path, '..'))
 from datasets.map_env import NUSC_MAP_SIZES
 import datasets.nuscenes_utils as nutils
-from datasets.utils import MeanStdNormalizer, normalize_scene_graph, read_adv_scenes, NUSC_NORM_STATS, NUSC_VAL_SPLIT_200, NUSC_VAL_SPLIT_400
+from datasets.utils import MeanStdNormalizer, normalize_scene_graph, read_adv_scenes, NUSC_NORM_STATS, CARLA_NORM_STATS, NUSC_VAL_SPLIT_200, NUSC_VAL_SPLIT_400
 
 # This function is based on https://github.com/Khrylx/AgentFormer/blob/main/data/process_nuscenes.py#L20
 # Copyright 2021 Carnegie Mellon University
@@ -103,7 +103,7 @@ class FITDataset(Dataset):
         # self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'trafficplanner_normal_small_datasets')
         # self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'trafficplanner_tf')
         # self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'various_driving_data_20260224')
-        self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'various_500_sample')
+        self.scenario_path = os.path.join(cur_file_path, '..', '..', 'data', 'race_scenarios', 'various_300_sample')
 
 
         self.require_full_past = require_full_past
@@ -167,7 +167,8 @@ class FITDataset(Dataset):
 
         # build normalization info objects
         # state normalizer. states of (x, y, hx, hy, s, hdot)
-        ninfo = NUSC_NORM_STATS[tuple(sorted(self.categories))]
+        # ninfo = NUSC_NORM_STATS[tuple(sorted(self.categories))]
+        ninfo = CARLA_NORM_STATS[tuple(sorted(self.categories))]
         norm_mean = [ninfo['lscale'][0], ninfo['lscale'][0], ninfo['h'][0], ninfo['h'][0], ninfo['s'][0], ninfo['hdot'][0]]
         norm_std = [ninfo['lscale'][1], ninfo['lscale'][1], ninfo['h'][1], ninfo['h'][1], ninfo['s'][1], ninfo['hdot'][1]]
         self.normalizer = MeanStdNormalizer(torch.Tensor(norm_mean),
@@ -201,10 +202,16 @@ class FITDataset(Dataset):
 
             if sname not in scene2data:
                 scene2data[sname] = {}
-                scene2data[sname]['ego'] = {'traj': [], 'w': 1.73,
-                                            'l': 4.084, 'k': 'ego'}
-                scene2data[sname]['sur'] = {'traj': [], 'w': 1.73,
-                                            'l': 4.084, 'k': 'sur'}
+                # Lincoln MKZ 2017 bounding box (CARLA 실측):
+                # length=4.9017, width=2.1283
+                # scene2data[sname]['ego'] = {'traj': [], 'w': 1.73,
+                #                             'l': 4.084, 'k': 'ego'}
+                scene2data[sname]['ego'] = {'traj': [], 'w': 2.1283,
+                                            'l': 4.9017, 'k': 'ego'}
+                # scene2data[sname]['sur'] = {'traj': [], 'w': 1.73,
+                #                             'l': 4.084, 'k': 'sur'}
+                scene2data[sname]['sur'] = {'traj': [], 'w': 2.1283,
+                                            'l': 4.9017, 'k': 'sur'}
                 # print(torch.stack([scene['ego_quat'][3],scene['ego_quat'][0],scene['ego_quat'][1],scene['ego_quat'][2]],dim=0))
                 for i in range(len(scene['ego_quat'][0])):
                     rot = Quaternion(scene['ego_quat'][3][i],scene['ego_quat'][0][i],scene['ego_quat'][1][i],scene['ego_quat'][2][i]).rotation_matrix

@@ -194,6 +194,31 @@ NUSC_NORM_STATS = {
 }
 
 #
+# CARLA normalization statistics (300 scenarios, verify_norm_final.py)
+# Lincoln MKZ 2017, various_300_sample
+#
+CARLA_BIKE_PARAMS = {
+            'maxs' : BIKE_MAXS,
+            'maxhdot' : BIKE_MAXHDOT,
+            'dt' : 0.5,
+            'a_stats' : (0.416014, 2.176668),
+            'ddh_stats' : (0.001695, 0.335501)
+}
+
+CARLA_NORM_STATS = {
+    ('car', 'truck') : {
+        'l' : (4.9017, 0.001),   # Lincoln MKZ 2017 bbox, fixed (no variance)
+        'w' : (2.1283, 0.001),   # Lincoln MKZ 2017 bbox, fixed (no variance)
+        's' : (6.247646, 2.678157),
+        'h' : (0.0, 1.0),       # unit vector, no normalization
+        'hdot' : (0.048943, 0.234959),
+        'lscale' : (0.0, 15.0), # must have mean 0 (transform2frame subtraction)
+        'a' : (0.416014, 2.176668),
+        'ddh' : (0.001695, 0.335501)
+    }
+}
+
+#
 # nuScenes splits
 #
 

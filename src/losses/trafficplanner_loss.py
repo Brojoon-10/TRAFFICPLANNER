@@ -19,7 +19,7 @@ from losses.common import kl_normal, log_normal
 from utils.transforms import transform2frame
 from utils.torch import c2c
 import datasets.nuscenes_utils as nutils
-from datasets.utils import NUSC_NORM_STATS
+from datasets.utils import NUSC_NORM_STATS, CARLA_NORM_STATS
 
 ENV_COLL_THRESH = 0.05 # up to 5% of vehicle can be off the road
 VEH_COLL_THRESH = 0.02 # IoU must be over this to count as a collision for metric (not loss)
@@ -395,6 +395,7 @@ class TrafficPlannerLoss(nn.Module):
             'map_gt_steps': 6,
             'map_gt_decay_lambda': 0.3,  # exponential decay: w_t = exp(-λt) / Σexp(-λt)
             'intent_sigma': 0.5,         # Gaussian sigma for intent soft label
+            'intent_range': 2.0,         # prototype grid range in std-scaled units
             'map_gauss_sigma_d': 0.8,    # lateral Gaussian sigma (grid cells, ~2.1m)
         }
         if aux_cfg is not None:
@@ -570,8 +571,9 @@ class TrafficPlannerLoss(nn.Module):
                 num_intents = model.num_intents
                 n_acc = int(np.sqrt(num_intents))
                 n_yaw = num_intents // n_acc
-                acc_vals = torch.linspace(-1, 1, n_acc, device=device)
-                yaw_vals = torch.linspace(-1, 1, n_yaw, device=device)
+                intent_range = self.aux_cfg.get('intent_range', 1.0)
+                acc_vals = torch.linspace(-intent_range, intent_range, n_acc, device=device)
+                yaw_vals = torch.linspace(-intent_range, intent_range, n_yaw, device=device)
                 prototypes = torch.stack(torch.meshgrid(acc_vals, yaw_vals), dim=-1).reshape(-1, 2)
 
                 sigma = self.aux_cfg['intent_sigma']
@@ -585,7 +587,8 @@ class TrafficPlannerLoss(nn.Module):
                 past_speed_norm = scene_graph.past[:, -1, 4:5][ego_mask]
                 ego_prev_speed_raw = torch.cat([past_speed_norm * s_std + s_mean, ego_speed_raw[:, :-1]], dim=1)
                 raw_acc = (ego_speed_raw - ego_prev_speed_raw) / dt
-                ninfo = NUSC_NORM_STATS[('car', 'truck')]
+                # ninfo = NUSC_NORM_STATS[('car', 'truck')]
+                ninfo = CARLA_NORM_STATS[('car', 'truck')]
                 a_std = ninfo['a'][1]
                 ego_acc = raw_acc / a_std
 

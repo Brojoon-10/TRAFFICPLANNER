@@ -180,6 +180,8 @@ def parse_cfg():
                         help='Ego prediction auxiliary loss weight (Phase 1 only)')
     parser.add_argument('--loss_intent_ce', type=float, default=0.0,
                         help='Intent classification CE loss weight (Phase 2 only)')
+    parser.add_argument('--intent_range', type=float, default=1.0,
+                        help='Intent prototype grid range in std-scaled units (default: 1.0)')
     parser.add_argument('--loss_map_attn', type=float, default=0.0,
                         help='Map attention guidance loss weight')
     parser.add_argument('--map_gt_steps', type=int, default=6,
@@ -600,6 +602,7 @@ def main():
         'map_gt_steps': getattr(cfg, 'map_gt_steps', 6),
         'map_gt_decay_lambda': getattr(cfg, 'map_gt_decay_lambda', 0.3),
         'intent_sigma': getattr(cfg, 'intent_sigma', 0.5),
+        'intent_range': getattr(cfg, 'intent_range', 1.0),
     }
 
     loss_fn = TrafficPlannerLoss(
@@ -711,8 +714,10 @@ def main():
     model.set_normalizer(train_dataset.get_state_normalizer())
     model.set_att_normalizer(train_dataset.get_att_normalizer())
     if cfg.model_output_bicycle:
-        from datasets.utils import NUSC_BIKE_PARAMS
-        model.set_bicycle_params(NUSC_BIKE_PARAMS)
+        # from datasets.utils import NUSC_BIKE_PARAMS
+        # model.set_bicycle_params(NUSC_BIKE_PARAMS)
+        from datasets.utils import CARLA_BIKE_PARAMS
+        model.set_bicycle_params(CARLA_BIKE_PARAMS)
 
     #
     # Print ACTUAL applied configuration from initialized objects

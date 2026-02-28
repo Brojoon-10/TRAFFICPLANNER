@@ -26,7 +26,7 @@ from torch_geometric.data import DataLoader as GraphDataLoader
 from datasets.nuscenes_utils import normalize_scene_graph
 from datasets.fit_dataset import FITDataset
 from datasets.fit_map_env import FITMapEnv
-from datasets.utils import NUSC_NORM_STATS
+from datasets.utils import NUSC_NORM_STATS, CARLA_NORM_STATS
 from utils.common import dict2obj, mkdir
 from utils.config import get_parser, add_base_args
 from utils.torch import get_device
@@ -65,6 +65,7 @@ def parse_cfg():
     # Intent params
     parser.add_argument('--num_intents', type=int, default=9)
     parser.add_argument('--intent_sigma', type=float, default=0.5)
+    parser.add_argument('--intent_range', type=float, default=2.0)
     # Map attn soft label params
     parser.add_argument('--map_gt_steps', type=int, default=6)
     parser.add_argument('--map_gt_decay_lambda', type=float, default=0.3)
@@ -121,7 +122,7 @@ def world_to_crop_pixel(pos_world, center_pos, bounds, L, W):
 # =================================================================
 
 def compute_intent_gt_labels(ego_past_last, ego_future, state_normalizer,
-                             dt=0.5, num_intents=9, sigma=0.5, device='cpu'):
+                             dt=0.5, num_intents=9, sigma=0.5, intent_range=2.0, device='cpu'):
     """
     Compute GT intent soft labels from (acc, yaw_rate).
 
@@ -137,7 +138,8 @@ def compute_intent_gt_labels(ego_past_last, ego_future, state_normalizer,
     s_std = state_normalizer.std_vals[4].to(device)
     hdot_mean = state_normalizer.mean_vals[5].to(device)
     hdot_std = state_normalizer.std_vals[5].to(device)
-    ninfo = NUSC_NORM_STATS[('car', 'truck')]
+    # ninfo = NUSC_NORM_STATS[('car', 'truck')]
+    ninfo = CARLA_NORM_STATS[('car', 'truck')]
     a_std_norm = ninfo['a'][1]
     hdot_std_norm = ninfo['hdot'][1]
 
@@ -152,11 +154,11 @@ def compute_intent_gt_labels(ego_past_last, ego_future, state_normalizer,
     raw_yaw_rate = ego_future[:, :, 5] * hdot_std + hdot_mean  # (N, FT)
     ego_yaw = raw_yaw_rate / hdot_std_norm  # (N, FT)
 
-    # Build prototypes: 3x3 grid in [-1, 1]
+    # Build prototypes: 3x3 grid in [-intent_range, intent_range]
     n_acc = int(np.sqrt(num_intents))
     n_yaw = num_intents // n_acc
-    acc_vals = torch.linspace(-1, 1, n_acc, device=device)
-    yaw_vals = torch.linspace(-1, 1, n_yaw, device=device)
+    acc_vals = torch.linspace(-intent_range, intent_range, n_acc, device=device)
+    yaw_vals = torch.linspace(-intent_range, intent_range, n_yaw, device=device)
     prototypes = torch.stack(torch.meshgrid(acc_vals, yaw_vals), dim=-1).reshape(-1, 2)
 
     # Gaussian softmax over prototypes
@@ -331,18 +333,22 @@ def apply_potential_weight(soft_label_grid, map_raster_29, k_solid=0.8, k_dashed
 # Visualization
 # =================================================================
 
-def visualize_intent_gt(intent_labels, ego_acc, ego_yaw, out_path, agent_idx=0):
+def visualize_intent_gt(intent_labels, ego_acc, ego_yaw, out_path, agent_idx=0,
+                        intent_range=2.0):
     """
     Visualize intent GT soft labels as 3x3 heatmaps per timestep.
 
     :param intent_labels: (FT, 9) soft labels
     :param ego_acc: (FT,) normalized acceleration
     :param ego_yaw: (FT,) normalized yaw rate
+    :param intent_range: prototype range (default 2.0)
     """
     FT = intent_labels.shape[0]
     show_steps = [0, 2, 4, 6, 8, 10, 11]
     show_steps = [s for s in show_steps if s < FT]
     n_cols = len(show_steps)
+    r = intent_range
+    half_cell = r / 3.0  # half cell width for extent
 
     fig, axes = plt.subplots(2, n_cols, figsize=(3 * n_cols, 7),
                              gridspec_kw={'height_ratios': [3, 1]})
@@ -351,21 +357,24 @@ def visualize_intent_gt(intent_labels, ego_acc, ego_yaw, out_path, agent_idx=0):
         # Top row: 3x3 heatmap
         ax = axes[0, panel_idx]
         grid = intent_labels[t].reshape(3, 3)
+        ext = r + half_cell
         im = ax.imshow(grid, cmap='YlOrRd', vmin=0, vmax=1.0,
-                       origin='lower', extent=[-1.5, 1.5, -1.5, 1.5])
+                       origin='lower', extent=[-ext, ext, -ext, ext])
         # Mark GT position
         ax.plot(ego_yaw[t], ego_acc[t], 'k*', markersize=12, markeredgecolor='white',
                 markeredgewidth=0.8)
-        # Grid labels
-        ax.set_xticks([-1, 0, 1])
-        ax.set_yticks([-1, 0, 1])
-        ax.set_xticklabels(['L', '0', 'R'], fontsize=8)
+        # Grid labels — hdot>0 = left turn, so yaw+ = L (right side of x-axis)
+        ax.set_xticks([-r, 0, r])
+        ax.set_yticks([-r, 0, r])
+        ax.set_xticklabels(['R', '0', 'L'], fontsize=8)
         ax.set_yticklabels(['Dec', '0', 'Acc'], fontsize=8)
         ax.set_title(f't={t*0.5:.1f}s\nacc={ego_acc[t]:.2f} yaw={ego_yaw[t]:.2f}',
                      fontsize=8)
         for i in range(3):
             for j in range(3):
-                ax.text(j - 1, i - 1, f'{grid[i, j]:.2f}', ha='center', va='center',
+                cx = (j - 1) * r
+                cy = (i - 1) * r
+                ax.text(cx, cy, f'{grid[i, j]:.2f}', ha='center', va='center',
                         fontsize=7, color='black' if grid[i, j] < 0.5 else 'white')
 
         # Bottom row: acc/yaw time series up to this step
@@ -374,7 +383,7 @@ def visualize_intent_gt(intent_labels, ego_acc, ego_yaw, out_path, agent_idx=0):
         ax2.plot(np.arange(t+1) * 0.5, ego_yaw[:t+1], 'r-o', markersize=2, label='yaw')
         ax2.axhline(0, color='gray', linewidth=0.5, linestyle='--')
         ax2.set_xlim(-0.1, FT * 0.5)
-        ax2.set_ylim(-2.5, 2.5)
+        ax2.set_ylim(-r - 1, r + 1)
         ax2.set_xlabel('time(s)', fontsize=7)
         ax2.tick_params(labelsize=6)
         if panel_idx == 0:
@@ -622,7 +631,9 @@ def main():
                 intent_labels, ego_acc, ego_yaw = compute_intent_gt_labels(
                     ego_past_last, ego_future_norm, state_normalizer,
                     dt=cfg.dt, num_intents=cfg.num_intents,
-                    sigma=cfg.intent_sigma, device=device
+                    sigma=cfg.intent_sigma,
+                    intent_range=getattr(cfg, 'intent_range', 2.0),
+                    device=device
                 )
                 # Back to unnormalized
                 normalize_scene_graph(scene_graph, state_normalizer, att_normalizer, unnorm=True)
@@ -631,7 +642,8 @@ def main():
                     f'scene{i:04d}_ego{ego_local_idx}_intent_gt.png')
                 visualize_intent_gt(
                     intent_labels[0], ego_acc[0], ego_yaw[0],
-                    intent_path, agent_idx=ego_global_idx
+                    intent_path, agent_idx=ego_global_idx,
+                    intent_range=getattr(cfg, 'intent_range', 2.0)
                 )
 
                 # ========================================

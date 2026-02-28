@@ -456,8 +456,10 @@ def main():
     model.set_normalizer(test_dataset.get_state_normalizer())
     model.set_att_normalizer(test_dataset.get_att_normalizer())
     if cfg.model_output_bicycle:
-        from datasets.utils import NUSC_BIKE_PARAMS
-        model.set_bicycle_params(NUSC_BIKE_PARAMS)
+        # from datasets.utils import NUSC_BIKE_PARAMS
+        # model.set_bicycle_params(NUSC_BIKE_PARAMS)
+        from datasets.utils import CARLA_BIKE_PARAMS
+        model.set_bicycle_params(CARLA_BIKE_PARAMS)
 
     # run evaluations on test data
     model.eval()
