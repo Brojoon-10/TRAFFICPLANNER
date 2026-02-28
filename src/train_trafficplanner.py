@@ -109,6 +109,8 @@ def parse_cfg():
     parser.add_argument('--loss_kl', type=float, default=0.004, help='KL loss weight')
     parser.add_argument('--kl_anneal_end', type=int, default=20, help='If given, uses KL loss annealing and will reach full weight at this epoch.')
     parser.add_argument('--loss_recon', type=float, default=1.0, help='Reconstruction loss weight')
+    parser.add_argument('--recon_pos_weight', type=float, default=1.0,
+                        help='Position (x,y) weight in recon_loss (compensates normalization std)')
     parser.add_argument('--loss_veh_coll_prior', type=float, default=0.05, help='Vehicle collision loss weight for sample from prior')
     parser.add_argument('--loss_env_coll_prior', type=float, default=0.1, help='Map collision loss weight for sample from prior')
 
@@ -196,6 +198,10 @@ def parse_cfg():
                         help='Enable Adaptive Layer Normalization (z_global injection per layer)')
     parser.add_argument('--use_a2a_rel_bias', type=str2bool, default=False,
                         help='Enable A2A relative physical bias (8-feature MLP → attention bias)')
+    parser.add_argument('--use_z_cross_attn', type=str2bool, default=False,
+                        help='Enable z_global cross-attention (multi-token decompose)')
+    parser.add_argument('--num_z_tokens', type=int, default=4,
+                        help='Number of z tokens for z_global cross-attention')
     parser.add_argument('--loss_z_aux', type=float, default=0.0,
                         help='z_global auxiliary decoder loss weight')
     parser.add_argument('--action_blending', type=str2bool, default=False,
@@ -422,7 +428,6 @@ def main():
     cfg, cfg_dict = parse_cfg()
 
     print(f'=== TrafficPlanner Training ===')
-    print(f'Phase: {cfg.phase}')
     print(f'past_len: {cfg.past_len}')
     print(f'future_len: {cfg.future_len}')
     print(f'z_local_size: {cfg.z_local_size}')
@@ -538,6 +543,8 @@ def main():
         # V5 redesign
         use_adaln=cfg.use_adaln,
         use_a2a_rel_bias=cfg.use_a2a_rel_bias,
+        use_z_cross_attn=getattr(cfg, 'use_z_cross_attn', False),
+        num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
     ).to(device)
 
     train_loss = []
@@ -605,7 +612,8 @@ def main():
         use_veh_potential=cfg.use_veh_potential,
         potential_cfg=potential_cfg,
         sparsity_cfg=sparsity_cfg,
-        aux_cfg=aux_cfg
+        aux_cfg=aux_cfg,
+        recon_pos_weight=getattr(cfg, 'recon_pos_weight', 1.0),
     ).to(device)
 
     Logger.log('Num model params: %d' % (count_params(model)))
@@ -695,7 +703,7 @@ def main():
                    f'max={lr_max}, min={lr_min}, total={total_steps} steps')
 
     # Freeze z_global if requested (for custom training scenarios)
-    if cfg.freeze_z_global and cfg.phase == 1:
+    if cfg.freeze_z_global:
         model.freeze_z_global()
         Logger.log('Frozen z_global encoder (manual override)')
 
@@ -725,6 +733,7 @@ def main():
     Logger.log(f'  map_recrop: {model.map_recrop}')
     Logger.log(f'  use_adaln: {model.use_adaln}')
     Logger.log(f'  use_a2a_rel_bias: {model.use_a2a_rel_bias}')
+    Logger.log(f'  use_z_cross_attn: {model.use_z_cross_attn}')
 
     # Action blending
     Logger.log('\n[Action Blending]')
@@ -736,7 +745,6 @@ def main():
 
     # Loss function parameters
     Logger.log('\n[Loss Function]')
-    Logger.log(f'  phase: {loss_fn.phase}')
     Logger.log(f'  use_sparse_loss: {loss_fn.use_sparse_loss}')
     Logger.log(f'  use_potential_loss: {loss_fn.use_potential_loss}')
     Logger.log(f'  use_veh_potential: {loss_fn.use_veh_potential}')
@@ -775,8 +783,8 @@ def main():
     Logger.log('=' * 80)
     Logger.log('')
 
-    # KL loss annealing (Phase 1 only)
-    use_kl_anneal = cfg.kl_anneal_end is not None and cfg.phase == 1
+    # KL loss annealing
+    use_kl_anneal = cfg.kl_anneal_end is not None
     if use_kl_anneal:
         assert cfg.kl_anneal_end > 0
         Logger.log('Using KL annealing...')
@@ -809,7 +817,7 @@ def main():
     # global_step is initialized above (from checkpoint or 0)
 
     for epoch in range(ckpt_epoch, cfg.epochs):
-        Logger.log('Starting epoch %d (Phase %d)...' % (epoch, cfg.phase))
+        Logger.log('Starting epoch %d...' % epoch)
 
         # compute loss weights with KL annealing (Phase 1 only)
         if use_kl_anneal:
@@ -877,7 +885,7 @@ def main():
         csv_train_file.flush()
         ax1.clear()
         ax1.plot(train_loss)
-        ax1.set_title(f"Train Loss (Phase {cfg.phase})")
+        ax1.set_title("Train Loss")
         plt.savefig(f'loss_{cfg.loss_plot_suffix}.jpg', format='jpeg')
 
         # lot of excess memory used by pygeometric
@@ -915,13 +923,13 @@ def main():
                 print(f'mean_eval_loss = ', mean_eval_loss)
                 ax2.clear()
                 ax2.plot(valid_loss)
-                ax2.set_title(f"Validation Loss (Phase {cfg.phase})")
+                ax2.set_title("Validation Loss")
                 plt.savefig(f'loss_{cfg.loss_plot_suffix}.jpg', format='jpeg')
 
                 if mean_eval_loss < min_eval_loss:
                     Logger.log('Lowest eval loss so far! Saving checkpoint...')
                     min_eval_loss = mean_eval_loss
-                    save_file = os.path.join(ckpts_path, f'best_eval_model_phase{cfg.phase}.pth')
+                    save_file = os.path.join(ckpts_path, 'best_eval_model.pth')
                     save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=global_step)
                     if use_wandb:
                         wandb.save(save_file)
@@ -932,7 +940,7 @@ def main():
             Logger.log('Saving checkpoint...')
             save_file = os.path.join(ckpts_path, 'epoch_%08d_model.pth' % (epoch))
             save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=global_step)
-            save_file = os.path.join(ckpts_path, f'latest_model_phase{cfg.phase}.pth')
+            save_file = os.path.join(ckpts_path, 'latest_model.pth')
             save_state(save_file, model, optimizer, cur_epoch=epoch, min_val_loss=min_eval_loss, global_step=global_step)
             if use_wandb:
                 wandb.save(save_file)

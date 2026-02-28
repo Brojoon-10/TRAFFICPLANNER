@@ -198,18 +198,21 @@ class SharedKVAttention(nn.Module):
 
 class TransDecoderLayer(nn.Module):
     """
-    One Transformer decoder layer: A2T → A2A → A2S → FFN.
+    One Transformer decoder layer: A2T → A2A → A2Z → A2S → FFN.
     A2T: self-attention (shared, ego/sur 구분 없음)
     A2A: K/V shared + Q/O separate (ego/sur)
+    A2Z: z_global cross-attention (z→multi-token decompose, ego/sur separate Q/O)
     A2S: K/V shared + Q/O separate (ego/sur), map cross-attention
     FFN: ego/sur fully separate
     """
     def __init__(self, d_model, nhead, ffn_dim, map_token_dim, dropout=0.1,
-                 use_adaln=False, z_size=32, use_a2a_rel_bias=False):
+                 use_adaln=False, z_size=32, use_a2a_rel_bias=False,
+                 use_z_cross_attn=False, num_z_tokens=4):
         super().__init__()
         self.d_model = d_model
         self.use_adaln = use_adaln
         self.use_a2a_rel_bias = use_a2a_rel_bias
+        self.use_z_cross_attn = use_z_cross_attn
 
         # A2T: standard self-attention
         if use_adaln:
@@ -229,6 +232,26 @@ class TransDecoderLayer(nn.Module):
         if use_a2a_rel_bias:
             self.a2a_rel_bias_module = A2ARelativeBias(
                 num_features=8, nhead=nhead, hidden_dim=32)
+
+        # A2Z: z_global cross-attention (z → multi-token decompose)
+        if use_z_cross_attn:
+            self.num_z_tokens = num_z_tokens
+            if use_adaln:
+                self.a2z_norm = AdaLN(d_model, z_size)
+            else:
+                self.a2z_norm = nn.LayerNorm(d_model)
+            # z_global → num_z_tokens × d_model
+            self.z_token_proj = nn.Linear(z_size, num_z_tokens * d_model)
+            # K/V for z tokens
+            self.a2z_k_proj = nn.Linear(d_model, d_model)
+            self.a2z_v_proj = nn.Linear(d_model, d_model)
+            # Ego/Sur separate Q/O
+            self.a2z_ego_q_proj = nn.Linear(d_model, d_model)
+            self.a2z_ego_o_proj = nn.Linear(d_model, d_model)
+            self.a2z_sur_q_proj = nn.Linear(d_model, d_model)
+            self.a2z_sur_o_proj = nn.Linear(d_model, d_model)
+            self.a2z_scale = (d_model // nhead) ** -0.5
+            self.a2z_dropout = nn.Dropout(dropout)
 
         # A2S: shared K/V (map) + ego/sur separate Q/O
         if use_adaln:
@@ -331,6 +354,62 @@ class TransDecoderLayer(nn.Module):
 
         return output, ego_attn_w, sur_attn_w
 
+    def _a2z_attention(self, query_tokens, z_global, ego_mask):
+        """
+        A2Z: z_global cross-attention with multi-token decomposition.
+        :param query_tokens: (B*T, N, D)
+        :param z_global: (N, z_size) — per-agent z_global
+        :param ego_mask: (N,) bool
+        :return: output (B*T, N, D)
+        """
+        BT, N, D = query_tokens.shape
+        nhead = self.a2s_nhead  # same nhead as other attention blocks
+        head_dim = D // nhead
+
+        # Decompose z_global into multiple tokens: (N, z_size) → (N, num_z_tokens, D)
+        z_tokens = self.z_token_proj(z_global).view(N, self.num_z_tokens, D)
+
+        # Project K/V from z tokens
+        z_k = self.a2z_k_proj(z_tokens)  # (N, num_z_tokens, D)
+        z_v = self.a2z_v_proj(z_tokens)  # (N, num_z_tokens, D)
+
+        ego_idx = ego_mask.nonzero(as_tuple=True)[0]
+        sur_idx = (~ego_mask).nonzero(as_tuple=True)[0]
+
+        output = query_tokens.new_zeros(BT, N, D)
+
+        def _do_a2z(agent_idx, q_proj, o_proj):
+            if agent_idx.numel() == 0:
+                return
+            # Q from agent tokens: (BT, N_sel, D)
+            q_in = query_tokens[:, agent_idx]
+            q = q_proj(q_in).view(BT, agent_idx.numel(), nhead, head_dim).transpose(1, 2)
+            # (BT, nhead, N_sel, head_dim)
+
+            # K/V from z tokens: (N_sel, num_z_tokens, D) → broadcast over BT
+            k_sel = z_k[agent_idx]  # (N_sel, num_z_tokens, D)
+            v_sel = z_v[agent_idx]
+            k_sel = k_sel.view(agent_idx.numel(), self.num_z_tokens, nhead, head_dim)
+            k_sel = k_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
+            # (BT, nhead, N_sel, num_z_tokens, head_dim)
+            v_sel = v_sel.view(agent_idx.numel(), self.num_z_tokens, nhead, head_dim)
+            v_sel = v_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
+
+            # Attention: (BT, nhead, N_sel, 1, head_dim) @ (BT, nhead, N_sel, head_dim, num_z_tokens)
+            q = q.unsqueeze(3)  # (BT, nhead, N_sel, 1, head_dim)
+            scores = torch.matmul(q, k_sel.transpose(-2, -1)) * self.a2z_scale
+            # (BT, nhead, N_sel, 1, num_z_tokens)
+            attn_w = F.softmax(scores, dim=-1)
+            attn_w = self.a2z_dropout(attn_w)
+            attn_out = torch.matmul(attn_w, v_sel)  # (BT, nhead, N_sel, 1, head_dim)
+            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().view(BT, agent_idx.numel(), D)
+            output[:, agent_idx] = o_proj(attn_out)
+
+        _do_a2z(ego_idx, self.a2z_ego_q_proj, self.a2z_ego_o_proj)
+        _do_a2z(sur_idx, self.a2z_sur_q_proj, self.a2z_sur_o_proj)
+
+        return output
+
     def forward(self, x, ego_mask, causal_mask, map_tokens,
                 return_a2a_output=False, return_a2s_weights=False,
                 z_global=None, agent_states=None):
@@ -382,6 +461,16 @@ class TransDecoderLayer(nn.Module):
             extras['a2a_output'] = x_a2a.view(B, T, N, D)
 
         x = x_a2a.view(B, T, N, D)
+
+        # --- A2Z: z_global cross-attention ---
+        if self.use_z_cross_attn and z_global is not None:
+            x_a2z = x.reshape(B * T, N, D)
+            if self.use_adaln:
+                x_norm = self.a2z_norm(x_a2z, z_global.unsqueeze(0))
+            else:
+                x_norm = self.a2z_norm(x_a2z)
+            a2z_out = self._a2z_attention(x_norm, z_global, ego_mask)
+            x = (x_a2z + a2z_out).view(B, T, N, D)
 
         # --- A2S: map cross-attention (shared K/V + ego/sur Q/O) ---
         x_a2s = x.reshape(B * T, N, D)
@@ -543,6 +632,8 @@ class TrafficPlannerModel(nn.Module):
                  # V5 redesign params
                  use_adaln=False,
                  use_a2a_rel_bias=False,
+                 use_z_cross_attn=False,
+                 num_z_tokens=4,
                  ):
         super(TrafficPlannerModel, self).__init__()
         self.normalizer = self.att_normalizer = None
@@ -596,7 +687,18 @@ class TrafficPlannerModel(nn.Module):
         self.map_conv_early = nn.Sequential(*early_layers)
         self.map_token_ch = conv_filter_list_full[3]  # 64
         self.map_num_tokens = self.map_token_spatial * self.map_token_spatial
-        print(f'Map tokens: {self.map_token_spatial}x{self.map_token_spatial} = {self.map_num_tokens} tokens, ch={self.map_token_ch}')
+
+        # Receptive field params for soft label coordinate mapping
+        # token[m] RF center pixel = m * map_rf_stride + map_rf_offset
+        _rf_stride = 1
+        _rf_offset = 0.0
+        for lidx in range(3):
+            _rf_offset += (conv_kernel_list[lidx] - 1) / 2.0 * _rf_stride
+            _rf_stride *= conv_stride_list[lidx]
+        self.map_rf_stride = _rf_stride
+        self.map_rf_offset = _rf_offset
+
+        print(f'Map tokens: {self.map_token_spatial}x{self.map_token_spatial} = {self.map_num_tokens} tokens, ch={self.map_token_ch}, RF stride={_rf_stride}, offset={_rf_offset}')
 
         # conv4-6: late layers (for encoder 64-dim feature)
         late_layers = []
@@ -679,6 +781,7 @@ class TrafficPlannerModel(nn.Module):
         self.use_sur_z_local = use_sur_z_local
         self.use_adaln = use_adaln
         self.use_a2a_rel_bias = use_a2a_rel_bias
+        self.use_z_cross_attn = use_z_cross_attn
 
         # 1. Interaction GCN: per-step agent interaction -> token features (64dim)
         interaction_gcn_in = self.state_size + self.att_feat_size + self.NC
@@ -698,7 +801,9 @@ class TrafficPlannerModel(nn.Module):
             TransDecoderLayer(trans_d_model, trans_nhead, trans_ffn_dim,
                               self.map_token_ch, trans_dropout,
                               use_adaln=use_adaln, z_size=self.z_size,
-                              use_a2a_rel_bias=use_a2a_rel_bias)
+                              use_a2a_rel_bias=use_a2a_rel_bias,
+                              use_z_cross_attn=use_z_cross_attn,
+                              num_z_tokens=num_z_tokens)
             for _ in range(trans_num_layers)
         ])
 
@@ -771,6 +876,9 @@ class TrafficPlannerModel(nn.Module):
                 teacher_forcing=False,
                 current_epoch=0,
                 blend_alpha=0.0):
+        # Reset per-step pooled raster (will be set by _recompute_map_tokens_batched if map_recrop)
+        self._map_raster_pooled_steps = None
+
         # Map encoding (encoder-level 64dim + decoder-level tokens)
         scene_graph.pos = scene_graph.past[:, -1, :4]
         map_feat, map_tokens = self.encode_map(scene_graph, map_idx, map_env, return_tokens=True)
@@ -1088,6 +1196,12 @@ class TrafficPlannerModel(nn.Module):
         bsize = NA if NS is None else NA * NS
         if NS is not None:
             map_obs = map_obs.reshape(bsize, map_obs.size(-3), map_obs.size(-2), map_obs.size(-1))
+
+        # Pool raw raster to token grid for potential-weighted soft labels
+        # map_obs: (bsize, C, 256, 256) → (bsize, C, 29, 29)
+        with torch.no_grad():
+            self._map_raster_pooled = nn.functional.adaptive_avg_pool2d(
+                map_obs, self.map_token_spatial)  # (bsize, C, 29, 29)
 
         # Early conv (conv1-3): spatial tokens
         map_early = self.map_conv_early(map_obs)  # (bsize, ch, H', W')
@@ -2115,6 +2229,14 @@ class TrafficPlannerModel(nn.Module):
         map_early = self.map_conv_early(map_obs)  # (NA*T, ch, H', W')
         map_tokens = map_early.flatten(2).permute(0, 2, 1)  # (NA*T, num_tokens, ch)
 
+        # Pool raw raster per step for potential-weighted soft labels
+        # map_obs: (NA*T, C, 256, 256) → (NA*T, C, 29, 29) → (T, NA, C, 29, 29)
+        with torch.no_grad():
+            pooled = nn.functional.adaptive_avg_pool2d(map_obs, self.map_token_spatial)
+            self._map_raster_pooled_steps = pooled.reshape(
+                NA, T, pooled.size(1), self.map_token_spatial, self.map_token_spatial
+            ).permute(1, 0, 2, 3, 4)  # (T, NA, C, 29, 29)
+
         # Reshape: (NA, T, num_tokens, ch) → (T, NA, num_tokens, ch)
         map_tokens = map_tokens.reshape(NA, T, -1, map_tokens.shape[-1])
         map_tokens = map_tokens.permute(1, 0, 2, 3)  # (T, NA, num_tokens, ch)
@@ -2319,6 +2441,17 @@ class TrafficPlannerModel(nn.Module):
             if len(self._sur_map_attn_weights_outputs) == 0:
                 return None
             return torch.cat(self._sur_map_attn_weights_outputs, dim=0)  # (FT, N_sur, num_tokens)
+        return None
+
+    def get_map_raster_pooled(self):
+        """Get pooled raw raster for potential-weighted soft labels.
+        Initial crop: (NA, C, grid, grid).
+        Per-step (map_recrop): (T, NA, C, grid, grid).
+        Returns whichever is available, preferring per-step."""
+        if hasattr(self, '_map_raster_pooled_steps') and self._map_raster_pooled_steps is not None:
+            return self._map_raster_pooled_steps  # (T, NA, C, 29, 29)
+        if hasattr(self, '_map_raster_pooled') and self._map_raster_pooled is not None:
+            return self._map_raster_pooled  # (NA, C, 29, 29)
         return None
 
     def get_map_attn_weights(self):

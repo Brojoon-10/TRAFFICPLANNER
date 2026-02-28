@@ -367,7 +367,8 @@ class TrafficPlannerLoss(nn.Module):
                     potential_cfg=None,
                     sparsity_cfg=None,
                     ego_only_recon=False,
-                    aux_cfg=None):
+                    aux_cfg=None,
+                    recon_pos_weight=1.0):
         """
         :param loss_weights: dict of weightings for loss terms
         :param aux_cfg: dict of auxiliary loss config (optional)
@@ -386,6 +387,7 @@ class TrafficPlannerLoss(nn.Module):
         self.use_potential_loss = use_potential_loss
         self.use_veh_potential = use_veh_potential
         self.ego_only_recon = ego_only_recon
+        self.recon_pos_weight = recon_pos_weight
 
         # Auxiliary loss config
         default_aux_cfg = {
@@ -645,6 +647,10 @@ class TrafficPlannerLoss(nn.Module):
         Transformer training: ego_attn is (B*T_total, N_ego, num_tokens) from Layer 0 A2S
         We only use future timesteps (PT:PT+FT) for loss.
 
+        When pooled raster is available, soft labels are weighted by drivable area
+        potential: non-drivable and lane-line tokens get reduced weight, encouraging
+        attention to focus on safe, drivable regions.
+
         :return: scalar loss or None
         """
         device = gt_future.device
@@ -661,15 +667,40 @@ class TrafficPlannerLoss(nn.Module):
         t_arr = np.arange(map_gt_steps, dtype=np.float64)
         map_gt_weights = np.exp(-decay_lambda * t_arr)
         map_gt_weights = (map_gt_weights / map_gt_weights.sum()).tolist()
-        grid_size = model.map_token_spatial  # 29
-        num_tokens = grid_size * grid_size  # 841
+        grid_size = model.map_token_spatial
+        num_tokens = grid_size * grid_size
 
         bounds = [-17.0, -38.5, 60.0, 38.5]
         pix_size = model.map_obs_size_pix  # 256
-        m2pix_l = pix_size / (bounds[2] - bounds[0])
-        m2pix_w = pix_size / (bounds[3] - bounds[1])
-        pix2grid_l = grid_size / pix_size
-        pix2grid_w = grid_size / pix_size
+        rf_stride = model.map_rf_stride
+        rf_offset = model.map_rf_offset
+
+        # Compute per-agent drivable potential weight for soft labels
+        # Per-step raster: (T, NA, C, 29, 29) or initial: (NA, C, 29, 29)
+        raster_pooled_raw = model.get_map_raster_pooled()
+        raster_per_step = (raster_pooled_raw is not None and raster_pooled_raw.dim() == 5)
+        k_solid = 0.0  # disabled: avg pool dilutes thin lines too much
+        k_dashed = 0.0
+
+        PT = model.PT if hasattr(model, 'PT') else 4
+
+        def _get_drivable_weight(agent_mask, step_idx):
+            """Get flattened drivable weight (N_sel, 841) for given agents at given step."""
+            if raster_pooled_raw is None:
+                return None
+            if raster_per_step:
+                # (T_total, NA, C, 29, 29) — T_total = PT + FT, step_idx is future index
+                rp = raster_pooled_raw[PT + step_idx]  # (NA, C, 29, 29)
+            else:
+                # (NA, C, 29, 29) — same for all steps
+                rp = raster_pooled_raw
+            rp_sel = rp[agent_mask]  # (N_sel, C, 29, 29)
+            drivable = rp_sel[:, 0]
+            solid = rp_sel[:, 1] if rp_sel.size(1) > 1 else torch.zeros_like(drivable)
+            dashed = rp_sel[:, 2] if rp_sel.size(1) > 2 else torch.zeros_like(drivable)
+            w = drivable * (1.0 - k_solid * solid) * (1.0 - k_dashed * dashed)
+            w = w.clamp(min=0.01)
+            return w.reshape(rp_sel.size(0), -1)  # (N_sel, 841)
 
         total_loss = torch.tensor(0.0, device=device)
         count = 0
@@ -690,10 +721,9 @@ class TrafficPlannerLoss(nn.Module):
                 # AR mode: (FT, N_ego, num_tokens) — already future-only
                 ego_attn_future = ego_attn_raw  # (FT, N_ego, num_tokens)
 
-            for t in range(FT):
-                remaining = min(map_gt_steps, FT - t - 1)
-                if remaining <= 0:
-                    continue
+            max_t = FT - map_gt_steps  # only steps with full lookahead
+            for t in range(max_t):
+                remaining = map_gt_steps
 
                 ego_attn_dist = ego_attn_future[t]  # (N_ego, num_tokens)
                 if t == 0:
@@ -703,10 +733,15 @@ class TrafficPlannerLoss(nn.Module):
 
                 ego_soft_label = self._make_soft_label(
                     ego_frame, gt_future[ego_mask], t, remaining,
-                    map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
-                    pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
+                    map_gt_weights, normalizer, bounds, pix_size,
+                    rf_stride, rf_offset, grid_size, num_tokens, device)
 
                 if ego_soft_label is not None:
+                    # Apply drivable potential weighting per step
+                    ego_dw = _get_drivable_weight(ego_mask, t)
+                    if ego_dw is not None:
+                        ego_soft_label = ego_soft_label * ego_dw
+                        ego_soft_label = ego_soft_label / (ego_soft_label.sum(dim=1, keepdim=True) + 1e-8)
                     ego_kl = self._kl_with_epsilon(ego_soft_label, ego_attn_dist)
                     total_loss = total_loss + ego_kl
                     count += 1
@@ -722,10 +757,8 @@ class TrafficPlannerLoss(nn.Module):
                     # AR mode
                     sur_attn_future = sur_attn_raw  # (FT, N_sur, num_tokens)
 
-                for t in range(FT):
-                    remaining = min(map_gt_steps, FT - t - 1)
-                    if remaining <= 0:
-                        continue
+                for t in range(max_t):
+                    remaining = map_gt_steps
                     sur_attn_dist = sur_attn_future[t]
                     if t == 0:
                         sur_frame = scene_graph.past[:, -1, :4][~ego_mask]
@@ -733,9 +766,14 @@ class TrafficPlannerLoss(nn.Module):
                         sur_frame = gt_future[~ego_mask][:, t - 1, :4]
                     sur_soft_label = self._make_soft_label(
                         sur_frame, gt_future[~ego_mask], t, remaining,
-                        map_gt_weights, normalizer, bounds, m2pix_l, m2pix_w,
-                        pix2grid_l, pix2grid_w, grid_size, num_tokens, device)
+                        map_gt_weights, normalizer, bounds, pix_size,
+                        rf_stride, rf_offset, grid_size, num_tokens, device)
                     if sur_soft_label is not None:
+                        # Apply drivable potential weighting per step
+                        sur_dw = _get_drivable_weight(~ego_mask, t)
+                        if sur_dw is not None:
+                            sur_soft_label = sur_soft_label * sur_dw
+                            sur_soft_label = sur_soft_label / (sur_soft_label.sum(dim=1, keepdim=True) + 1e-8)
                         sur_kl = self._kl_with_epsilon(sur_soft_label, sur_attn_dist)
                         total_loss = total_loss + sur_kl
                         count += 1
@@ -748,8 +786,8 @@ class TrafficPlannerLoss(nn.Module):
         return None
 
     def _make_soft_label(self, frame, gt_future_agent, t, remaining,
-                         weights, normalizer, bounds, m2pix_l, m2pix_w,
-                         pix2grid_l, pix2grid_w, grid_size, num_tokens, device):
+                         weights, normalizer, bounds, pix_size,
+                         rf_stride, rf_offset, grid_size, num_tokens, device):
         """
         Trajectory-based soft label with uniform lateral width.
 
@@ -759,6 +797,11 @@ class TrafficPlannerLoss(nn.Module):
         2. Lateral: exp(-0.5 * d² / σ_d²) — uniform-width Gaussian band along trajectory
         3. Longitudinal: additive decay bonus on centerline — nearer = brighter center
         4. Normalize to probability distribution
+
+        Coordinates use CNN receptive field centers:
+          token[m] RF center pixel = m * rf_stride + rf_offset
+          meters_to_token: pixel = (meters - bounds_min) / (bounds_max - bounds_min) * pix_size
+                           token = (pixel - rf_offset) / rf_stride
 
         :param frame: (N, 4) current agent position (normalized, x,y,hx,hy)
         :param gt_future_agent: (N, FT, 6) GT future for these agents (normalized)
@@ -775,10 +818,20 @@ class TrafficPlannerLoss(nn.Module):
 
         frame_unnorm = normalizer.unnormalize(frame)  # (N, 4)
 
+        def _m2token_l(meters):
+            """meters (longitudinal) → token index using RF centers."""
+            pixel = (meters - bounds[0]) / (bounds[2] - bounds[0]) * pix_size
+            return (pixel - rf_offset) / rf_stride
+
+        def _m2token_w(meters):
+            """meters (lateral) → token index using RF centers."""
+            pixel = (meters - bounds[1]) / (bounds[3] - bounds[1]) * pix_size
+            return (pixel - rf_offset) / rf_stride
+
         # Collect GT waypoints in grid coordinates: agent pos + K future points
         # Agent's current position in its own local frame is always (0, 0)
-        agent_gi = (0.0 - bounds[0]) * m2pix_l * pix2grid_l * torch.ones(N, device=device)  # (N,)
-        agent_gj = (0.0 - bounds[1]) * m2pix_w * pix2grid_w * torch.ones(N, device=device)  # (N,)
+        agent_gi = _m2token_l(torch.zeros(N, device=device))  # (N,)
+        agent_gj = _m2token_w(torch.zeros(N, device=device))  # (N,)
 
         waypoints_i = [agent_gi]
         waypoints_j = [agent_gj]
@@ -792,8 +845,8 @@ class TrafficPlannerLoss(nn.Module):
             gt_pos_unnorm = normalizer.unnormalize(gt_pos)
             local_pos = transform2frame(frame_unnorm, gt_pos_unnorm.unsqueeze(1))
             local_xy = local_pos[:, 0, :2]
-            gi_f = (local_xy[:, 0] - bounds[0]) * m2pix_l * pix2grid_l
-            gj_f = (local_xy[:, 1] - bounds[1]) * m2pix_w * pix2grid_w
+            gi_f = _m2token_l(local_xy[:, 0])
+            gj_f = _m2token_w(local_xy[:, 1])
             waypoints_i.append(gi_f)
             waypoints_j.append(gj_f)
             num_pts += 1
@@ -928,7 +981,15 @@ class TrafficPlannerLoss(nn.Module):
             gt_future_valid = gt_future[scene_graph.future_vis == 1.0]
             pred_future_valid = pred_future[scene_graph.future_vis == 1.0]
 
+        # Reconstruction loss: log_normal (all 4 dims) + position MSE boost
         recon_loss = -log_normal(pred_future_valid, gt_future_valid[:, :4], torch.ones_like(pred_future_valid))
+        pos_mse = ((pred_future_valid[:, :2] - gt_future_valid[:, :2]) ** 2).sum(dim=-1)
+        head_mse = ((pred_future_valid[:, 2:4] - gt_future_valid[:, 2:4]) ** 2).sum(dim=-1)
+        if self.recon_pos_weight > 0.0:
+            recon_loss = recon_loss + self.recon_pos_weight * pos_mse
+        # monitoring: MSE for each component
+        pos_loss = pos_mse
+        head_loss = head_mse
 
         # KL divergence loss
         pm, pv = pred['prior_out']
@@ -993,6 +1054,8 @@ class TrafficPlannerLoss(nn.Module):
             'loss': loss.view((1,)),
             'recon_loss': recon_loss,
             'kl_loss': kl_loss,
+            'pos_loss': pos_loss,
+            'head_loss': head_loss,
         }
 
         # Auxiliary losses (Redesign)
