@@ -80,11 +80,11 @@ def parse_cfg():
     parser.add_argument('--use_ego_z_local', type=str2bool, default=True)
     parser.add_argument('--use_sur_z_local', type=str2bool, default=True)
 
-    # V5 Redesign params
-    parser.add_argument('--use_adaln', type=str2bool, default=False)
+    # V5/V6 Redesign params (Enc-Dec Cross-Attention)
     parser.add_argument('--use_a2a_rel_bias', type=str2bool, default=False)
-    parser.add_argument('--use_z_cross_attn', type=str2bool, default=False)
     parser.add_argument('--num_z_tokens', type=int, default=4)
+    parser.add_argument('--context_num_layers', type=int, default=2)
+    parser.add_argument('--map_summary_tokens', type=int, default=8)
 
     # Potential field parameters (ignored in test, but needed for config compatibility)
     parser.add_argument('--k_veh_repel', type=float, default=1.0)
@@ -416,11 +416,11 @@ def main():
         trans_dropout=cfg.trans_dropout,
         use_ego_z_local=cfg.use_ego_z_local,
         use_sur_z_local=cfg.use_sur_z_local,
-        # V5 Redesign params
-        use_adaln=getattr(cfg, 'use_adaln', False),
+        # V5/V6 Redesign params (Enc-Dec Cross-Attention)
         use_a2a_rel_bias=getattr(cfg, 'use_a2a_rel_bias', False),
-        use_z_cross_attn=getattr(cfg, 'use_z_cross_attn', False),
         num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
+        context_num_layers=getattr(cfg, 'context_num_layers', 2),
+        map_summary_tokens=getattr(cfg, 'map_summary_tokens', 8),
     ).to(device)
 
     print(model)

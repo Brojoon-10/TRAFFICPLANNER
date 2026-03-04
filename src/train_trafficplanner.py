@@ -113,8 +113,7 @@ def parse_cfg():
                         help='Free bits per latent dim (0=off). KL_dim = max(KL_dim - free_bits, 0)')
     parser.add_argument('--enc_dropout', type=float, default=0.1,
                         help='Encoder PositionalEncoding dropout (0=off)')
-    parser.add_argument('--dec_past_dropout', type=float, default=0.0,
-                        help='Decoder past context dropout to force z_global dependency (0=off)')
+    # dec_past_dropout removed (Enc-Dec context blocks direct past access)
     parser.add_argument('--loss_recon', type=float, default=1.0, help='Reconstruction loss weight')
     parser.add_argument('--recon_pos_weight', type=float, default=1.0,
                         help='Position (x,y) weight in recon_loss (compensates normalization std)')
@@ -202,15 +201,17 @@ def parse_cfg():
     parser.add_argument('--map_attn_anneal_steps', type=int, default=0,
                         help='Steps for map attn cosine decay (overrides epoch-based if > 0)')
 
-    # V5 Redesign: AdaLN, A2A Relative Bias, z_aux, Action Blending
-    parser.add_argument('--use_adaln', type=str2bool, default=False,
-                        help='Enable Adaptive Layer Normalization (z_global injection per layer)')
+    # V5 Redesign: A2A Relative Bias, z_aux, Action Blending, Enc-Dec Context
+    # (use_adaln removed: replaced by LayerNorm in Enc-Dec redesign)
     parser.add_argument('--use_a2a_rel_bias', type=str2bool, default=False,
                         help='Enable A2A relative physical bias (8-feature MLP → attention bias)')
-    parser.add_argument('--use_z_cross_attn', type=str2bool, default=False,
-                        help='Enable z_global cross-attention (multi-token decompose)')
+    # (use_z_cross_attn removed: z goes through ContextEncoder)
     parser.add_argument('--num_z_tokens', type=int, default=4,
-                        help='Number of z tokens for z_global cross-attention')
+                        help='Number of z tokens for context encoder')
+    parser.add_argument('--context_num_layers', type=int, default=2,
+                        help='Number of TransformerEncoder layers in context encoder')
+    parser.add_argument('--map_summary_tokens', type=int, default=8,
+                        help='Number of learnable query tokens for map summary pooling')
     parser.add_argument('--loss_z_aux', type=float, default=0.0,
                         help='z_global auxiliary decoder loss weight')
     parser.add_argument('--action_blending', type=str2bool, default=False,
@@ -562,13 +563,12 @@ def main():
         trans_dropout=cfg.trans_dropout,
         use_ego_z_local=cfg.use_ego_z_local,
         use_sur_z_local=cfg.use_sur_z_local,
-        # V5 redesign
-        use_adaln=cfg.use_adaln,
+        # V5/V6 redesign (Enc-Dec Cross-Attention)
         use_a2a_rel_bias=cfg.use_a2a_rel_bias,
-        use_z_cross_attn=getattr(cfg, 'use_z_cross_attn', False),
         num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
         enc_dropout=getattr(cfg, 'enc_dropout', 0.1),
-        dec_past_dropout=getattr(cfg, 'dec_past_dropout', 0.0),
+        context_num_layers=getattr(cfg, 'context_num_layers', 2),
+        map_summary_tokens=getattr(cfg, 'map_summary_tokens', 8),
     ).to(device)
 
     train_loss = []
@@ -759,9 +759,9 @@ def main():
     Logger.log(f'  map_num_tokens: {model.map_num_tokens}')
     Logger.log(f'  sur_pred_dim: {model.sur_pred_dim}')
     Logger.log(f'  map_recrop: {model.map_recrop}')
-    Logger.log(f'  use_adaln: {model.use_adaln}')
     Logger.log(f'  use_a2a_rel_bias: {model.use_a2a_rel_bias}')
-    Logger.log(f'  use_z_cross_attn: {model.use_z_cross_attn}')
+    Logger.log(f'  context_encoder: {model.context_encoder}')
+    Logger.log(f'  map_summary_pooling: {model.map_summary_pooling.num_queries} tokens')
 
     # Action blending
     Logger.log('\n[Action Blending]')

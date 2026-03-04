@@ -95,6 +95,83 @@ class A2ARelativeBias(nn.Module):
 
 
 # ============================================================
+# Context Encoder Modules (Enc-Dec Cross-Attention Redesign)
+# ============================================================
+
+
+class MapSummaryPooling(nn.Module):
+    """Learnable query pooling to compress map tokens into summary tokens.
+    Uses cross-attention: K learned queries attend to 3249 map tokens → K summary tokens.
+    """
+    def __init__(self, num_queries=8, d_model=128, map_ch=64, nhead=4):
+        super().__init__()
+        self.num_queries = num_queries
+        self.queries = nn.Parameter(torch.randn(num_queries, d_model) * 0.02)
+        self.map_proj = nn.Linear(map_ch, d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+
+    def forward(self, map_tokens):
+        """
+        :param map_tokens: (NA, num_tokens, map_ch) — CNN conv3 spatial features
+        :return: (NA, num_queries, d_model) — compressed map summary
+        """
+        NA = map_tokens.size(0)
+        kv = self.map_proj(map_tokens)  # (NA, num_tokens, d_model)
+        q = self.queries.unsqueeze(0).expand(NA, -1, -1)  # (NA, num_queries, d_model)
+        summary, _ = self.cross_attn(q, kv, kv)  # (NA, num_queries, d_model)
+        return summary
+
+
+class ContextEncoder(nn.Module):
+    """Encode past + z_global + map_summary into context tokens via self-attention.
+    The self-attention mixes all three information sources, making them inseparable.
+    """
+    def __init__(self, d_model=128, nhead=8, num_layers=2,
+                 gcn_feat_dim=64, z_size=32, num_z_tokens=4,
+                 past_len=4, ffn_dim=256, dropout=0.1):
+        super().__init__()
+        self.num_z_tokens = num_z_tokens
+        self.d_model = d_model
+
+        self.past_proj = nn.Linear(gcn_feat_dim, d_model)
+        self.z_proj = nn.Linear(z_size, num_z_tokens * d_model)
+        self.past_pe = nn.Embedding(past_len, d_model)
+
+        encoder_layer = TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=ffn_dim, dropout=dropout,
+            batch_first=True
+        )
+        self.encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, past_gcn_feats, z_global, map_summary):
+        """
+        :param past_gcn_feats: (NA, PT, gcn_feat_dim) — per-step GCN features
+        :param z_global: (NA, z_size)
+        :param map_summary: (NA, M, d_model) — from MapSummaryPooling
+        :return: context_tokens (NA, PT+K+M, d_model)
+        """
+        NA = past_gcn_feats.size(0)
+        PT = past_gcn_feats.size(1)
+        device = past_gcn_feats.device
+
+        # Past tokens with temporal PE
+        past_tokens = self.past_proj(past_gcn_feats)  # (NA, PT, d_model)
+        past_pe = self.past_pe(torch.arange(PT, device=device))  # (PT, d_model)
+        past_tokens = past_tokens + past_pe.unsqueeze(0)  # broadcast
+
+        # z tokens (no PE — order-free latent)
+        z_tokens = self.z_proj(z_global).view(NA, self.num_z_tokens, self.d_model)
+
+        # Concatenate: [past, z, map_summary]
+        context = torch.cat([past_tokens, z_tokens, map_summary], dim=1)
+
+        # Self-attention mixes all information
+        context = self.encoder(context)
+        return context
+
+
+# ============================================================
 # Transformer Decoder Modules
 # ============================================================
 
@@ -198,34 +275,22 @@ class SharedKVAttention(nn.Module):
 
 class TransDecoderLayer(nn.Module):
     """
-    One Transformer decoder layer: A2T → A2A → A2Z → A2S → FFN.
-    A2T: self-attention (shared, ego/sur 구분 없음)
-    A2A: K/V shared + Q/O separate (ego/sur)
-    A2Z: z_global cross-attention (z→multi-token decompose, ego/sur separate Q/O)
-    A2S: K/V shared + Q/O separate (ego/sur), map cross-attention
+    One Transformer decoder layer: A2A → A2C → A2S → FFN.
+    (Enc-Dec Cross-Attention redesign: A2T/A2Z/AdaLN removed)
+
+    A2A: K/V shared + Q/O separate (ego/sur) — agent interaction
+    A2C: context cross-attention (shared K/V + ego/sur Q/O) — past+z+map_summary
+    A2S: K/V shared + Q/O separate (ego/sur) — high-res map cross-attention
     FFN: ego/sur fully separate
     """
     def __init__(self, d_model, nhead, ffn_dim, map_token_dim, dropout=0.1,
-                 use_adaln=False, z_size=32, use_a2a_rel_bias=False,
-                 use_z_cross_attn=False, num_z_tokens=4):
+                 use_a2a_rel_bias=False):
         super().__init__()
         self.d_model = d_model
-        self.use_adaln = use_adaln
         self.use_a2a_rel_bias = use_a2a_rel_bias
-        self.use_z_cross_attn = use_z_cross_attn
-
-        # A2T: standard self-attention
-        if use_adaln:
-            self.a2t_norm = AdaLN(d_model, z_size)
-        else:
-            self.a2t_norm = nn.LayerNorm(d_model)
-        self.a2t_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
 
         # A2A: shared K/V + ego/sur separate Q/O
-        if use_adaln:
-            self.a2a_norm = AdaLN(d_model, z_size)
-        else:
-            self.a2a_norm = nn.LayerNorm(d_model)
+        self.a2a_norm = nn.LayerNorm(d_model)
         self.a2a_attn = SharedKVAttention(d_model, nhead, dropout)
 
         # A2A relative physical bias
@@ -233,31 +298,21 @@ class TransDecoderLayer(nn.Module):
             self.a2a_rel_bias_module = A2ARelativeBias(
                 num_features=8, nhead=nhead, hidden_dim=32)
 
-        # A2Z: z_global cross-attention (z → multi-token decompose)
-        if use_z_cross_attn:
-            self.num_z_tokens = num_z_tokens
-            if use_adaln:
-                self.a2z_norm = AdaLN(d_model, z_size)
-            else:
-                self.a2z_norm = nn.LayerNorm(d_model)
-            # z_global → num_z_tokens × d_model
-            self.z_token_proj = nn.Linear(z_size, num_z_tokens * d_model)
-            # K/V for z tokens
-            self.a2z_k_proj = nn.Linear(d_model, d_model)
-            self.a2z_v_proj = nn.Linear(d_model, d_model)
-            # Ego/Sur separate Q/O
-            self.a2z_ego_q_proj = nn.Linear(d_model, d_model)
-            self.a2z_ego_o_proj = nn.Linear(d_model, d_model)
-            self.a2z_sur_q_proj = nn.Linear(d_model, d_model)
-            self.a2z_sur_o_proj = nn.Linear(d_model, d_model)
-            self.a2z_scale = (d_model // nhead) ** -0.5
-            self.a2z_dropout = nn.Dropout(dropout)
+        # A2C: context cross-attention (shared K/V + ego/sur Q/O)
+        self.a2c_norm = nn.LayerNorm(d_model)
+        self.a2c_ctx_k_proj = nn.Linear(d_model, d_model)
+        self.a2c_ctx_v_proj = nn.Linear(d_model, d_model)
+        self.a2c_ego_q_proj = nn.Linear(d_model, d_model)
+        self.a2c_ego_o_proj = nn.Linear(d_model, d_model)
+        self.a2c_sur_q_proj = nn.Linear(d_model, d_model)
+        self.a2c_sur_o_proj = nn.Linear(d_model, d_model)
+        self.a2c_nhead = nhead
+        self.a2c_head_dim = d_model // nhead
+        self.a2c_scale = self.a2c_head_dim ** -0.5
+        self.a2c_dropout = nn.Dropout(dropout)
 
         # A2S: shared K/V (map) + ego/sur separate Q/O
-        if use_adaln:
-            self.a2s_norm = AdaLN(d_model, z_size)
-        else:
-            self.a2s_norm = nn.LayerNorm(d_model)
+        self.a2s_norm = nn.LayerNorm(d_model)
         self.a2s_map_k_proj = nn.Linear(map_token_dim, d_model)
         self.a2s_map_v_proj = nn.Linear(map_token_dim, d_model)
         self.a2s_ego_q_proj = nn.Linear(d_model, d_model)
@@ -270,10 +325,7 @@ class TransDecoderLayer(nn.Module):
         self.a2s_dropout = nn.Dropout(dropout)
 
         # FFN: ego/sur fully separate
-        if use_adaln:
-            self.ego_ffn_norm = AdaLN(d_model, z_size)
-        else:
-            self.ego_ffn_norm = nn.LayerNorm(d_model)
+        self.ego_ffn_norm = nn.LayerNorm(d_model)
         self.ego_ffn = nn.Sequential(
             nn.Linear(d_model, ffn_dim),
             nn.ReLU(),
@@ -281,10 +333,7 @@ class TransDecoderLayer(nn.Module):
             nn.Linear(ffn_dim, d_model),
             nn.Dropout(dropout),
         )
-        if use_adaln:
-            self.sur_ffn_norm = AdaLN(d_model, z_size)
-        else:
-            self.sur_ffn_norm = nn.LayerNorm(d_model)
+        self.sur_ffn_norm = nn.LayerNorm(d_model)
         self.sur_ffn = nn.Sequential(
             nn.Linear(d_model, ffn_dim),
             nn.ReLU(),
@@ -293,29 +342,75 @@ class TransDecoderLayer(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def _a2c_attention(self, query_tokens, context, ego_mask):
+        """
+        A2C: context cross-attention with shared K/V and separate ego/sur Q/O.
+        :param query_tokens: (BT, N, D) — decoder tokens
+        :param context: (N, C, D) — context encoder output (fixed across steps)
+        :return: output (BT, N, D)
+        """
+        BT, N, D = query_tokens.shape
+        nhead = self.a2c_nhead
+        head_dim = self.a2c_head_dim
+        C = context.size(1)
+
+        # Shared K/V from context: (N, C, D) → project → broadcast over BT
+        ctx_k = self.a2c_ctx_k_proj(context)  # (N, C, D)
+        ctx_v = self.a2c_ctx_v_proj(context)  # (N, C, D)
+
+        ego_idx = ego_mask.nonzero(as_tuple=True)[0]
+        sur_idx = (~ego_mask).nonzero(as_tuple=True)[0]
+
+        output = query_tokens.new_zeros(BT, N, D)
+
+        def _do_a2c(agent_idx, q_proj, o_proj):
+            if agent_idx.numel() == 0:
+                return
+            # Q from decoder tokens: (BT, N_sel, D)
+            q_in = query_tokens[:, agent_idx]
+            q = q_proj(q_in).view(BT, agent_idx.numel(), nhead, head_dim).transpose(1, 2)
+            # (BT, nhead, N_sel, head_dim)
+
+            # K/V from context: (N_sel, C, D) → broadcast over BT
+            k_sel = ctx_k[agent_idx]  # (N_sel, C, D)
+            v_sel = ctx_v[agent_idx]
+            k_sel = k_sel.view(agent_idx.numel(), C, nhead, head_dim)
+            k_sel = k_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
+            # (BT, nhead, N_sel, C, head_dim)
+            v_sel = v_sel.view(agent_idx.numel(), C, nhead, head_dim)
+            v_sel = v_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
+
+            # Attention: Q(BT, nhead, N_sel, 1, head_dim) @ K^T(BT, nhead, N_sel, head_dim, C)
+            q = q.unsqueeze(3)  # (BT, nhead, N_sel, 1, head_dim)
+            scores = torch.matmul(q, k_sel.transpose(-2, -1)) * self.a2c_scale
+            # (BT, nhead, N_sel, 1, C)
+            attn_w = F.softmax(scores, dim=-1)
+            attn_w = self.a2c_dropout(attn_w)
+            attn_out = torch.matmul(attn_w, v_sel)  # (BT, nhead, N_sel, 1, head_dim)
+            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().view(BT, agent_idx.numel(), D)
+            output[:, agent_idx] = o_proj(attn_out)
+
+        _do_a2c(ego_idx, self.a2c_ego_q_proj, self.a2c_ego_o_proj)
+        _do_a2c(sur_idx, self.a2c_sur_q_proj, self.a2c_sur_o_proj)
+
+        return output
+
     def _a2s_attention(self, query_tokens, map_tokens, ego_mask):
         """
         A2S: map cross-attention with shared K/V and separate ego/sur Q/O.
-        :param query_tokens: (B*T, N, D)
-        :param map_tokens: (N, num_tokens, map_dim) — 3D: same map for all steps
-                           or (B*T, N, num_tokens, map_dim) — 4D: per-step recrop
-        :param ego_mask: (N,) bool
-        :return: output (B*T, N, D), ego_attn_weights, sur_attn_weights
+        :param query_tokens: (BT, N, D)
+        :param map_tokens: (N, num_tokens, map_dim) — per-agent map crop
+        :return: output (BT, N, D), ego_attn_weights, sur_attn_weights
         """
         BT, N, D = query_tokens.shape
         nhead = self.a2s_nhead
         head_dim = self.a2s_head_dim
 
-        if map_tokens.dim() == 3:
-            # Same map for all timesteps: (N, num_tokens, ch) → project → broadcast
-            map_k = self.a2s_map_k_proj(map_tokens)  # (N, num_tokens, D)
-            map_v = self.a2s_map_v_proj(map_tokens)
-            map_k = map_k.unsqueeze(0).expand(BT, -1, -1, -1)  # (BT, N, num_tokens, D)
-            map_v = map_v.unsqueeze(0).expand(BT, -1, -1, -1)
-        else:
-            # Per-step recrop: (BT, N, num_tokens, ch) → project directly
-            map_k = self.a2s_map_k_proj(map_tokens)  # (BT, N, num_tokens, D)
-            map_v = self.a2s_map_v_proj(map_tokens)
+        # Map tokens: (N, num_tokens, ch) → project → broadcast
+        map_k = self.a2s_map_k_proj(map_tokens)  # (N, num_tokens, D)
+        map_v = self.a2s_map_v_proj(map_tokens)
+        map_k = map_k.unsqueeze(0).expand(BT, -1, -1, -1)  # (BT, N, num_tokens, D)
+        map_v = map_v.unsqueeze(0).expand(BT, -1, -1, -1)
         num_tokens = map_k.shape[2]
 
         ego_idx = ego_mask.nonzero(as_tuple=True)[0]
@@ -327,26 +422,18 @@ class TransDecoderLayer(nn.Module):
         def _do_a2s(agent_idx, q_proj, o_proj):
             if agent_idx.numel() == 0:
                 return None
-            # (BT, N_sel, D)
             q_in = query_tokens[:, agent_idx]
             q = q_proj(q_in).view(BT, agent_idx.numel(), nhead, head_dim).transpose(1, 2)
-            # (BT, N_sel, num_tokens, D) → heads
-            k_sel = map_k[:, agent_idx].view(BT * agent_idx.numel(), num_tokens, D)
-            k_sel = k_sel.view(BT, agent_idx.numel(), num_tokens, nhead, head_dim).permute(0, 3, 1, 2, 4)
-            # (BT, nhead, N_sel, num_tokens, head_dim)
+            k_sel = map_k[:, agent_idx].view(BT, agent_idx.numel(), num_tokens, nhead, head_dim).permute(0, 3, 1, 2, 4)
             v_sel = map_v[:, agent_idx].view(BT, agent_idx.numel(), num_tokens, nhead, head_dim).permute(0, 3, 1, 2, 4)
 
-            # Attention: Q(BT, nhead, N_sel, 1, head_dim) @ K^T → (BT, nhead, N_sel, 1, num_tokens)
-            # But each agent has its own map → per-agent attention
-            # q: (BT, nhead, N_sel, head_dim) → add token dim
             q = q.unsqueeze(3)  # (BT, nhead, N_sel, 1, head_dim)
-            scores = torch.matmul(q, k_sel.transpose(-2, -1)) * self.a2s_scale  # (BT, nhead, N_sel, 1, num_tokens)
+            scores = torch.matmul(q, k_sel.transpose(-2, -1)) * self.a2s_scale
             attn_w = F.softmax(scores, dim=-1)
             attn_w = self.a2s_dropout(attn_w)
-            attn_out = torch.matmul(attn_w, v_sel)  # (BT, nhead, N_sel, 1, head_dim)
+            attn_out = torch.matmul(attn_w, v_sel)
             attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().view(BT, agent_idx.numel(), D)
             output[:, agent_idx] = o_proj(attn_out)
-            # Average attn weights across heads: (BT, nhead, N_sel, 1, num_tokens) → (BT, N_sel, num_tokens)
             return attn_w.squeeze(3).mean(dim=1)
 
         ego_attn_w = _do_a2s(ego_idx, self.a2s_ego_q_proj, self.a2s_ego_o_proj)
@@ -354,99 +441,25 @@ class TransDecoderLayer(nn.Module):
 
         return output, ego_attn_w, sur_attn_w
 
-    def _a2z_attention(self, query_tokens, z_global, ego_mask):
-        """
-        A2Z: z_global cross-attention with multi-token decomposition.
-        :param query_tokens: (B*T, N, D)
-        :param z_global: (N, z_size) — per-agent z_global
-        :param ego_mask: (N,) bool
-        :return: output (B*T, N, D)
-        """
-        BT, N, D = query_tokens.shape
-        nhead = self.a2s_nhead  # same nhead as other attention blocks
-        head_dim = D // nhead
-
-        # Decompose z_global into multiple tokens: (N, z_size) → (N, num_z_tokens, D)
-        z_tokens = self.z_token_proj(z_global).view(N, self.num_z_tokens, D)
-
-        # Project K/V from z tokens
-        z_k = self.a2z_k_proj(z_tokens)  # (N, num_z_tokens, D)
-        z_v = self.a2z_v_proj(z_tokens)  # (N, num_z_tokens, D)
-
-        ego_idx = ego_mask.nonzero(as_tuple=True)[0]
-        sur_idx = (~ego_mask).nonzero(as_tuple=True)[0]
-
-        output = query_tokens.new_zeros(BT, N, D)
-
-        def _do_a2z(agent_idx, q_proj, o_proj):
-            if agent_idx.numel() == 0:
-                return
-            # Q from agent tokens: (BT, N_sel, D)
-            q_in = query_tokens[:, agent_idx]
-            q = q_proj(q_in).view(BT, agent_idx.numel(), nhead, head_dim).transpose(1, 2)
-            # (BT, nhead, N_sel, head_dim)
-
-            # K/V from z tokens: (N_sel, num_z_tokens, D) → broadcast over BT
-            k_sel = z_k[agent_idx]  # (N_sel, num_z_tokens, D)
-            v_sel = z_v[agent_idx]
-            k_sel = k_sel.view(agent_idx.numel(), self.num_z_tokens, nhead, head_dim)
-            k_sel = k_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
-            # (BT, nhead, N_sel, num_z_tokens, head_dim)
-            v_sel = v_sel.view(agent_idx.numel(), self.num_z_tokens, nhead, head_dim)
-            v_sel = v_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
-
-            # Attention: (BT, nhead, N_sel, 1, head_dim) @ (BT, nhead, N_sel, head_dim, num_z_tokens)
-            q = q.unsqueeze(3)  # (BT, nhead, N_sel, 1, head_dim)
-            scores = torch.matmul(q, k_sel.transpose(-2, -1)) * self.a2z_scale
-            # (BT, nhead, N_sel, 1, num_z_tokens)
-            attn_w = F.softmax(scores, dim=-1)
-            attn_w = self.a2z_dropout(attn_w)
-            attn_out = torch.matmul(attn_w, v_sel)  # (BT, nhead, N_sel, 1, head_dim)
-            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().view(BT, agent_idx.numel(), D)
-            output[:, agent_idx] = o_proj(attn_out)
-
-        _do_a2z(ego_idx, self.a2z_ego_q_proj, self.a2z_ego_o_proj)
-        _do_a2z(sur_idx, self.a2z_sur_q_proj, self.a2z_sur_o_proj)
-
-        return output
-
-    def forward(self, x, ego_mask, causal_mask, map_tokens,
+    def forward(self, x, ego_mask, context, map_tokens,
                 return_a2a_output=False, return_a2s_weights=False,
-                z_global=None, agent_states=None):
+                agent_states=None):
         """
-        :param x: (B, T, N, D)
+        :param x: (B, T, N, D) — decoder tokens (T=1 for AR single-step)
         :param ego_mask: (N,) bool — True for ego
-        :param causal_mask: (T, T) — for A2T
+        :param context: (N, C, D) — context encoder output
         :param map_tokens: (N, num_tokens, map_dim) — per-agent map crop
         :param return_a2a_output: return tokens after A2A (for pred loss)
         :param return_a2s_weights: return A2S attention weights (for map guidance loss)
-        :param z_global: (N, z_size) or None — for AdaLN conditioning
         :param agent_states: (B*T, N, 6) or None — for A2A relative bias
         :return: x, extras_dict
         """
         B, T, N, D = x.shape
         extras = {}
 
-        # --- A2T: temporal self-attention ---
-        # reshape: (B, T, N, D) -> (B*N, T, D)
-        x_a2t = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
-        if self.use_adaln and z_global is not None:
-            # z_global: (N, z_size) -> (N, 1, z_size) broadcast over T
-            x_norm = self.a2t_norm(x_a2t, z_global.unsqueeze(1))
-        else:
-            x_norm = self.a2t_norm(x_a2t)
-        a2t_out, _ = self.a2t_attn(x_norm, x_norm, x_norm, attn_mask=causal_mask)
-        x_a2t = x_a2t + a2t_out
-        x = x_a2t.view(B, N, T, D).permute(0, 2, 1, 3)  # back to (B, T, N, D)
-
         # --- A2A: agent interaction (shared K/V + ego/sur Q/O) ---
-        # reshape: (B, T, N, D) -> (B*T, N, D)
         x_a2a = x.reshape(B * T, N, D)
-        if self.use_adaln and z_global is not None:
-            # z_global: (N, z_size) -> (1, N, z_size) broadcast over B*T
-            x_norm = self.a2a_norm(x_a2a, z_global.unsqueeze(0))
-        else:
-            x_norm = self.a2a_norm(x_a2a)
+        x_norm = self.a2a_norm(x_a2a)
 
         # Compute A2A relative bias from agent states
         a2a_rel_bias = None
@@ -460,29 +473,20 @@ class TransDecoderLayer(nn.Module):
         if return_a2a_output:
             extras['a2a_output'] = x_a2a.view(B, T, N, D)
 
-        x = x_a2a.view(B, T, N, D)
+        # --- A2C: context cross-attention ---
+        x_a2c = x_a2a  # (BT, N, D) — stays flat
+        x_norm = self.a2c_norm(x_a2c)
+        a2c_out = self._a2c_attention(x_norm, context, ego_mask)
+        x_a2c = x_a2c + a2c_out
 
-        # --- A2Z: z_global cross-attention ---
-        if self.use_z_cross_attn and z_global is not None:
-            x_a2z = x.reshape(B * T, N, D)
-            if self.use_adaln:
-                x_norm = self.a2z_norm(x_a2z, z_global.unsqueeze(0))
-            else:
-                x_norm = self.a2z_norm(x_a2z)
-            a2z_out = self._a2z_attention(x_norm, z_global, ego_mask)
-            x = (x_a2z + a2z_out).view(B, T, N, D)
-
-        # --- A2S: map cross-attention (shared K/V + ego/sur Q/O) ---
-        x_a2s = x.reshape(B * T, N, D)
-        if self.use_adaln and z_global is not None:
-            x_norm = self.a2s_norm(x_a2s, z_global.unsqueeze(0))
-        else:
-            x_norm = self.a2s_norm(x_a2s)
+        # --- A2S: map cross-attention ---
+        x_a2s = x_a2c  # (BT, N, D)
+        x_norm = self.a2s_norm(x_a2s)
         a2s_out, ego_map_w, sur_map_w = self._a2s_attention(x_norm, map_tokens, ego_mask)
         x_a2s = x_a2s + a2s_out
 
         if return_a2s_weights:
-            extras['ego_map_attn_weights'] = ego_map_w  # (B*T, N_ego, num_tokens) or None
+            extras['ego_map_attn_weights'] = ego_map_w
             extras['sur_map_attn_weights'] = sur_map_w
 
         x = x_a2s.view(B, T, N, D)
@@ -492,21 +496,13 @@ class TransDecoderLayer(nn.Module):
         sur_idx = (~ego_mask).nonzero(as_tuple=True)[0]
 
         if ego_idx.numel() > 0:
-            ego_tokens = x[:, :, ego_idx]  # (B, T, N_ego, D)
-            if self.use_adaln and z_global is not None:
-                z_ego = z_global[ego_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, N_ego, z_size)
-                ego_normed = self.ego_ffn_norm(ego_tokens, z_ego)
-            else:
-                ego_normed = self.ego_ffn_norm(ego_tokens)
+            ego_tokens = x[:, :, ego_idx]
+            ego_normed = self.ego_ffn_norm(ego_tokens)
             x[:, :, ego_idx] = ego_tokens + self.ego_ffn(ego_normed)
 
         if sur_idx.numel() > 0:
-            sur_tokens = x[:, :, sur_idx]  # (B, T, N_sur, D)
-            if self.use_adaln and z_global is not None:
-                z_sur = z_global[sur_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, N_sur, z_size)
-                sur_normed = self.sur_ffn_norm(sur_tokens, z_sur)
-            else:
-                sur_normed = self.sur_ffn_norm(sur_tokens)
+            sur_tokens = x[:, :, sur_idx]
+            sur_normed = self.sur_ffn_norm(sur_tokens)
             x[:, :, sur_idx] = sur_tokens + self.sur_ffn(sur_normed)
 
         return x, extras
@@ -606,7 +602,7 @@ class TrafficPlannerModel(nn.Module):
                  map_feat_size=64,
                  past_feat_size=64,
                  future_feat_size=64,
-                 latent_size=32,          # z_global size (was 64, now 32)
+                 latent_size=32,          # z_global size
                  z_local_size=32,         # intent_dim
                  output_bicycle=True,
                  dt=0.5,
@@ -629,13 +625,12 @@ class TrafficPlannerModel(nn.Module):
                  trans_dropout=0.1,
                  use_ego_z_local=True,
                  use_sur_z_local=False,
-                 # V5 redesign params
-                 use_adaln=False,
+                 # Enc-Dec Cross-Attention params
                  use_a2a_rel_bias=False,
-                 use_z_cross_attn=False,
                  num_z_tokens=4,
                  enc_dropout=0.1,
-                 dec_past_dropout=0.0,
+                 context_num_layers=2,
+                 map_summary_tokens=8,
                  ):
         super(TrafficPlannerModel, self).__init__()
         self.normalizer = self.att_normalizer = None
@@ -774,16 +769,14 @@ class TrafficPlannerModel(nn.Module):
 
         #
         # =============================================
-        # TRANSFORMER DECODER COMPONENTS
+        # TRANSFORMER DECODER COMPONENTS (Enc-Dec Cross-Attention)
         # =============================================
         #
         self.trans_d_model = trans_d_model  # 128
         self.trans_num_layers = trans_num_layers
         self.use_ego_z_local = use_ego_z_local
         self.use_sur_z_local = use_sur_z_local
-        self.use_adaln = use_adaln
         self.use_a2a_rel_bias = use_a2a_rel_bias
-        self.use_z_cross_attn = use_z_cross_attn
 
         # 1. Interaction GCN: per-step agent interaction -> token features (64dim)
         interaction_gcn_in = self.state_size + self.att_feat_size + self.NC
@@ -791,22 +784,39 @@ class TrafficPlannerModel(nn.Module):
             interaction_gcn_in, self.NC, 4, 64, self.gcn_hidden_dim,
         )
 
-        # 2. Token construction: GCN(64) + z_global(32) + lw(2) + sem(NC) -> d_model(128)
-        token_input_dim = self.gcn_hidden_dim + self.z_size + self.att_feat_size + self.NC
-        self.token_proj = nn.Linear(token_input_dim, trans_d_model)
-        self.dec_past_dropout = nn.Dropout(dec_past_dropout) if dec_past_dropout > 0.0 else None
+        # 2. MapSummaryPooling: map_tokens(3249, 64) → summary(M, 128)
+        self.map_summary_pooling = MapSummaryPooling(
+            num_queries=map_summary_tokens,
+            d_model=trans_d_model,
+            map_ch=self.map_token_ch,
+            nhead=4,
+        )
 
-        # 3. Learnable temporal positional encoding
-        self.temporal_pe = nn.Embedding(self.PT + self.FT, trans_d_model)  # 16 positions
+        # 3. Context Encoder: past_gcn(4,64) + z(K,128) + map_summary(M,128) → context
+        self.context_encoder = ContextEncoder(
+            d_model=trans_d_model,
+            nhead=trans_nhead,
+            num_layers=context_num_layers,
+            gcn_feat_dim=self.gcn_hidden_dim,
+            z_size=self.z_size,
+            num_z_tokens=num_z_tokens,
+            past_len=self.PT,
+            ffn_dim=trans_d_model * 2,
+            dropout=trans_dropout,
+        )
 
-        # 4. Transformer decoder layers
+        # 4. Decoder query construction: GCN(64) + lw(2) + sem(NC) → d_model(128)
+        query_input_dim = self.gcn_hidden_dim + self.att_feat_size + self.NC
+        self.query_proj = nn.Linear(query_input_dim, trans_d_model)
+
+        # 5. Decoder step PE: nn.Embedding(FT=12, d_model)
+        self.step_pe = nn.Embedding(self.FT, trans_d_model)
+
+        # 6. Transformer decoder layers: A2A → A2C → A2S → FFN
         self.trans_layers = nn.ModuleList([
             TransDecoderLayer(trans_d_model, trans_nhead, trans_ffn_dim,
                               self.map_token_ch, trans_dropout,
-                              use_adaln=use_adaln, z_size=self.z_size,
-                              use_a2a_rel_bias=use_a2a_rel_bias,
-                              use_z_cross_attn=use_z_cross_attn,
-                              num_z_tokens=num_z_tokens)
+                              use_a2a_rel_bias=use_a2a_rel_bias)
             for _ in range(trans_num_layers)
         ])
 
@@ -995,16 +1005,6 @@ class TrafficPlannerModel(nn.Module):
             metrics['z_aux/pred_acc_std'] = z_aux[:, :, 0].std().item()
             metrics['z_aux/pred_ddh_std'] = z_aux[:, :, 1].std().item()
 
-        # AdaLN gamma/beta statistics (are the modulations actually active?)
-        if self.use_adaln and hasattr(self, 'trans_layers'):
-            for li, layer in enumerate(self.trans_layers):
-                for norm_name in ['a2t_norm', 'a2a_norm', 'a2s_norm', 'ego_ffn_norm', 'sur_ffn_norm']:
-                    norm = getattr(layer, norm_name, None)
-                    if norm is not None and isinstance(norm, AdaLN):
-                        w = norm.adaln_mlp[-1]
-                        # How far from identity init: weight norm (should grow from 0)
-                        metrics[f'adaln/L{li}_{norm_name}_wnorm'] = w.weight.data.norm().item()
-
         return metrics
 
     def compute_per_module_grad_norms(self):
@@ -1015,7 +1015,8 @@ class TrafficPlannerModel(nn.Module):
             'prior': [self.latent_prior_net, self.prior_temporal_gru],
             'posterior': [self.latent_posterior_net, self.transformer_encoder],
             'interaction_gcn': [self.interaction_gcn],
-            'token_proj': [self.token_proj],
+            'query_proj': [self.query_proj],
+            'context_encoder': [self.context_encoder, self.map_summary_pooling],
             'trans_layers': list(self.trans_layers),
             'output_heads': [self.ego_output_head, self.sur_output_head],
             'intent': [self.intent_codebook, self.ego_intent_proj],
@@ -1257,53 +1258,6 @@ class TrafficPlannerModel(nn.Module):
     # Decoder (Transformer-based)
     # ============================================================
 
-    def _build_causal_mask(self, T, device):
-        """Build causal mask for A2T self-attention. (T, T) with -inf above diagonal."""
-        mask = torch.full((T, T), float('-inf'), device=device)
-        mask = torch.triu(mask, diagonal=1)
-        return mask
-
-    def _build_decoder_tokens(self, gcn_feats, z, scene_graph, mult_samp=False, NS=None):
-        """
-        Build decoder input tokens from GCN features.
-
-        :param gcn_feats: (B, T, NA_eff, gcn_hidden_dim=64)
-        :param z: (NA_eff, z_size=32) — z_global per agent (NA*NS if mult_samp)
-        :param scene_graph: for lw, sem (always NA-sized, not expanded)
-        :param mult_samp: if True, lw/sem need expansion by NS
-        :param NS: number of samples (used when mult_samp=True)
-        :return: tokens (B, T, NA_eff, trans_d_model=128)
-        """
-        B, T, NA_eff, _ = gcn_feats.shape
-        device = gcn_feats.device
-
-        # Per-agent static features
-        if mult_samp:
-            cur_lw = scene_graph.lw.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, -1)
-            cur_sem = scene_graph.sem.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, -1)
-        else:
-            cur_lw = scene_graph.lw  # (NA, 2)
-            cur_sem = scene_graph.sem  # (NA, NC)
-
-        # Decoder past context dropout: force z_global dependency
-        if self.dec_past_dropout is not None and self.training:
-            gcn_feats = self.dec_past_dropout(gcn_feats)
-
-        # Expand to (B, T, NA_eff, feat_dim) for concat
-        z_expand = z.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-        lw_expand = cur_lw.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-        sem_expand = cur_sem.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-
-        token_input = torch.cat([gcn_feats, z_expand, lw_expand, sem_expand], dim=-1)
-        tokens = self.token_proj(token_input)  # (B, T, NA_eff, trans_d_model)
-
-        # Add temporal positional encoding
-        positions = torch.arange(T, device=device)
-        pe = self.temporal_pe(positions)  # (T, trans_d_model)
-        tokens = tokens + pe.unsqueeze(0).unsqueeze(2)  # broadcast (1, T, 1, D)
-
-        return tokens
-
     def _run_interaction_gcn_parallel(self, states, scene_graph, ego_mask, T):
         """
         Run interaction GCN for T timesteps in parallel (using GT states).
@@ -1346,14 +1300,13 @@ class TrafficPlannerModel(nn.Module):
     def decoder(self, scene_graph, map_feat, past_seq_out, z, map_idx, map_env,
                 map_tokens=None,
                 ext_future=None, nfuture=None,
-                teacher_forcing=False, tf_segment_len=3,
+                teacher_forcing=False,
                 sur_gt_replay=False,
                 blend_alpha=0.0):
         """
-        Decoder dispatcher (Transformer-based).
-        Training: parallel forward with causal mask (teacher_forcing=True)
+        Decoder dispatcher (Enc-Dec Cross-Attention).
+        Training: AR loop with GT action interpolation (blend_alpha ∈ [0,1])
         Inference: autoregressive (teacher_forcing=False)
-        Blended: AR loop with GT/predicted action interpolation (blend_alpha > 0)
         """
         if map_tokens is None:
             scene_graph_pos_backup = scene_graph.pos.clone()
@@ -1362,216 +1315,29 @@ class TrafficPlannerModel(nn.Module):
             scene_graph.pos = scene_graph_pos_backup
 
         if teacher_forcing:
-            if blend_alpha > 0.0:
-                return self.transformer_decoder_training_blended(
-                    scene_graph, z, map_tokens, map_idx, map_env, blend_alpha)
-            else:
-                return self.transformer_decoder_training(
-                    scene_graph, z, map_tokens, map_idx, map_env)
+            return self.transformer_decoder_training_blended(
+                scene_graph, z, map_tokens, map_idx, map_env, blend_alpha)
         else:
             return self.transformer_decoder_inference(
                 scene_graph, z, map_tokens, map_idx, map_env,
                 ext_future=ext_future, nfuture=nfuture,
                 sur_gt_replay=sur_gt_replay)
 
-    def transformer_decoder_training(self, scene_graph, z, map_tokens, map_idx, map_env):
-        """
-        Transformer decoder — training mode (parallel with causal mask).
-
-        All 16 timesteps (PT=4 past + FT=12 future) processed in parallel.
-        Uses GT states for GCN at all timesteps.
-
-        :return: traj_out (NA, FT, 4) — predicted future trajectory
-        """
-        NA = z.size(0)
-        FT = self.FT
-        PT = self.PT
-        T_total = PT + FT
-        device = z.device
-
-        ego_mask = self._get_ego_mask(scene_graph)
-        num_ego = int(ego_mask.sum())
-
-        # ================================================================
-        # 1. Build GT states for all 16 timesteps: past(4) + future(12)
-        # ================================================================
-        gt_past = scene_graph.past  # (NA, PT, state_dim)
-        gt_future = scene_graph.future_gt  # (NA, FT, state_dim)
-        # Concat: (NA, T_total, state_dim)
-        all_states = torch.cat([gt_past, gt_future], dim=1)  # (NA, 16, state_dim)
-
-        # ================================================================
-        # 2. GCN for all 16 timesteps (sequential loop, using GT positions)
-        # ================================================================
-        gcn_feats = self._run_interaction_gcn_parallel(all_states, scene_graph, ego_mask, T_total)
-        # gcn_feats: (NA, 16, gcn_hidden_dim=64)
-
-        # ================================================================
-        # 3. Build decoder tokens: (1, T_total, NA, trans_d_model=128)
-        # ================================================================
-        # Reshape for token builder: B=1 (we treat NA as agent dim, not batch)
-        # gcn_feats: (NA, T_total, 64) → transpose → (T_total, NA, 64) → unsqueeze → (1, T_total, NA, 64)
-        gcn_feats_4d = gcn_feats.transpose(0, 1).unsqueeze(0)  # (1, 16, NA, 64)
-        tokens = self._build_decoder_tokens(gcn_feats_4d, z, scene_graph)  # (1, 16, NA, 128)
-
-        # ================================================================
-        # 4. Causal mask
-        # ================================================================
-        causal_mask = self._build_causal_mask(T_total, device)  # (16, 16)
-
-        # ================================================================
-        # 5. Run through Transformer layers
-        # ================================================================
-        # Re-crop map tokens per timestep using GT positions (batched CNN)
-        if self.map_recrop:
-            map_tokens = self._recompute_map_tokens_batched(
-                all_states[:, :, :4], map_idx, map_env, scene_graph
-            )  # (T_total, NA, num_tokens, ch)
-
-        x = tokens  # (1, T_total, NA, D)
-
-        # Prepare agent states for A2A relative bias: (T_total, NA, 6)
-        agent_states_for_bias = None
-        if self.use_a2a_rel_bias:
-            # all_states: (NA, T_total, state_dim) -> (T_total, NA, state_dim)
-            agent_states_for_bias = all_states.permute(1, 0, 2)
-
-        # Initialize analysis storage
-        self._z_local_outputs = []
-        self._intent_weights_outputs = []
-        self._ego_map_attn_weights_outputs = []
-        self._sur_map_attn_weights_outputs = []
-        self._sur_pred_outputs = []
-        self._ego_pred_outputs = []
-
-        for layer_idx, layer in enumerate(self.trans_layers):
-            is_first_layer = (layer_idx == 0)
-            is_before_intent = (layer_idx == 0)  # Intent codebook between Layer 0 and Layer 1
-
-            x_out, extras = layer(
-                x, ego_mask, causal_mask, map_tokens,
-                return_a2a_output=is_first_layer,
-                return_a2s_weights=is_first_layer,
-                z_global=z if self.use_adaln else None,
-                agent_states=agent_states_for_bias,
-            )
-            x = x_out
-
-            # After Layer 0: extract auxiliary outputs & apply intent codebook
-            if is_before_intent:
-                # Pred loss: from A2A output of Layer 0
-                # Shifted: PE N output predicts step N+1 (matches AR)
-                if 'a2a_output' in extras:
-                    a2a_out = extras['a2a_output']  # (1, T_total, NA, D)
-                    # Extract shifted tokens: PE 3~14 output → future step 0~11
-                    a2a_future = a2a_out[:, PT-1:-1, :, :]  # (1, FT, NA, D)
-
-                    # ego tokens → predict sur delta
-                    ego_a2a = a2a_future[:, :, ego_mask, :]  # (1, FT, num_ego, D)
-                    sur_pred = self.sur_pred_head(ego_a2a)  # (1, FT, num_ego, 2)
-                    self._sur_pred_outputs = sur_pred.squeeze(0)  # (FT, num_ego, 2)
-
-                    # sur tokens → predict ego delta
-                    sur_a2a = a2a_future[:, :, ~ego_mask, :]  # (1, FT, num_sur, D)
-                    ego_pred = self.ego_pred_head(sur_a2a)  # (1, FT, num_sur, 2)
-                    self._ego_pred_outputs = ego_pred.squeeze(0)  # (FT, num_sur, 2)
-
-                # Map attention weights
-                if 'ego_map_attn_weights' in extras:
-                    self._ego_map_attn_weights_outputs = extras['ego_map_attn_weights']
-                if 'sur_map_attn_weights' in extras:
-                    self._sur_map_attn_weights_outputs = extras['sur_map_attn_weights']
-
-                # Intent Codebook (ego, between Layer 0 and Layer 1)
-                # Shifted: use PE 3~14 tokens for future step 0~11 intent
-                ego_tokens_l0 = x[:, PT-1:-1, ego_mask, :]  # (1, FT, num_ego, D)
-                ego_tokens_flat = ego_tokens_l0.reshape(-1, self.trans_d_model)  # (FT*num_ego, D)
-
-                z_local, intent_weights = self.intent_codebook(
-                    ego_tokens_flat, temperature=self.gumbel_temperature)
-                # z_local: (FT*num_ego, intent_dim=32)
-                # intent_weights: (FT*num_ego, K)
-
-                if not self.use_ego_z_local:
-                    z_local = torch.zeros_like(z_local)
-
-                # Store WITHOUT detach: intent CE loss needs gradient flow to codebook
-                self._z_local_outputs = z_local.view(FT, num_ego, self.intent_dim)
-                self._intent_weights_outputs = intent_weights.view(FT, num_ego, self.num_intents)
-
-                # Concat z_local and project: (D + intent_dim) → D
-                ego_with_z_local = torch.cat([ego_tokens_flat, z_local], dim=-1)
-                ego_projected = self.ego_intent_proj(ego_with_z_local)  # (FT*num_ego, D)
-                ego_projected = ego_projected.view(1, FT, num_ego, self.trans_d_model)
-
-                # Replace shifted ego tokens with projected version
-                x = x.clone()
-                x[:, PT-1:-1, ego_mask, :] = ego_projected
-
-                # Sur intent codebook (optional)
-                if self.use_sur_z_local:
-                    sur_tokens_l0 = x[:, PT-1:-1, ~ego_mask, :]
-                    sur_tokens_flat = sur_tokens_l0.reshape(-1, self.trans_d_model)
-                    sur_z_local, sur_intent_w = self.sur_intent_codebook(
-                        sur_tokens_flat, temperature=self.gumbel_temperature)
-                    sur_with_z_local = torch.cat([sur_tokens_flat, sur_z_local], dim=-1)
-                    sur_projected = self.sur_intent_proj(sur_with_z_local)
-                    num_sur = NA - num_ego
-                    sur_projected = sur_projected.view(1, FT, num_sur, self.trans_d_model)
-                    x[:, PT-1:-1, ~ego_mask, :] = sur_projected
-
-        # ================================================================
-        # 6. Output heads: shifted tokens → (acc, yaw_rate)
-        #    PE 3~14 output predicts future step 0~11 (matches AR decoder)
-        # ================================================================
-        future_tokens = x[:, PT-1:-1, :, :]  # (1, FT, NA, D)
-
-        ego_future = future_tokens[:, :, ego_mask, :]  # (1, FT, num_ego, D)
-        sur_future = future_tokens[:, :, ~ego_mask, :]  # (1, FT, num_sur, D)
-
-        ego_out = self.ego_output_head(ego_future)  # (1, FT, num_ego, 2)
-        sur_out = self.sur_output_head(sur_future)  # (1, FT, num_sur, 2)
-
-        # Merge ego/sur outputs: (1, FT, NA, 2)
-        decoder_out = torch.zeros(1, FT, NA, self.traj_out_size, device=device)
-        decoder_out[:, :, ego_mask, :] = ego_out
-        decoder_out[:, :, ~ego_mask, :] = sur_out
-        decoder_out = decoder_out.squeeze(0)  # (FT, NA, 2)
-
-        # ================================================================
-        # 7. Bicycle model → trajectory (NA, FT, 4)
-        # ================================================================
-        cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
-        traj_out = torch.zeros(NA, FT, 4, device=device)
-
-        for t in range(FT):
-            if t == 0:
-                prev_state = scene_graph.past[:, -1, :]
-            else:
-                # Use GT previous state (training uses GT for dynamics)
-                prev_state = gt_future[:, t - 1, :]
-
-            step_out = decoder_out[t]  # (NA, 2)
-            cur_state_global, _, _ = self._apply_dynamics(
-                step_out, prev_state, cur_veh_len, NA, None, False)
-            traj_out[:, t, :] = cur_state_global
-
-        return traj_out
-
     def transformer_decoder_training_blended(self, scene_graph, z, map_tokens, map_idx, map_env,
                                               blend_alpha=0.5):
         """
-        Transformer decoder — blended training mode (AR loop with GT action interpolation).
+        Enc-Dec Cross-Attention decoder — blended training mode.
 
-        At each step:
-          a_applied = (1-alpha) * a_GT + alpha * a_predicted
-          s_{t+1} = BicycleModel(s_t, a_applied)
-
-        Gradient is maintained through the entire loop (no detach).
-        When alpha=0, behaves identically to pure teacher forcing.
+        Architecture:
+          1. Context = ContextEncoder(past_gcn + z_global + map_summary) — computed once
+          2. AR loop (12 steps):
+             a. GCN(current state) → interaction_feat
+             b. query = query_proj(gcn ⊕ z_local ⊕ lw ⊕ sem) + step_PE(t)
+             c. TransDecoderLayer ×2: A2A → A2C(context) → A2S(map) → FFN
+             d. output_head → action → blend with GT → bicycle model
 
         :param blend_alpha: interpolation weight (0=pure GT, 1=pure predicted)
-        :return: traj_out (NA, FT, 4) — predicted future trajectory
+        :return: traj_out (NA, FT, 4)
         """
         NA = z.size(0)
         FT = self.FT
@@ -1580,11 +1346,10 @@ class TrafficPlannerModel(nn.Module):
 
         ego_mask = self._get_ego_mask(scene_graph)
         num_ego = int(ego_mask.sum())
-        ego_inds = scene_graph.ptr[:-1]
 
         cur_veh_len = self.att_normalizer.unnormalize(scene_graph.lw)[:, 0].unsqueeze(1)
 
-        # Precompute GT actions: (N_ego/NA, FT, 2) — but we need all agents
+        # Precompute GT actions for blending
         gt_actions_all = self._compute_gt_actions(scene_graph, ego_only=False)  # (NA, FT, 2)
 
         # Initialize analysis storage
@@ -1596,76 +1361,96 @@ class TrafficPlannerModel(nn.Module):
         self._ego_pred_outputs = []
 
         # ================================================================
-        # 1. Build past tokens from GT
+        # 1. Build Context (once, before AR loop)
         # ================================================================
         gt_past = scene_graph.past  # (NA, PT, state_dim)
-        past_gcn_feats = self._run_interaction_gcn_parallel(gt_past, scene_graph, ego_mask, PT)
-        past_tokens = self._build_decoder_tokens(
-            past_gcn_feats.transpose(0, 1).unsqueeze(0), z, scene_graph)
-        # past_tokens: (1, PT, NA, D)
+        past_gcn_feats = self._run_interaction_gcn_parallel(
+            gt_past, scene_graph, ego_mask, PT)  # (NA, PT, 64)
 
-        all_tokens = past_tokens
+        # Map summary: 3249 tokens → M summary tokens
+        map_summary = self.map_summary_pooling(map_tokens)  # (NA, M, d_model)
+
+        # Context encoder: past + z + map_summary → context tokens
+        context = self.context_encoder(past_gcn_feats, z, map_summary)
+        # context: (NA, PT+K+M, d_model) — fixed across all AR steps
+
+        # Store for health metrics
+        self._last_context = context.detach()
+
+        # ================================================================
+        # 2. AR loop
+        # ================================================================
         prev_state = scene_graph.past[:, -1, :]  # (NA, state_dim)
-
         traj_out = torch.zeros(NA, FT, 4, device=device)
 
-        # Track accumulated states for A2A relative bias
-        if self.use_a2a_rel_bias:
-            accum_states = gt_past.clone()  # (NA, PT, state_dim)
-
         for t in range(FT):
-            cur_T = PT + t
+            # --- GCN for current state ---
+            cur_state_6d = self._get_6d_state(prev_state, False, NA, None)
 
-            # ================================================================
-            # Run Transformer on accumulated tokens
-            # ================================================================
-            causal_mask = self._build_causal_mask(cur_T, device)
+            # Local frame for GCN node features
+            ref_frame = scene_graph.past[:, -1, :4]
+            local_kin = transform2frame(ref_frame, prev_state[:, :4].unsqueeze(1))[:, 0]
+            local_state = torch.cat([local_kin, prev_state[:, 4:]], dim=1)
+            local_6d = self._get_6d_state(local_state, False, NA, None)
 
-            # Map tokens (recrop if needed)
+            gcn_in = torch.cat([local_6d, scene_graph.lw, scene_graph.sem], dim=-1)
+            scene_graph.x = gcn_in
+            scene_graph.pos = cur_state_6d[:, :4]  # global for edge transform
+
+            ego_gcn, sur_gcn = self.interaction_gcn(scene_graph, ego_mask)
+            gcn_feat = self._merge_ego_other_feat(ego_gcn, sur_gcn, ego_mask)
+            # gcn_feat: (NA, 64)
+
+            # --- Build query token ---
+            query_input = torch.cat([gcn_feat, scene_graph.lw, scene_graph.sem], dim=-1)
+            query = self.query_proj(query_input)  # (NA, d_model)
+            query = query + self.step_pe(torch.tensor(t, device=device))  # step PE
+            # Reshape: (1, 1, NA, D) for TransDecoderLayer
+            x = query.unsqueeze(0).unsqueeze(0)
+
+            # --- Map tokens (recrop if needed) ---
             if self.map_recrop and t > 0:
                 cur_map = self._recompute_map_tokens(
                     prev_state[:, :4], map_idx, map_env, scene_graph)
             else:
                 cur_map = map_tokens
 
-            # A2A relative bias states
+            # --- Agent states for A2A relative bias ---
             agent_states_for_bias = None
             if self.use_a2a_rel_bias:
-                agent_states_for_bias = accum_states.permute(1, 0, 2)
+                agent_states_for_bias = cur_state_6d.unsqueeze(0)  # (1, NA, 6)
 
-            x = all_tokens
-
+            # --- Run through Transformer decoder layers ---
             for layer_idx, layer in enumerate(self.trans_layers):
                 is_first_layer = (layer_idx == 0)
                 x_out, extras = layer(
-                    x, ego_mask, causal_mask, cur_map,
+                    x, ego_mask, context, cur_map,
                     return_a2a_output=is_first_layer,
                     return_a2s_weights=is_first_layer,
-                    z_global=z if self.use_adaln else None,
                     agent_states=agent_states_for_bias,
                 )
                 x = x_out
 
-                # Intent between Layer 0 and Layer 1 (last token only)
+                # Intent between Layer 0 and Layer 1
                 if is_first_layer:
+                    # Collect map attn weights
                     if 'ego_map_attn_weights' in extras and extras['ego_map_attn_weights'] is not None:
-                        self._ego_map_attn_weights_outputs.append(extras['ego_map_attn_weights'][-1:])
+                        self._ego_map_attn_weights_outputs.append(extras['ego_map_attn_weights'])
                     if 'sur_map_attn_weights' in extras and extras['sur_map_attn_weights'] is not None:
-                        self._sur_map_attn_weights_outputs.append(extras['sur_map_attn_weights'][-1:])
+                        self._sur_map_attn_weights_outputs.append(extras['sur_map_attn_weights'])
 
-                    # A2A aux outputs: collect last token at each step
+                    # A2A aux outputs
                     if 'a2a_output' in extras:
-                        a2a_out = extras['a2a_output']  # (1, cur_T, NA, D)
-                        a2a_last = a2a_out[:, -1, :, :]  # (1, NA, D)
-                        # sur_pred: ego tokens → predict sur delta
+                        a2a_out = extras['a2a_output']  # (1, 1, NA, D)
+                        a2a_single = a2a_out[:, 0, :, :]  # (1, NA, D)
                         self._sur_pred_outputs.append(
-                            self.sur_pred_head(a2a_last[:, ego_mask, :]).squeeze(0))  # (num_ego, 2)
-                        # ego_pred: sur tokens → predict ego delta
+                            self.sur_pred_head(a2a_single[:, ego_mask, :]).squeeze(0))
                         self._ego_pred_outputs.append(
-                            self.ego_pred_head(a2a_last[:, ~ego_mask, :]).squeeze(0))  # (num_sur, 2)
+                            self.ego_pred_head(a2a_single[:, ~ego_mask, :]).squeeze(0))
 
-                    last_ego_token = x[:, -1:, ego_mask, :]
-                    ego_flat = last_ego_token.reshape(-1, self.trans_d_model)
+                    # Intent codebook (ego)
+                    ego_token = x[:, 0, ego_mask, :]  # (1, num_ego, D)
+                    ego_flat = ego_token.reshape(-1, self.trans_d_model)
 
                     z_local, intent_w = self.intent_codebook(
                         ego_flat, temperature=self.gumbel_temperature)
@@ -1678,21 +1463,19 @@ class TrafficPlannerModel(nn.Module):
                     ego_with_z = torch.cat([ego_flat, z_local], dim=-1)
                     ego_proj = self.ego_intent_proj(ego_with_z)
                     x = x.clone()
-                    x[:, -1:, ego_mask, :] = ego_proj.view(1, 1, -1, self.trans_d_model)
+                    x[:, 0, ego_mask, :] = ego_proj.view(1, -1, self.trans_d_model)
 
                     if self.use_sur_z_local:
-                        last_sur_token = x[:, -1:, ~ego_mask, :]
-                        sur_flat = last_sur_token.reshape(-1, self.trans_d_model)
+                        sur_token = x[:, 0, ~ego_mask, :]
+                        sur_flat = sur_token.reshape(-1, self.trans_d_model)
                         sur_z_local, _ = self.sur_intent_codebook(
                             sur_flat, temperature=self.gumbel_temperature)
                         sur_with_z = torch.cat([sur_flat, sur_z_local], dim=-1)
                         sur_proj = self.sur_intent_proj(sur_with_z)
-                        x[:, -1:, ~ego_mask, :] = sur_proj.view(1, 1, -1, self.trans_d_model)
+                        x[:, 0, ~ego_mask, :] = sur_proj.view(1, -1, self.trans_d_model)
 
-            # ================================================================
-            # Extract last token → output head → blend with GT → bicycle model
-            # ================================================================
-            last_tokens = x[:, -1, :, :]  # (1, NA, D)
+            # --- Output head → action → blend → bicycle model ---
+            last_tokens = x[:, 0, :, :]  # (1, NA, D)
 
             ego_last = last_tokens[:, ego_mask, :]
             sur_last = last_tokens[:, ~ego_mask, :]
@@ -1703,54 +1486,26 @@ class TrafficPlannerModel(nn.Module):
             pred_action[ego_mask] = ego_out
             pred_action[~ego_mask] = sur_out
 
-            # Blend predicted action with GT action (gradient maintained!)
-            gt_action_t = gt_actions_all[:, t, :]  # (NA, 2)
+            # Blend with GT action
+            gt_action_t = gt_actions_all[:, t, :]
             blended_action = (1.0 - blend_alpha) * gt_action_t + blend_alpha * pred_action
 
-            # Apply bicycle model with blended action
+            # Bicycle model
             cur_state_global, _, cur_bike_state = self._apply_dynamics(
                 blended_action, prev_state, cur_veh_len, NA, None, False)
 
             traj_out[:, t, :] = cur_state_global
 
-            # Update prev_state for next step (gradient flows through!)
+            # Update prev_state (gradient flows through!)
             if self.output_bicycle and cur_bike_state is not None:
                 prev_state = cur_bike_state
             else:
                 prev_state = cur_state_global
 
-            # ================================================================
-            # Build new token for next step and append
-            # ================================================================
-            if t < FT - 1:
-                cur_state_6d = self._get_6d_state(prev_state, False, NA, None)
-
-                if self.use_a2a_rel_bias:
-                    accum_states = torch.cat([
-                        accum_states, cur_state_6d.unsqueeze(1)], dim=1)
-
-                # Local frame transform for GCN node features (same ref as encoder)
-                ref_frame = scene_graph.past[:, -1, :4]  # (NA, 4)
-                local_kin = transform2frame(ref_frame, prev_state[:, :4].unsqueeze(1))[:, 0]
-                local_state = torch.cat([local_kin, prev_state[:, 4:]], dim=1)
-                local_6d = self._get_6d_state(local_state, False, NA, None)
-
-                gcn_in = torch.cat([local_6d, scene_graph.lw, scene_graph.sem], dim=-1)
-                scene_graph.x = gcn_in
-                scene_graph.pos = cur_state_6d[:, :4]  # global for edge transform
-
-                ego_gcn, sur_gcn = self.interaction_gcn(scene_graph, ego_mask)
-                gcn_merged = self._merge_ego_other_feat(ego_gcn, sur_gcn, ego_mask)
-
-                new_gcn = gcn_merged.unsqueeze(0).unsqueeze(0)
-                new_token = self._build_decoder_tokens_single(
-                    new_gcn, z, scene_graph, t_pos=PT + t)
-                all_tokens = torch.cat([all_tokens, new_token], dim=1)
-
-        # Stack map attn weights for loss computation
+        # Stack collected outputs
         if self._ego_map_attn_weights_outputs:
             self._ego_map_attn_weights_outputs = torch.cat(
-                self._ego_map_attn_weights_outputs, dim=0)  # (FT, N_ego, num_tokens)
+                self._ego_map_attn_weights_outputs, dim=0)
         if self._sur_map_attn_weights_outputs:
             self._sur_map_attn_weights_outputs = torch.cat(
                 self._sur_map_attn_weights_outputs, dim=0)
@@ -1765,14 +1520,14 @@ class TrafficPlannerModel(nn.Module):
     def transformer_decoder_inference(self, scene_graph, z, map_tokens, map_idx, map_env,
                                        ext_future=None, nfuture=None, sur_gt_replay=False):
         """
-        Transformer decoder — inference mode (autoregressive).
+        Enc-Dec Cross-Attention decoder — inference mode (autoregressive).
 
-        Start with PT past tokens, predict one future step at a time,
-        run bicycle model, compute new GCN features, build new token, append, repeat.
+        Same architecture as training: context + single-query AR loop.
+        Supports multi-sample (z: NA, NS, z_size).
 
         :return: traj_out (NA, FT, 4) or (NA, NS, FT, 4) for multi-sample
         """
-        NA = z.size(0) if z.dim() == 2 else z.size(0)
+        NA = z.size(0)
         FT = self.FT if nfuture is None else nfuture
         PT = self.PT
         device = z.device
@@ -1806,97 +1561,120 @@ class TrafficPlannerModel(nn.Module):
             z_flat = z
             map_tokens_flat = map_tokens
 
+        NA_eff = NA * NS if mult_samp else NA
+
         # ================================================================
-        # 1. Build past tokens from past GT
+        # 1. Build Context (once)
         # ================================================================
         gt_past = scene_graph.past  # (NA, PT, state_dim)
-        past_gcn_feats = self._run_interaction_gcn_parallel(gt_past, scene_graph, ego_mask, PT)
-        # past_gcn_feats: (NA, PT, 64)
+        past_gcn_feats = self._run_interaction_gcn_parallel(
+            gt_past, scene_graph, ego_mask, PT)  # (NA, PT, 64)
 
         if mult_samp:
-            # Expand past features for multi-sample
-            past_gcn_feats = past_gcn_feats.unsqueeze(1).expand(-1, NS, -1, -1).reshape(NA * NS, PT, self.gcn_hidden_dim)
-            # Build tokens with expanded z: (NA*NS, PT, 64) → (PT, NA*NS, 64) → (1, PT, NA*NS, 64)
-            past_tokens = self._build_decoder_tokens(
-                past_gcn_feats.transpose(0, 1).unsqueeze(0), z_flat, scene_graph, mult_samp=True, NS=NS)
+            past_gcn_feats_exp = past_gcn_feats.unsqueeze(1).expand(-1, NS, -1, -1).reshape(
+                NA_eff, PT, self.gcn_hidden_dim)
+            map_summary = self.map_summary_pooling(map_tokens_flat)  # (NA_eff, M, d_model)
+            context = self.context_encoder(past_gcn_feats_exp, z_flat, map_summary)
         else:
-            # past_gcn_feats: (NA, PT, 64) → (PT, NA, 64) → (1, PT, NA, 64)
-            past_tokens = self._build_decoder_tokens(
-                past_gcn_feats.transpose(0, 1).unsqueeze(0), z_flat, scene_graph)
+            map_summary = self.map_summary_pooling(map_tokens)  # (NA, M, d_model)
+            context = self.context_encoder(past_gcn_feats, z_flat, map_summary)
+        # context: (NA_eff, C, d_model)
 
-        # all_tokens: accumulate tokens as we predict
-        # Start with past tokens: (1, PT, NA_eff, D)
-        NA_eff = NA * NS if mult_samp else NA
-        all_tokens = past_tokens  # (1, PT, NA_eff, D)
-
-        # Initialize state
+        # ================================================================
+        # 2. AR loop
+        # ================================================================
         prev_state = scene_graph.past[:, -1, :]  # (NA, state_dim)
         if mult_samp:
-            prev_state = prev_state.unsqueeze(1).expand(NA, NS, -1).reshape(NA * NS, -1)
+            prev_state = prev_state.unsqueeze(1).expand(NA, NS, -1).reshape(NA_eff, -1)
             if ext_future is not None:
-                ext_future = ext_future.unsqueeze(1).expand(NA, NS, -1, 4).reshape(NA * NS, -1, 4)
-            scene_graph_pos_backup = scene_graph.pos.clone() if hasattr(scene_graph, 'pos') else None
+                ext_future = ext_future.unsqueeze(1).expand(NA, NS, -1, 4).reshape(NA_eff, -1, 4)
 
-        traj_dim = 4
-        traj_out = torch.zeros(NA_eff, FT, traj_dim, device=device)
-
-        # Track accumulated states for A2A relative bias
-        # Start with past states: (NA_eff, PT, state_dim)
-        if self.use_a2a_rel_bias:
-            if mult_samp:
-                accum_states = gt_past.unsqueeze(1).expand(-1, NS, -1, -1).reshape(NA_eff, PT, -1)
-            else:
-                accum_states = gt_past.clone()  # (NA, PT, state_dim)
+        traj_out = torch.zeros(NA_eff, FT, 4, device=device)
+        cur_ego = ego_mask if not mult_samp else self._expand_ego_mask(ego_mask, NS)
 
         for t in range(FT):
-            cur_T = PT + t  # current sequence length
+            # --- GCN for current state ---
+            cur_state_6d = self._get_6d_state(prev_state, False, NA_eff, None)
 
-            # ================================================================
-            # Run Transformer on accumulated tokens
-            # ================================================================
-            causal_mask = self._build_causal_mask(cur_T, device)
+            ref_frame = scene_graph.past[:, -1, :4]  # (NA, 4)
+            if mult_samp:
+                ref_frame_exp = ref_frame.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, 4)
+            else:
+                ref_frame_exp = ref_frame
+            local_kin = transform2frame(ref_frame_exp, prev_state[:, :4].unsqueeze(1))[:, 0]
+            local_state = torch.cat([local_kin, prev_state[:, 4:]], dim=1)
+            local_6d = self._get_6d_state(local_state, False, NA_eff, None)
 
-            # Compute map_tokens for current agents
+            if mult_samp:
+                local_for_gcn = local_6d.reshape(NA, NS, -1)
+                scene_graph.x = torch.cat([local_for_gcn,
+                                            scene_graph.lw.unsqueeze(1).expand(-1, NS, -1),
+                                            scene_graph.sem.unsqueeze(1).expand(-1, NS, -1)], dim=-1)
+                scene_graph.pos = cur_state_6d.reshape(NA, NS, -1)[..., :4]
+            else:
+                gcn_in = torch.cat([local_6d, scene_graph.lw, scene_graph.sem], dim=-1)
+                scene_graph.x = gcn_in
+                scene_graph.pos = cur_state_6d[:, :4]
+
+            ego_gcn, sur_gcn = self.interaction_gcn(scene_graph, ego_mask)
+            gcn_feat = self._merge_ego_other_feat(ego_gcn, sur_gcn, ego_mask)
+            if mult_samp:
+                gcn_feat = gcn_feat.reshape(NA_eff, self.gcn_hidden_dim)
+
+            # --- Build query token ---
+            if mult_samp:
+                lw_exp = scene_graph.lw.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, -1)
+                sem_exp = scene_graph.sem.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, -1)
+            else:
+                lw_exp = scene_graph.lw
+                sem_exp = scene_graph.sem
+
+            query_input = torch.cat([gcn_feat, lw_exp, sem_exp], dim=-1)
+            query = self.query_proj(query_input) + self.step_pe(torch.tensor(t, device=device))
+            x = query.unsqueeze(0).unsqueeze(0)  # (1, 1, NA_eff, D)
+
+            # --- Map tokens ---
             if self.map_recrop and t > 0:
-                cur_pos = prev_state[:, :4]  # (NA_eff, 4) normalized
                 cur_map = self._recompute_map_tokens(
-                    cur_pos, map_idx, map_env, scene_graph,
+                    prev_state[:, :4], map_idx, map_env, scene_graph,
                     mult_samp=mult_samp, NS=NS)
             else:
-                cur_map = map_tokens_flat  # (NA_eff, num_tokens, ch)
+                cur_map = map_tokens_flat
 
-            # Prepare agent states for A2A bias: (cur_T, NA_eff, state_dim)
+            # --- A2A bias ---
             agent_states_for_bias = None
             if self.use_a2a_rel_bias:
-                agent_states_for_bias = accum_states.permute(1, 0, 2)  # (cur_T, NA_eff, 6)
+                agent_states_for_bias = cur_state_6d.unsqueeze(0)  # (1, NA_eff, 6)
 
-            x = all_tokens  # (1, cur_T, NA_eff, D)
-
-            cur_ego = ego_mask if not mult_samp else self._expand_ego_mask(ego_mask, NS)
+            # --- Transformer decoder layers ---
             for layer_idx, layer in enumerate(self.trans_layers):
                 is_first_layer = (layer_idx == 0)
                 x_out, extras = layer(
-                    x, cur_ego,
-                    causal_mask, cur_map,
-                    return_a2a_output=False,
+                    x, cur_ego, context, cur_map,
+                    return_a2a_output=is_first_layer,
                     return_a2s_weights=is_first_layer,
-                    z_global=z_flat if self.use_adaln else None,
                     agent_states=agent_states_for_bias,
                 )
                 x = x_out
 
                 # Intent between Layer 0 and Layer 1
                 if is_first_layer:
-                    # Collect map attn weights — last token only (current prediction step)
                     if 'ego_map_attn_weights' in extras and extras['ego_map_attn_weights'] is not None:
-                        self._ego_map_attn_weights_outputs.append(extras['ego_map_attn_weights'][-1:])
+                        self._ego_map_attn_weights_outputs.append(extras['ego_map_attn_weights'])
                     if 'sur_map_attn_weights' in extras and extras['sur_map_attn_weights'] is not None:
-                        self._sur_map_attn_weights_outputs.append(extras['sur_map_attn_weights'][-1:])
+                        self._sur_map_attn_weights_outputs.append(extras['sur_map_attn_weights'])
 
-                    cur_ego_mask = ego_mask if not mult_samp else self._expand_ego_mask(ego_mask, NS)
-                    # Only apply intent to the last token (current prediction step)
-                    last_ego_token = x[:, -1:, cur_ego_mask, :]  # (1, 1, num_ego_eff, D)
-                    ego_flat = last_ego_token.reshape(-1, self.trans_d_model)
+                    # A2A aux outputs (same as training: collect from A2A output)
+                    if 'a2a_output' in extras:
+                        a2a_out = extras['a2a_output']  # (1, 1, NA_eff, D)
+                        a2a_single = a2a_out[:, 0, :, :]  # (1, NA_eff, D)
+                        self._sur_pred_outputs.append(
+                            self.sur_pred_head(a2a_single[:, cur_ego, :]).squeeze(0))
+                        self._ego_pred_outputs.append(
+                            self.ego_pred_head(a2a_single[:, ~cur_ego, :]).squeeze(0))
+
+                    ego_token = x[:, 0, cur_ego, :]
+                    ego_flat = ego_token.reshape(-1, self.trans_d_model)
 
                     z_local, intent_w = self.intent_codebook(
                         ego_flat, temperature=self.gumbel_temperature)
@@ -1909,43 +1687,32 @@ class TrafficPlannerModel(nn.Module):
                     ego_with_z = torch.cat([ego_flat, z_local], dim=-1)
                     ego_proj = self.ego_intent_proj(ego_with_z)
                     x = x.clone()
-                    x[:, -1:, cur_ego_mask, :] = ego_proj.view(1, 1, -1, self.trans_d_model)
+                    x[:, 0, cur_ego, :] = ego_proj.view(1, -1, self.trans_d_model)
 
                     if self.use_sur_z_local:
-                        last_sur_token = x[:, -1:, ~cur_ego_mask, :]
-                        sur_flat = last_sur_token.reshape(-1, self.trans_d_model)
+                        sur_token = x[:, 0, ~cur_ego, :]
+                        sur_flat = sur_token.reshape(-1, self.trans_d_model)
                         sur_z_local, _ = self.sur_intent_codebook(
                             sur_flat, temperature=self.gumbel_temperature)
                         sur_with_z = torch.cat([sur_flat, sur_z_local], dim=-1)
                         sur_proj = self.sur_intent_proj(sur_with_z)
-                        x[:, -1:, ~cur_ego_mask, :] = sur_proj.view(1, 1, -1, self.trans_d_model)
+                        x[:, 0, ~cur_ego, :] = sur_proj.view(1, -1, self.trans_d_model)
 
-            # ================================================================
-            # Extract last token → output head → bicycle model
-            # ================================================================
-            last_tokens = x[:, -1, :, :]  # (1, NA_eff, D)
-            cur_ego_mask = ego_mask if not mult_samp else self._expand_ego_mask(ego_mask, NS)
+            # --- Output head → bicycle model ---
+            last_tokens = x[:, 0, :, :]  # (1, NA_eff, D)
 
-            ego_last = last_tokens[:, cur_ego_mask, :]  # (1, num_ego_eff, D)
-            sur_last = last_tokens[:, ~cur_ego_mask, :]
+            ego_last = last_tokens[:, cur_ego, :]
+            sur_last = last_tokens[:, ~cur_ego, :]
 
-            # Aux pred: ego→sur, sur→ego (for val diagnostics)
-            if hasattr(self, 'sur_pred_head'):
-                self._sur_pred_outputs.append(self.sur_pred_head(ego_last).squeeze(0))  # (num_ego_eff, 2)
-            if hasattr(self, 'ego_pred_head'):
-                self._ego_pred_outputs.append(self.ego_pred_head(sur_last).squeeze(0))  # (num_sur_eff, 2)
-
-            ego_out = self.ego_output_head(ego_last).squeeze(0)  # (num_ego_eff, 2)
+            ego_out = self.ego_output_head(ego_last).squeeze(0)
             sur_out = self.sur_output_head(sur_last).squeeze(0)
 
-            # Merge
             decoder_out = torch.zeros(NA_eff, self.traj_out_size, device=device)
-            decoder_out[cur_ego_mask] = ego_out
-            decoder_out[~cur_ego_mask] = sur_out
+            decoder_out[cur_ego] = ego_out
+            decoder_out[~cur_ego] = sur_out
 
-            # Bicycle model
             cur_state_global, cur_state_local, cur_bike_state = self._apply_dynamics(
-                decoder_out, prev_state, cur_veh_len, NA if not mult_samp else NA * NS, None, False)
+                decoder_out, prev_state, cur_veh_len, NA_eff, None, False)
 
             # Handle external future
             if ext_future is not None:
@@ -1958,106 +1725,25 @@ class TrafficPlannerModel(nn.Module):
 
             # Handle sur GT replay
             if sur_gt_replay and hasattr(scene_graph, 'future_gt'):
-                num_sur = NA_eff - int(cur_ego_mask.sum())
+                num_sur = NA_eff - int(cur_ego.sum())
                 cur_state_global, cur_state_local, cur_bike_state = self._apply_sur_gt_replay(
                     scene_graph, cur_state_global, cur_state_local, cur_bike_state,
-                    prev_state, cur_ego_mask, t, False, NA_eff, None, num_sur)
+                    prev_state, cur_ego, t, False, NA_eff, None, num_sur)
 
             traj_out[:, t, :] = cur_state_global
 
-            # Update prev_state
             if self.output_bicycle and cur_bike_state is not None:
                 prev_state = cur_bike_state
             else:
                 prev_state = cur_state_global
 
-            # ================================================================
-            # Build new token for next step and append
-            # ================================================================
-            if t < FT - 1:
-                cur_state_6d = self._get_6d_state(prev_state, False, NA_eff, None)
-
-                # Accumulate states for A2A relative bias
-                if self.use_a2a_rel_bias:
-                    accum_states = torch.cat([
-                        accum_states, cur_state_6d.unsqueeze(1)], dim=1)
-
-                # Local frame transform for GCN node features (same ref as encoder)
-                ref_frame = scene_graph.past[:, -1, :4]  # (NA, 4)
-                if mult_samp:
-                    ref_frame_exp = ref_frame.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, 4)
-                else:
-                    ref_frame_exp = ref_frame
-                local_kin = transform2frame(ref_frame_exp, prev_state[:, :4].unsqueeze(1))[:, 0]
-                local_state = torch.cat([local_kin, prev_state[:, 4:]], dim=1)
-                local_6d = self._get_6d_state(local_state, False, NA_eff, None)
-
-                if mult_samp:
-                    # Reshape for GCN: (NA*NS) → (NA, NS, ...)
-                    local_for_gcn = local_6d.reshape(NA, NS, -1)
-                    scene_graph.x = torch.cat([local_for_gcn,
-                                                scene_graph.lw.unsqueeze(1).expand(-1, NS, -1),
-                                                scene_graph.sem.unsqueeze(1).expand(-1, NS, -1)], dim=-1)
-                    cur_state_for_gcn = cur_state_6d.reshape(NA, NS, -1)
-                    scene_graph.pos = cur_state_for_gcn[..., :4]  # global for edge transform
-                else:
-                    gcn_in = torch.cat([local_6d, scene_graph.lw, scene_graph.sem], dim=-1)
-                    scene_graph.x = gcn_in
-                    scene_graph.pos = cur_state_6d[:, :4]  # global for edge transform
-
-                ego_gcn, sur_gcn = self.interaction_gcn(scene_graph, ego_mask)
-                gcn_merged = self._merge_ego_other_feat(ego_gcn, sur_gcn, ego_mask)
-
-                if mult_samp:
-                    gcn_merged = gcn_merged.reshape(NA * NS, self.gcn_hidden_dim)
-
-                # Build single token
-                new_gcn = gcn_merged.unsqueeze(0).unsqueeze(0)  # (1, 1, NA_eff, 64)
-                new_token = self._build_decoder_tokens_single(
-                    new_gcn, z_flat, scene_graph, t_pos=PT + t,
-                    mult_samp=mult_samp, NS=NS)
-                # (1, 1, NA_eff, D)
-                all_tokens = torch.cat([all_tokens, new_token], dim=1)
-
         if mult_samp:
-            traj_out = traj_out.reshape(NA, NS, FT, traj_dim)
+            traj_out = traj_out.reshape(NA, NS, FT, 4)
         return traj_out
 
     def _expand_ego_mask(self, ego_mask, NS):
         """Expand ego_mask (NA,) → (NA*NS,) for multi-sample."""
         return ego_mask.unsqueeze(1).expand(-1, NS).reshape(-1)
-
-    def _build_decoder_tokens_single(self, gcn_feat, z, scene_graph, t_pos,
-                                      mult_samp=False, NS=None):
-        """
-        Build a single decoder token for timestep t_pos.
-
-        :param gcn_feat: (1, 1, NA_eff, gcn_hidden_dim)
-        :param z: (NA_eff, z_size)
-        :param t_pos: integer position for temporal PE
-        :return: (1, 1, NA_eff, trans_d_model)
-        """
-        NA_eff = gcn_feat.size(2)
-        device = gcn_feat.device
-
-        if mult_samp:
-            lw = scene_graph.lw.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, -1)
-            sem = scene_graph.sem.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, -1)
-        else:
-            lw = scene_graph.lw
-            sem = scene_graph.sem
-
-        z_expand = z.unsqueeze(0).unsqueeze(0)  # (1, 1, NA_eff, z_size)
-        lw_expand = lw.unsqueeze(0).unsqueeze(0)  # (1, 1, NA_eff, 2)
-        sem_expand = sem.unsqueeze(0).unsqueeze(0)
-
-        token_input = torch.cat([gcn_feat, z_expand, lw_expand, sem_expand], dim=-1)
-        token = self.token_proj(token_input)  # (1, 1, NA_eff, D)
-
-        pe = self.temporal_pe(torch.tensor([t_pos], device=device))  # (1, D)
-        token = token + pe.view(1, 1, 1, -1)
-
-        return token
 
     # ============================================================
     # GT action computation (shared by z_aux loss and action blending)
@@ -2346,13 +2032,13 @@ class TrafficPlannerModel(nn.Module):
 
         FROZEN:
         - Encoder (prior, posterior, temporal GCN, map CNN)
-        - Interaction GCN, token_proj, temporal_pe
-        - A2T (all layers), A2A K/V + sur Q/O (all layers)
-        - A2S K/V + sur Q/O (all layers), sur FFN (all layers)
-        - Sur output head, ego pred head
+        - Context encoder, map summary pooling
+        - Interaction GCN, query_proj, step_pe
+        - A2A K/V + sur Q/O, A2C K/V + sur Q/O, A2S K/V + sur Q/O
+        - sur FFN (all layers), sur output head, ego pred head
 
         TRAINABLE:
-        - A2A ego Q/O (all layers), A2S ego Q/O (all layers)
+        - A2A ego Q/O, A2C ego Q/O, A2S ego Q/O (all layers)
         - Ego FFN (all layers), ego output head
         - Intent codebook, intent CE head, sur pred head
         - Ego intent projection
@@ -2376,6 +2062,11 @@ class TrafficPlannerModel(nn.Module):
             trainable_modules.extend([
                 layer.a2a_attn.ego_q_proj,
                 layer.a2a_attn.ego_o_proj,
+            ])
+            # A2C: ego Q/O
+            trainable_modules.extend([
+                layer.a2c_ego_q_proj,
+                layer.a2c_ego_o_proj,
             ])
             # A2S: ego Q/O
             trainable_modules.extend([

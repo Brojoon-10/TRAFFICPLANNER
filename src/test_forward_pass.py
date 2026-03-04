@@ -111,13 +111,18 @@ def setup_model(device):
         output_bicycle=True, dt=0.5,
         num_intents=9, sur_pred_dim=2,
         # Transformer decoder params
-        trans_num_layers=4,
+        trans_num_layers=2,
         trans_d_model=128,
         trans_nhead=8,
-        trans_ffn_dim=512,
+        trans_ffn_dim=256,
         trans_dropout=0.1,
         use_ego_z_local=True,
         use_sur_z_local=False,
+        # Enc-Dec Cross-Attention params
+        use_a2a_rel_bias=True,
+        num_z_tokens=4,
+        context_num_layers=2,
+        map_summary_tokens=8,
     ).to(device)
 
     state_norm, att_norm = make_dummy_normalizers()
@@ -152,9 +157,11 @@ def test_model_instantiation(device):
     print(f"  num_intents: {model.num_intents}")
 
     # Check Transformer layers exist
-    assert len(model.trans_layers) == 4, f"Expected 4 trans layers, got {len(model.trans_layers)}"
-    assert hasattr(model, 'token_proj'), "Missing token_proj"
-    assert hasattr(model, 'temporal_pe'), "Missing temporal_pe"
+    assert len(model.trans_layers) == 2, f"Expected 2 trans layers, got {len(model.trans_layers)}"
+    assert hasattr(model, 'query_proj'), "Missing query_proj"
+    assert hasattr(model, 'step_pe'), "Missing step_pe"
+    assert hasattr(model, 'context_encoder'), "Missing context_encoder"
+    assert hasattr(model, 'map_summary_pooling'), "Missing map_summary_pooling"
     assert hasattr(model, 'intent_codebook'), "Missing intent_codebook"
     assert hasattr(model, 'ego_output_head'), "Missing ego_output_head"
     assert hasattr(model, 'sur_output_head'), "Missing sur_output_head"
@@ -167,9 +174,9 @@ def test_model_instantiation(device):
 
 
 def test_training_forward(model, device):
-    """Test training forward (parallel with causal mask)."""
+    """Test training forward (Enc-Dec Cross-Attention, AR blended)."""
     print("=" * 60)
-    print("[2] Training Forward (teacher_forcing=True, parallel)")
+    print("[2] Training Forward (teacher_forcing=True, Enc-Dec AR)")
     print("=" * 60)
 
     B, agents_per_scene = 2, 3
@@ -202,31 +209,36 @@ def test_training_forward(model, device):
     assert isinstance(intent_w, torch.Tensor), f"Training mode should return tensor, got {type(intent_w)}"
     assert intent_w.shape == (12, num_ego, 9), f"Expected (12, {num_ego}, 9), got {intent_w.shape}"
 
-    # ego map attn: training → tensor (B*T_total, N_ego, num_tokens)
+    # ego map attn: training → tensor (FT, N_ego, num_tokens) — one per AR step
     ego_map_attn = model.get_ego_map_attn_weights()
     assert ego_map_attn is not None, "ego_map_attn should be available in training"
     assert isinstance(ego_map_attn, torch.Tensor), f"Expected tensor, got {type(ego_map_attn)}"
-    T_total = 4 + 12  # PT + FT
-    print(f"  ego_map_attn shape: {ego_map_attn.shape} (expected B*T_total={B*T_total} or T_total={T_total})")
+    print(f"  ego_map_attn shape: {ego_map_attn.shape}")
 
     # sur map attn
     sur_map_attn = model.get_sur_map_attn_weights()
     assert sur_map_attn is not None, "sur_map_attn should be available in training"
 
-    # sur_pred/ego_pred: training → tensor
+    # sur_pred/ego_pred: AR loop → list of FT tensors
     sur_pred = model.get_sur_pred_outputs()
     assert sur_pred is not None, "sur_pred should be available"
-    assert isinstance(sur_pred, torch.Tensor), f"Expected tensor, got {type(sur_pred)}"
+    if isinstance(sur_pred, list):
+        sur_pred_stacked = torch.stack(sur_pred, dim=0)
+    else:
+        sur_pred_stacked = sur_pred
 
     ego_pred = model.get_ego_pred_outputs()
     assert ego_pred is not None, "ego_pred should be available"
-    assert isinstance(ego_pred, torch.Tensor), f"Expected tensor, got {type(ego_pred)}"
+    if isinstance(ego_pred, list):
+        ego_pred_stacked = torch.stack(ego_pred, dim=0)
+    else:
+        ego_pred_stacked = ego_pred
 
     print(f"  future_pred shape: {fp.shape}")
     print(f"  z_local shape: {z_local.shape}")
     print(f"  intent_weights shape: {intent_w.shape}")
-    print(f"  sur_pred shape: {sur_pred.shape}")
-    print(f"  ego_pred shape: {ego_pred.shape}")
+    print(f"  sur_pred shape: {sur_pred_stacked.shape}")
+    print(f"  ego_pred shape: {ego_pred_stacked.shape}")
     print("  [OK] Training forward pass successful\n")
     return pred
 
@@ -488,9 +500,11 @@ def test_freeze_for_finetuning(model, device):
         else:
             print(f"  [WARNING] {kw}: not found in frozen")
 
-    # A2T (self-attn) should be fully frozen
-    a2t = [n for n in frozen if 'a2t_self_attn' in n]
-    print(f"  [FROZEN] A2T self-attn: {len(a2t)} params")
+    # A2C (context cross-attn) ego Q/O should be trainable, K/V frozen
+    a2c_ego = [n for n in trainable if 'a2c_ego' in n]
+    print(f"  [TRAINABLE] A2C ego Q/O: {len(a2c_ego)} params")
+    a2c_kv = [n for n in frozen if 'a2c_ctx' in n]
+    print(f"  [FROZEN] A2C K/V: {len(a2c_kv)} params")
 
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     num_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)

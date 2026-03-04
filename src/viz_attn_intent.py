@@ -640,6 +640,10 @@ def main():
         trans_dropout=cfg.trans_dropout,
         use_ego_z_local=cfg.use_ego_z_local,
         use_sur_z_local=cfg.use_sur_z_local,
+        use_a2a_rel_bias=getattr(cfg, 'use_a2a_rel_bias', False),
+        num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
+        context_num_layers=getattr(cfg, 'context_num_layers', 2),
+        map_summary_tokens=getattr(cfg, 'map_summary_tokens', 8),
     ).to(device)
 
     # Load checkpoint
