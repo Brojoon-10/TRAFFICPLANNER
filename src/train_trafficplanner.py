@@ -106,8 +106,15 @@ def parse_cfg():
                         help='Freeze z_global encoder (automatic in Phase 2)')
 
     # Losses - base
-    parser.add_argument('--loss_kl', type=float, default=0.004, help='KL loss weight')
-    parser.add_argument('--kl_anneal_end', type=int, default=20, help='If given, uses KL loss annealing and will reach full weight at this epoch.')
+    parser.add_argument('--loss_kl', type=float, default=0.004, help='KL loss weight (target beta)')
+    parser.add_argument('--kl_anneal_steps', type=int, default=5000, help='Steps for linear KL annealing (0 = immediate full weight)')
+    parser.add_argument('--kl_floor', type=float, default=0.0, help='Minimum KL beta floor (never zero)')
+    parser.add_argument('--kl_free_bits', type=float, default=0.0,
+                        help='Free bits per latent dim (0=off). KL_dim = max(KL_dim - free_bits, 0)')
+    parser.add_argument('--enc_dropout', type=float, default=0.1,
+                        help='Encoder PositionalEncoding dropout (0=off)')
+    parser.add_argument('--dec_past_dropout', type=float, default=0.0,
+                        help='Decoder past context dropout to force z_global dependency (0=off)')
     parser.add_argument('--loss_recon', type=float, default=1.0, help='Reconstruction loss weight')
     parser.add_argument('--recon_pos_weight', type=float, default=1.0,
                         help='Position (x,y) weight in recon_loss (compensates normalization std)')
@@ -214,6 +221,8 @@ def parse_cfg():
                         help='Steps over which blend_alpha ramps to target')
     parser.add_argument('--blend_target_alpha', type=float, default=0.5,
                         help='Target blend_alpha (0=pure GT, 1=pure predicted)')
+    parser.add_argument('--blend_alpha_floor', type=float, default=0.0,
+                        help='Minimum blend_alpha from step 0 (e.g. 0.05 for 5%% pred from start)')
 
     args = parser.parse_args()
     config_dict = vars(args)
@@ -263,13 +272,21 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
             gc.collect()
             torch.cuda.empty_cache()
         try:
-            # Step-based annealing: compute blend_alpha and map_attn_w per batch
+            # Step-based annealing: compute blend_alpha, map_attn_w, kl_weight per batch
             cur_blend_alpha = 0.0
             if train and cfg is not None:
+                # KL annealing: step-based linear ramp with floor
+                kl_anneal_steps = getattr(cfg, 'kl_anneal_steps', 0)
+                if kl_anneal_steps > 0:
+                    cur_kl = compute_kl_weight(global_step, kl_anneal_steps, cfg.loss_kl,
+                                               kl_beta_floor=getattr(cfg, 'kl_floor', 0.0))
+                    loss_fn.loss_weights['kl'] = cur_kl
+
                 # Action blending: step-based alpha ramp
-                if getattr(cfg, 'action_blending', False) and global_step >= cfg.blend_start_step:
-                    progress = (global_step - cfg.blend_start_step) / max(cfg.blend_anneal_steps, 1)
-                    cur_blend_alpha = min(cfg.blend_target_alpha, cfg.blend_target_alpha * progress)
+                if getattr(cfg, 'action_blending', False):
+                    blend_floor = getattr(cfg, 'blend_alpha_floor', 0.0)
+                    progress = min(global_step / max(cfg.blend_anneal_steps, 1), 1.0)
+                    cur_blend_alpha = blend_floor + (cfg.blend_target_alpha - blend_floor) * progress
 
                 # Map attn annealing: step-based cosine decay (overrides epoch-based)
                 if getattr(cfg, 'map_attn_anneal', False) and cfg.loss_map_attn > 0:
@@ -402,6 +419,9 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                 # Log annealing values
                 if cur_blend_alpha > 0:
                     tb_writer.add_scalar('anneal/blend_alpha', cur_blend_alpha, global_step)
+                if cfg is not None and getattr(cfg, 'kl_anneal_steps', 0) > 0:
+                    tb_writer.add_scalar('anneal/kl_weight',
+                                         loss_fn.loss_weights.get('kl', 0), global_step)
                 if cfg is not None and getattr(cfg, 'map_attn_anneal', False):
                     tb_writer.add_scalar('anneal/map_attn_weight',
                                          loss_fn.loss_weights.get('map_attn', 0), global_step)
@@ -547,6 +567,8 @@ def main():
         use_a2a_rel_bias=cfg.use_a2a_rel_bias,
         use_z_cross_attn=getattr(cfg, 'use_z_cross_attn', False),
         num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
+        enc_dropout=getattr(cfg, 'enc_dropout', 0.1),
+        dec_past_dropout=getattr(cfg, 'dec_past_dropout', 0.0),
     ).to(device)
 
     train_loss = []
@@ -617,6 +639,7 @@ def main():
         sparsity_cfg=sparsity_cfg,
         aux_cfg=aux_cfg,
         recon_pos_weight=getattr(cfg, 'recon_pos_weight', 1.0),
+        kl_free_bits=getattr(cfg, 'kl_free_bits', 0.0),
     ).to(device)
 
     Logger.log('Num model params: %d' % (count_params(model)))
@@ -747,6 +770,7 @@ def main():
         Logger.log(f'  blend_start_step: {cfg.blend_start_step}')
         Logger.log(f'  blend_anneal_steps: {cfg.blend_anneal_steps}')
         Logger.log(f'  blend_target_alpha: {cfg.blend_target_alpha}')
+        Logger.log(f'  blend_alpha_floor: {getattr(cfg, "blend_alpha_floor", 0.0)}')
 
     # Loss function parameters
     Logger.log('\n[Loss Function]')
@@ -788,11 +812,11 @@ def main():
     Logger.log('=' * 80)
     Logger.log('')
 
-    # KL loss annealing
-    use_kl_anneal = cfg.kl_anneal_end is not None
+    # KL loss annealing (step-based, computed per batch in run_one_epoch)
+    use_kl_anneal = getattr(cfg, 'kl_anneal_steps', 0) > 0
     if use_kl_anneal:
-        assert cfg.kl_anneal_end > 0
-        Logger.log('Using KL annealing...')
+        Logger.log(f'Using step-based KL annealing: {cfg.kl_anneal_steps} steps, '
+                   f'floor={cfg.kl_floor}, target={cfg.loss_kl}')
 
     # run training
     ckpts_path = os.path.join(cfg.out, 'checkpoints_trafficplanner')
@@ -824,16 +848,12 @@ def main():
     for epoch in range(ckpt_epoch, cfg.epochs):
         Logger.log('Starting epoch %d...' % epoch)
 
-        # compute loss weights with KL annealing (Phase 1 only)
+        # KL annealing: step-based (computed per batch in run_one_epoch)
+        # Just log current KL weight at epoch start
         if use_kl_anneal:
-            cur_beta = compute_kl_weight(epoch, cfg.kl_anneal_end, cfg.loss_kl)
-            loss_fn.loss_weights['kl'] = cur_beta
-            Logger.log('KL weight %f...' % (loss_fn.loss_weights['kl']))
-            if use_wandb:
-                wandb.log({'kl_weight': loss_fn.loss_weights['kl']}, step=step_counter)
-            if epoch == cfg.kl_anneal_end:
-                Logger.log('KL ANNEALING FINISHED: resetting val loss tracking...')
-                min_eval_loss = float('inf')
+            cur_beta = compute_kl_weight(global_step, cfg.kl_anneal_steps, cfg.loss_kl,
+                                          kl_beta_floor=cfg.kl_floor)
+            Logger.log(f'KL weight (step {global_step}): {cur_beta:.6f}')
 
         # Map attention loss annealing: epoch-based (legacy) or step-based
         # Step-based overrides epoch-based if map_attn_anneal_steps > 0

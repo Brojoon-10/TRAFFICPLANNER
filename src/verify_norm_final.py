@@ -1,5 +1,5 @@
 """
-최종 검증: NUSC_NORM_STATS가 CARLA 데이터에 적용될 때의 정확한 영향 분석.
+CARLA 데이터 정규화 통계 검증 스크립트.
 
 데이터 흐름:
 1. post_process: raw state (x_global, y_global, hcos, hsin, speed, hdot) 생성
@@ -16,45 +16,42 @@ A. State normalizer: x,y,hcos,hsin,speed,hdot (6dim)
 B. Bicycle params: a_stats(acc mean/std), ddh_stats(ddh mean/std)
    - Decoder output unnormalize: raw_acc = pred*std + mean
    - GT action 계산: norm_acc = (raw_acc - mean) / std
-C. Intent CE loss: NUSC_NORM_STATS에서 a_std, hdot_std 직접 참조
-   - acc / a_std, yaw_rate / hdot_std → prototype distance
+   ★ 중요: a_stats/ddh_stats는 모델이 실제로 보는 값의 분포와 일치해야 함.
+     모델은 _compute_gt_actions()에서 학습 subsequence의 future 구간만 사용:
+       raw_acc = (speed[t+1] - speed[t]) / dt   (dt=0.5 고정)
+     따라서 전체 trajectory 연속 프레임(가변 dt)이 아닌,
+     FITDataset 학습 subsequence 기반으로 통계를 구해야 함.
+C. Intent CE loss: CARLA_NORM_STATS에서 a_std, hdot_std 직접 참조
 D. Att normalizer: l,w (vehicle attributes)
-   - Dataset에서 normalize, model에서 unnormalize
 """
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# src/ 디렉토리를 path에 추가 (maps, datasets 등 import 위해)
+_src_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _src_dir)
+# 프로젝트 루트로 이동 (상대 경로 data/ 접근 위해)
+os.chdir(os.path.dirname(_src_dir))
 
 import numpy as np
 import glob
 import pandas as pd
+import torch
 from pyquaternion import Quaternion
 import datasets.nuscenes_utils as nutils
-from datasets.utils import NUSC_NORM_STATS
+from datasets.utils import CARLA_NORM_STATS, CARLA_BIKE_PARAMS
 
-# === 전체 500개 데이터에서 통계 계산 ===
-# dataset post_process와 100% 동일한 방식으로 계산
+# ============================================================
+# Part A: State 6dim 통계 (전체 trajectory 기반 — state normalizer용)
+# ============================================================
+# State normalizer는 전체 데이터의 speed/hdot 분포를 사용.
+# FITDataset.post_process()에서 계산되는 raw state 값의 통계.
 
-scenario_path = './data/race_scenarios/various_300_sample'
+scenario_path = './data/race_scenarios/various_driving_data_20260224'
 scene_files = sorted(glob.glob(os.path.join(scenario_path, 'driving_data_scenario_*.xlsx')))
-print(f"Processing {len(scene_files)} files...")
+print(f"Processing {len(scene_files)} files for state statistics...")
 
-# State 6dim 각 차원의 raw 값 수집
-all_x_global = []      # dim 0
-all_y_global = []      # dim 1
-all_hcos = []          # dim 2
-all_hsin = []          # dim 3
-all_speed = []         # dim 4
-all_hdot = []          # dim 5
-
-# Bicycle model 관련
-all_signed_acc = []    # (speed[t+1] - speed[t]) / dt — bicycle output에 대응
-all_ddh = []           # heading_change_rate(hdot, t) — dataset의 ddh
-
-# Vehicle attributes
-all_length = []
-all_width = []
-
-dt = 0.5
+all_speed = []
+all_hdot = []
+dt_cfg = 0.5
 
 for fidx, fpath in enumerate(scene_files):
     if fidx % 50 == 0:
@@ -74,66 +71,23 @@ for fidx, fpath in enumerate(scene_files):
         y_arr = pos_rows[1].copy()
 
         h_arr = np.zeros(T)
-        hcos_arr = np.zeros(T)
-        hsin_arr = np.zeros(T)
         for i in range(T):
             rot = Quaternion(quat_rows[3][i], quat_rows[0][i],
                            quat_rows[1][i], quat_rows[2][i]).rotation_matrix
             h_arr[i] = np.arctan2(rot[1, 0], rot[0, 0])
-            hcos_arr[i] = np.cos(h_arr[i])
-            hsin_arr[i] = np.sin(h_arr[i])
 
-        # Speed: dataset과 동일 = norm(velocity(pos, t))
         pos_2d = np.stack([x_arr, y_arr], axis=1)
         vel = nutils.velocity(pos_2d, t_arr)
         speed = np.linalg.norm(vel, axis=1)
-
-        # hdot: dataset과 동일 = heading_change_rate(h, t)
         hdot = nutils.heading_change_rate(h_arr, t_arr)
 
-        # ddh: dataset과 동일 = heading_change_rate(hdot, t)
-        ddh = nutils.heading_change_rate(hdot, t_arr)
-
-        # Signed acc: bicycle model이 출력하는 acc에 대응
-        # model._compute_gt_actions에서:
-        #   raw_acc = (speed[t+1] - speed[t]) / dt
-        #   norm_acc = (raw_acc - a_mean) / a_std
-        # 여기서 speed는 unnormalized (raw m/s)
-        signed_acc = np.full(T, np.nan)
-        for i in range(T - 1):
-            if not (np.isnan(speed[i]) or np.isnan(speed[i+1])):
-                signed_acc[i] = (speed[i+1] - speed[i]) / (t_arr[i+1] - t_arr[i])
-        if T > 1 and not np.isnan(signed_acc[T-2]):
-            signed_acc[T-1] = signed_acc[T-2]
-
-        # Collect valid values
         valid = ~np.isnan(speed)
-        all_x_global.extend(x_arr[valid].tolist())
-        all_y_global.extend(y_arr[valid].tolist())
-        all_hcos.extend(hcos_arr[valid].tolist())
-        all_hsin.extend(hsin_arr[valid].tolist())
         all_speed.extend(speed[valid].tolist())
-        all_hdot.extend(hdot[valid].tolist())
+        valid_h = ~np.isnan(hdot)
+        all_hdot.extend(hdot[valid_h].tolist())
 
-        valid_ddh = ~np.isnan(ddh)
-        all_ddh.extend(ddh[valid_ddh].tolist())
-
-        valid_acc = ~np.isnan(signed_acc)
-        all_signed_acc.extend(signed_acc[valid_acc].tolist())
-
-        # Vehicle attributes (hardcoded in dataset: l=4.084, w=1.73)
-        all_length.append(4.084)
-        all_width.append(1.73)
-
-# Convert to numpy
-all_x = np.array(all_x_global)
-all_y = np.array(all_y_global)
-all_hcos = np.array(all_hcos)
-all_hsin = np.array(all_hsin)
 all_speed = np.array(all_speed)
 all_hdot = np.array(all_hdot)
-all_signed_acc = np.array(all_signed_acc)
-all_ddh = np.array(all_ddh)
 
 def pr(name, arr, ideal_range=None):
     m, s = np.mean(arr), np.std(arr)
@@ -147,160 +101,312 @@ def pr(name, arr, ideal_range=None):
     return m, s
 
 print(f"\n{'='*70}")
-print(f"A. STATE 6dim RAW STATISTICS ({len(all_speed)} samples)")
+print(f"A. STATE STATISTICS (전체 trajectory, {len(all_speed)} samples)")
 print(f"{'='*70}")
-x_m, x_s = pr("dim0: x_global (m)", all_x)
-y_m, y_s = pr("dim1: y_global (m)", all_y)
-hc_m, hc_s = pr("dim2: hcos", all_hcos)
-hs_m, hs_s = pr("dim3: hsin", all_hsin)
-sp_m, sp_s = pr("dim4: speed (m/s)", all_speed)
-hd_m, hd_s = pr("dim5: hdot (rad/s)", all_hdot)
+sp_m, sp_s = pr("speed (m/s)", all_speed)
+hd_m, hd_s = pr("hdot (rad/s)", all_hdot)
+
+# ============================================================
+# Part B: Bicycle params (a_stats, ddh_stats) — FITDataset 기반
+# ============================================================
+# ★ 핵심: _compute_gt_actions()와 동일한 방식으로 계산
+#
+# _compute_gt_actions()의 계산:
+#   speed_seq = [last_past_speed, future_speed_0, ..., future_speed_11]  (13개)
+#   raw_acc = (speed_seq[:, 1:] - speed_seq[:, :-1]) / dt              (12개, dt=0.5 고정)
+#   hdot_seq도 동일
+#
+# 왜 전체 trajectory가 아닌 학습 subsequence인가:
+#   1. 모델은 FITDataset.__getitem__()이 잘라주는 subsequence만 봄
+#      (seq_interval=5로 샘플링, past_len=4 + future_len=12)
+#   2. _compute_gt_actions()는 이 subsequence의 future 구간에서만 acc/ddh 계산
+#   3. dt는 config의 0.5초 고정 (시뮬레이터의 가변 프레임 간격이 아님)
+#   4. 전체 trajectory 기반 통계는 정차/출발 구간, 가변 dt 등으로 분포가 다름
+#
+# 따라서 a_stats/ddh_stats는 모델이 실제로 보는 분포 = FITDataset subsequence 기반이어야
+# 정규화 후 mean=0, std=1이 보장됨.
 
 print(f"\n{'='*70}")
-print(f"B. BICYCLE PARAMS RAW STATISTICS ({len(all_signed_acc)} samples)")
+print(f"B. BICYCLE PARAMS — FITDataset subsequence 재현 (_compute_gt_actions 동일)")
 print(f"{'='*70}")
-acc_m, acc_s = pr("signed_acc (m/s²)", all_signed_acc)
-ddh_m, ddh_s = pr("ddh (rad/s²)", all_ddh)
+
+# FITDataset을 직접 로드하지 않고, 동일한 로직을 재현:
+#   1. xlsx → raw position/heading 추출
+#   2. nutils.velocity()로 speed/hdot 계산 (가변 dt, FITDataset.post_process와 동일)
+#   3. seq_interval=5로 subsequence 시작점 생성
+#   4. past[-1]과 future[0:12]로 speed_seq 구성
+#   5. raw_acc = (speed[t+1] - speed[t]) / dt_cfg  (dt=0.5 고정)
+#
+# 이것이 _compute_gt_actions()와 동일한 이유:
+#   - _compute_gt_actions()는 normalized speed를 unnormalize한 뒤 차분/dt로 acc 계산
+#   - unnormalize(normalize(x)) = x 이므로 raw speed 차분/dt와 동일
+#   - FITDataset.post_process()의 speed = nutils.velocity(pos, t_arr) 그대로 사용
+
+SEQ_INTERVAL = 5
+NPAST = 4
+NFUTURE = 12
+SEQ_LEN = NPAST + NFUTURE
+SPLIT_RATIO = 0.85  # train split
+
+all_raw_acc = []
+all_raw_ddh = []
+total_subseq = 0
+
+# train split만 사용 (FITDataset과 동일)
+train_n = int(len(scene_files) * SPLIT_RATIO)
+train_files = scene_files[:train_n]
+print(f"  Train split: {train_n}/{len(scene_files)} files")
+
+for fidx, fpath in enumerate(train_files):
+    if fidx % 100 == 0:
+        print(f"  Part B: {fidx}/{len(train_files)}...")
+    data = pd.read_excel(fpath, sheet_name='driving_data').values.tolist()
+    data = np.array(data).T
+    T = len(data[0])
+    t_arr = np.array(data[0])
+
+    # 각 agent에 대해 speed/hdot 계산 (FITDataset.post_process 동일)
+    agent_speeds = []
+    agent_hdots = []
+    for agent_type in ['ego', 'sur']:
+        if agent_type == 'ego':
+            pos_rows, quat_rows = data[1:4], data[4:8]
+        else:
+            pos_rows, quat_rows = data[14:17], data[17:21]
+
+        x_arr = pos_rows[0].copy()
+        y_arr = pos_rows[1].copy()
+
+        h_arr = np.zeros(T)
+        for i in range(T):
+            rot = Quaternion(quat_rows[3][i], quat_rows[0][i],
+                           quat_rows[1][i], quat_rows[2][i]).rotation_matrix
+            h_arr[i] = np.arctan2(rot[1, 0], rot[0, 0])
+
+        pos_2d = np.stack([x_arr, y_arr], axis=1)
+        vel = nutils.velocity(pos_2d, t_arr)
+        speed = np.linalg.norm(vel, axis=1)  # (T,)
+        hdot = nutils.heading_change_rate(h_arr, t_arr)  # (T,)
+
+        agent_speeds.append(speed)
+        agent_hdots.append(hdot)
+
+    # subsequence 생성 (FITDataset.__getitem__ 동일)
+    for sidx in range(0, T - SEQ_LEN, SEQ_INTERVAL):
+        midx = sidx + NPAST
+        eidx = sidx + SEQ_LEN
+
+        for a in range(2):  # ego, sur
+            speed = agent_speeds[a]
+            hdot_a = agent_hdots[a]
+
+            # past[-1]이 NaN이면 skip (FITDataset과 동일: midx-1 시점이 유효해야 함)
+            if np.isnan(speed[midx-1]):
+                continue
+
+            # speed_seq: [past[-1], future[0], ..., future[11]]  (13개)
+            speed_seq = speed[midx-1:eidx]  # midx-1 ~ eidx-1, 즉 13개
+            hdot_seq = hdot_a[midx-1:eidx]
+
+            # NaN이 있으면 skip
+            if np.any(np.isnan(speed_seq)) or np.any(np.isnan(hdot_seq)):
+                continue
+
+            # raw_acc = (speed[t+1] - speed[t]) / dt  (12개, dt=0.5 고정)
+            raw_acc = (speed_seq[1:] - speed_seq[:-1]) / dt_cfg
+            raw_ddh = (hdot_seq[1:] - hdot_seq[:-1]) / dt_cfg
+
+            all_raw_acc.extend(raw_acc.tolist())
+            all_raw_ddh.extend(raw_ddh.tolist())
+            total_subseq += 1
+
+all_raw_acc = np.array(all_raw_acc)
+all_raw_ddh = np.array(all_raw_ddh)
+
+print(f"  Total acc/ddh samples: {len(all_raw_acc)} ({total_subseq} subseqs × {NFUTURE} future steps)")
+acc_m_fit, acc_s_fit = pr("raw_acc (m/s², FITDataset)", all_raw_acc)
+ddh_m_fit, ddh_s_fit = pr("raw_ddh (rad/s², FITDataset)", all_raw_ddh)
+
+# 정규화 후 mean=0, std=1 검증
+norm_acc_fit = (all_raw_acc - acc_m_fit) / acc_s_fit
+norm_ddh_fit = (all_raw_ddh - ddh_m_fit) / ddh_s_fit
+print(f"\n  정규화 후 검증 (이 값으로 a_stats/ddh_stats 설정 시):")
+pr("    norm_acc", norm_acc_fit, ideal_range=(-3, 3))
+pr("    norm_ddh", norm_ddh_fit, ideal_range=(-3, 3))
+
+# ============================================================
+# Part C: 현재 config와 비교
+# ============================================================
 
 print(f"\n{'='*70}")
-print(f"CURRENT: NUSC_NORM_STATS 적용 후")
+print(f"C. 현재 CARLA_BIKE_PARAMS vs FITDataset 실측")
 print(f"{'='*70}")
-ninfo = NUSC_NORM_STATS[('car', 'truck')]
-# State normalizer: (x - mean) / std
-nusc_state_mean = [0.0, 0.0, 0.0, 0.0, ninfo['s'][0], ninfo['hdot'][0]]
-nusc_state_std = [ninfo['lscale'][1], ninfo['lscale'][1], 1.0, 1.0, ninfo['s'][1], ninfo['hdot'][1]]
 
-dims = ['x', 'y', 'hcos', 'hsin', 'speed', 'hdot']
-raw_arrays = [all_x, all_y, all_hcos, all_hsin, all_speed, all_hdot]
+cur_a = CARLA_BIKE_PARAMS['a_stats']
+cur_ddh = CARLA_BIKE_PARAMS['ddh_stats']
 
-for i, (name, arr) in enumerate(zip(dims, raw_arrays)):
-    norm_arr = (arr - nusc_state_mean[i]) / nusc_state_std[i]
-    pr(f"norm_{name} (NUSC)", norm_arr, ideal_range=(-3, 3))
+print(f"  {'항목':<12} {'현재 config':>14} {'FITDataset 실측':>16} {'차이':>10} {'비율':>8}")
+print(f"  {'─'*62}")
+print(f"  {'acc mean':<12} {cur_a[0]:>14.6f} {acc_m_fit:>16.6f} {acc_m_fit-cur_a[0]:>+10.6f} {abs(acc_m_fit-cur_a[0])/max(abs(cur_a[0]),1e-9)*100:>7.1f}%")
+print(f"  {'acc std':<12} {cur_a[1]:>14.6f} {acc_s_fit:>16.6f} {acc_s_fit-cur_a[1]:>+10.6f} {abs(acc_s_fit-cur_a[1])/cur_a[1]*100:>7.1f}%")
+print(f"  {'ddh mean':<12} {cur_ddh[0]:>14.6f} {ddh_m_fit:>16.6f} {ddh_m_fit-cur_ddh[0]:>+10.6f} {abs(ddh_m_fit-cur_ddh[0])/max(abs(cur_ddh[0]),1e-9)*100:>7.1f}%")
+print(f"  {'ddh std':<12} {cur_ddh[1]:>14.6f} {ddh_s_fit:>16.6f} {ddh_s_fit-cur_ddh[1]:>+10.6f} {abs(ddh_s_fit-cur_ddh[1])/cur_ddh[1]*100:>7.1f}%")
 
-print(f"\n  Bicycle params after NUSC:")
-nusc_a_mean, nusc_a_std = ninfo['a']
-nusc_ddh_mean, nusc_ddh_std = ninfo['ddh']
-norm_acc = (all_signed_acc - nusc_a_mean) / nusc_a_std
-norm_ddh = (all_ddh - nusc_ddh_mean) / nusc_ddh_std
-pr(f"norm_acc (NUSC)", norm_acc, ideal_range=(-3, 3))
-pr(f"norm_ddh (NUSC)", norm_ddh, ideal_range=(-3, 3))
+# 현재 config로 정규화하면 어떤 분포가 되는지
+norm_acc_cur = (all_raw_acc - cur_a[0]) / cur_a[1]
+norm_ddh_cur = (all_raw_ddh - cur_ddh[0]) / cur_ddh[1]
+print(f"\n  현재 config로 정규화 시 (이상적: mean=0, std=1):")
+pr("    norm_acc (현재 config)", norm_acc_cur, ideal_range=(-3, 3))
+pr("    norm_ddh (현재 config)", norm_ddh_cur, ideal_range=(-3, 3))
+
+# ============================================================
+# Part D: State normalizer 검증
+# ============================================================
 
 print(f"\n{'='*70}")
-print(f"PROPOSED CARLA STATISTICS")
+print(f"D. STATE NORMALIZER 검증")
 print(f"{'='*70}")
 
-# lscale:
-# x, y는 global 좌표이고 dataset에서 정규화 후 model에 들어감
-# lscale mean MUST = 0 (transform2frame에서 뺄셈: (x_A-x_B)/std 가 정확하려면)
-# lscale std: global position의 std가 아니라,
-#   "model이 보는 좌표 범위를 [-3, 3] 정도에 맞추는 스케일"
-# 현재 NUSC std=15: global x는 [-460, 712] 범위 → norm [-30, 47] → 너무 큼
-# 하지만! GCN에서 pos는 agent간 상대적 관계에만 사용
-# transform2frame에서 (x_A - x_B) / std → 상대 거리 / std
-# 따라서 lscale_std는 "inter-agent distance scale"에 맞춰야 함
-# 즉, 한 시나리오 내에서 agent 간 거리의 적정 스케일
+cinfo = CARLA_NORM_STATS[('car', 'truck')]
+print(f"  speed: config=({cinfo['s'][0]:.6f}, {cinfo['s'][1]:.6f}), 실측=({sp_m:.6f}, {sp_s:.6f})")
+print(f"    차이: mean {abs(sp_m-cinfo['s'][0]):.6f}, std {abs(sp_s-cinfo['s'][1]):.6f}")
+print(f"  hdot:  config=({cinfo['hdot'][0]:.6f}, {cinfo['hdot'][1]:.6f}), 실측=({hd_m:.6f}, {hd_s:.6f})")
+print(f"    차이: mean {abs(hd_m-cinfo['hdot'][0]):.6f}, std {abs(hd_s-cinfo['hdot'][1]):.6f}")
 
-# Per-scenario agent distance
-print(f"\n  lscale 분석:")
-print(f"    Global position은 절대 좌표이므로 mean/std가 의미 없음")
-print(f"    중요한 건 agent 간 상대 거리를 정규화하는 스케일")
-print(f"    현재 NUSC lscale_std=15: 15m = 1 단위")
-print(f"    CARLA 시나리오에서 agent 간 거리:")
+# ============================================================
+# Part E: lscale 분석 (agent간 거리, local 변위)
+# ============================================================
 
-# Calculate inter-agent distances in scenarios
+print(f"\n{'='*70}")
+print(f"E. lscale 분석")
+print(f"{'='*70}")
+
+# Agent간 거리
 agent_dists = []
 for fidx, fpath in enumerate(scene_files[:50]):
     data = pd.read_excel(fpath, sheet_name='driving_data').values.tolist()
     data = np.array(data).T
     T = len(data[0])
     for t in range(T):
-        dx = data[1][t] - data[14][t]  # ego_x - sur_x
-        dy = data[2][t] - data[15][t]  # ego_y - sur_y
+        dx = data[1][t] - data[14][t]
+        dy = data[2][t] - data[15][t]
         agent_dists.append(np.sqrt(dx**2 + dy**2))
 agent_dists = np.array(agent_dists)
+print(f"  Agent간 거리 (50 scenarios):")
 print(f"    mean={np.mean(agent_dists):.1f}m, std={np.std(agent_dists):.1f}m")
 print(f"    p5={np.percentile(agent_dists, 5):.1f}m, p95={np.percentile(agent_dists, 95):.1f}m")
-print(f"    현재 정규화(÷15): 거리 15m → 1.0, 거리 50m → 3.3")
 
-# lscale도 본 map crop 범위와 관련
-print(f"    Map crop bounds: [-17, -38.5, 60, 38.5] → 77m × 77m")
-print(f"    Max meaningful distance ≈ 60m (forward)")
+# Raw trajectory에서 local 변위 (past[-1] 기준) — subsequence 기반
+print(f"\n  Local 변위 (past[-1] 기준, subsequence에서 모델이 보는 값):")
+lscale_std = cinfo['lscale'][1]
+all_local_past = []
+all_local_future = []
+for fidx, fpath in enumerate(train_files[:200]):
+    data_e = pd.read_excel(fpath, sheet_name='driving_data').values.tolist()
+    data_e = np.array(data_e).T
+    T_e = len(data_e[0])
+    for agent_type in ['ego', 'sur']:
+        if agent_type == 'ego':
+            x_e, y_e = data_e[1], data_e[2]
+        else:
+            x_e, y_e = data_e[14], data_e[15]
+        for sidx in range(0, T_e - SEQ_LEN, SEQ_INTERVAL):
+            midx_e = sidx + NPAST
+            eidx_e = sidx + SEQ_LEN
+            ref_x = x_e[midx_e - 1]
+            ref_y = y_e[midx_e - 1]
+            for t in range(sidx, midx_e):
+                d = np.sqrt((x_e[t]-ref_x)**2 + (y_e[t]-ref_y)**2)
+                all_local_past.append(d)
+            for t in range(midx_e, eidx_e):
+                d = np.sqrt((x_e[t]-ref_x)**2 + (y_e[t]-ref_y)**2)
+                all_local_future.append(d)
 
-# Final proposal
-print(f"\n{'='*70}")
-print(f"FINAL PROPOSED CARLA NORM STATS")
-print(f"{'='*70}")
+all_local_past = np.array(all_local_past)
+all_local_future = np.array(all_local_future)
+print(f"    Past local dist: mean={np.mean(all_local_past):.2f}m, p95={np.percentile(all_local_past, 95):.2f}m")
+print(f"    Future local dist: mean={np.mean(all_local_future):.2f}m, p95={np.percentile(all_local_future, 95):.2f}m")
+print(f"    Normalized (÷{lscale_std}): past p95={np.percentile(all_local_past, 95)/lscale_std:.2f}, future p95={np.percentile(all_local_future, 95)/lscale_std:.2f}")
 
-# lscale: mean=0 필수. std는 현재 15로도 agent 간 거리/map 범위에 대해 괜찮음
-# 다만, 12 step × 0.5s = 6초간 이동거리 최대 ~55m. std=15면 norm=3.7 → 허용 범위 내
-# 너무 바꾸면 map crop coordinate와 불일치 위험. 15 유지가 안전
-lscale_std_proposed = 15.0  # 유지
-print(f"  lscale: (0.0, {lscale_std_proposed})  ← 유지 (agent간 거리/map crop에 적합)")
-
-print(f"  h: (0.0, 1.0)  ← 유지 (unit vector)")
-
-print(f"  s (speed): ({sp_m:.6f}, {sp_s:.6f})")
-print(f"    현재 NUSC: (1.802, 3.508)")
-norm_speed_carla = (all_speed - sp_m) / sp_s
-pr("    → norm_speed (CARLA)", norm_speed_carla, ideal_range=(-3, 3))
-
-print(f"  hdot: ({hd_m:.6f}, {hd_s:.6f})")
-print(f"    현재 NUSC: (-0.000037, 0.055684)")
-norm_hdot_carla = (all_hdot - hd_m) / hd_s
-pr("    → norm_hdot (CARLA)", norm_hdot_carla, ideal_range=(-3, 3))
-
-print(f"\n  BIKE_PARAMS:")
-print(f"  a_stats (signed acc): ({acc_m:.6f}, {acc_s:.6f})")
-print(f"    현재 NUSC: (0.409074, 1.045530)")
-norm_acc_carla = (all_signed_acc - acc_m) / acc_s
-pr("    → norm_acc (CARLA)", norm_acc_carla, ideal_range=(-3, 3))
-
-print(f"  ddh_stats: ({ddh_m:.6f}, {ddh_s:.6f})")
-print(f"    현재 NUSC: (0.000046, 0.075032)")
-norm_ddh_carla = (all_ddh - ddh_m) / ddh_s
-pr("    → norm_ddh (CARLA)", norm_ddh_carla, ideal_range=(-3, 3))
-
-# Vehicle attributes
-print(f"\n  l: (4.084, 0.001)  ← 고정 차량, std≈0 → 작은 값 사용")
-print(f"  w: (1.73, 0.001)  ← 고정 차량, std≈0 → 작은 값 사용")
-print(f"  (주의: std=0이면 normalize시 division by zero → 작은 양수 사용)")
+# ============================================================
+# Part F: 최종 제안값 출력
+# ============================================================
 
 print(f"\n{'='*70}")
-print(f"INTENT 분석: CARLA stats 적용 시")
+print(f"F. CARLA_NORM_STATS / CARLA_BIKE_PARAMS 최종 값")
 print(f"{'='*70}")
-# Intent CE loss에서 prototype은 [-1, 0, 1] × [-1, 0, 1]
-# acc = raw_acc / a_std (mean은 안 뺌 — 코드 확인 필요)
+print(f"""
+CARLA_BIKE_PARAMS = {{
+    'maxs' : BIKE_MAXS,
+    'maxhdot' : BIKE_MAXHDOT,
+    'dt' : 0.5,
+    'a_stats' : ({acc_m_fit:.6f}, {acc_s_fit:.6f}),
+    'ddh_stats' : ({ddh_m_fit:.6f}, {ddh_s_fit:.6f})
+}}
 
-# 코드 재확인: loss.py line 590
-# ego_acc = raw_acc / a_std  ← mean을 빼지 않음!
-# raw_acc = (speed[t+1] - speed[t]) / dt
-# 이건 signed acc를 a_std로 나눈 것
+CARLA_NORM_STATS = {{
+    ('car', 'truck') : {{
+        'l' : (4.9017, 0.001),
+        'w' : (2.1283, 0.001),
+        's' : ({sp_m:.6f}, {sp_s:.6f}),
+        'h' : (0.0, 1.0),
+        'hdot' : ({hd_m:.6f}, {hd_s:.6f}),
+        'lscale' : (0.0, 15.0),
+        'a' : ({acc_m_fit:.6f}, {acc_s_fit:.6f}),
+        'ddh' : ({ddh_m_fit:.6f}, {ddh_s_fit:.6f})
+    }}
+}}
+""")
 
-print(f"\n  Intent CE loss 코드:")
-print(f"    raw_acc = (speed_next - speed_cur) / dt")
-print(f"    ego_acc = raw_acc / a_std")
-print(f"    ego_yaw_rate = raw_hdot / hdot_std")
-print(f"    → prototype [-1,0,1] 과 비교")
+# ============================================================
+# Part G: Intent 분석
+# ============================================================
 
-print(f"\n  현재 NUSC (a_std={nusc_a_std:.4f}, hdot_std={ninfo['hdot'][1]:.6f}):")
-intent_acc_nusc = all_signed_acc / nusc_a_std
-intent_yaw_nusc = all_hdot / ninfo['hdot'][1]
-pr("    intent_acc (NUSC)", intent_acc_nusc, ideal_range=(-1.5, 1.5))
-pr("    intent_yaw (NUSC)", intent_yaw_nusc, ideal_range=(-1.5, 1.5))
+print(f"{'='*70}")
+print(f"G. INTENT 분석 (CARLA stats 적용 시)")
+print(f"{'='*70}")
 
-print(f"\n  제안 CARLA (a_std={acc_s:.4f}, hdot_std={hd_s:.6f}):")
-intent_acc_carla = all_signed_acc / acc_s
-intent_yaw_carla = all_hdot / hd_s
-pr("    intent_acc (CARLA)", intent_acc_carla, ideal_range=(-1.5, 1.5))
-pr("    intent_yaw (CARLA)", intent_yaw_carla, ideal_range=(-1.5, 1.5))
+# Intent는 raw_acc / a_std, raw_hdot / hdot_std 사용
+# Part B에서 수집한 raw_acc와 별도로 future hdot을 수집
+all_future_hdot = []
+for fidx, fpath in enumerate(train_files):
+    data_g = pd.read_excel(fpath, sheet_name='driving_data').values.tolist()
+    data_g = np.array(data_g).T
+    T_g = len(data_g[0])
+    t_arr_g = np.array(data_g[0])
+    for agent_type in ['ego', 'sur']:
+        if agent_type == 'ego':
+            pos_g, quat_g = data_g[1:4], data_g[4:8]
+        else:
+            pos_g, quat_g = data_g[14:17], data_g[17:21]
+        h_arr_g = np.zeros(T_g)
+        for i in range(T_g):
+            rot_g = Quaternion(quat_g[3][i], quat_g[0][i], quat_g[1][i], quat_g[2][i]).rotation_matrix
+            h_arr_g[i] = np.arctan2(rot_g[1, 0], rot_g[0, 0])
+        hdot_g = nutils.heading_change_rate(h_arr_g, t_arr_g)
+        for sidx in range(0, T_g - SEQ_LEN, SEQ_INTERVAL):
+            midx_g = sidx + NPAST
+            eidx_g = sidx + SEQ_LEN
+            if np.isnan(hdot_g[midx_g-1]):
+                continue
+            fut_hdot = hdot_g[midx_g:eidx_g]
+            if np.any(np.isnan(fut_hdot)):
+                continue
+            all_future_hdot.extend(fut_hdot.tolist())
+all_future_hdot = np.array(all_future_hdot)
 
-# 9-class distribution comparison
-print(f"\n  9-class distribution:")
+intent_acc = all_raw_acc / acc_s_fit
+intent_yaw = all_future_hdot / hd_s
+
+print(f"\n  Intent 분포 (acc/a_std, hdot/hdot_std):")
+pr("  intent_acc", intent_acc, ideal_range=(-2, 2))
+pr("  intent_yaw", intent_yaw, ideal_range=(-2, 2))
+
+# 9-class distribution
 labels = ['dec+L', 'dec+S', 'dec+R', 'mnt+L', 'mnt+S', 'mnt+R', 'acc+L', 'acc+S', 'acc+R']
-for tag, ia, iy in [("NUSC", intent_acc_nusc, intent_yaw_nusc),
-                     ("CARLA", intent_acc_carla, intent_yaw_carla)]:
-    ac = np.digitize(ia, [-1/3, 1/3])
-    yc = np.digitize(iy, [-1/3, 1/3])
-    ic = ac * 3 + yc
-    dist = [f"{labels[i]}={np.mean(ic==i)*100:.0f}%" for i in range(9)]
-    print(f"    {tag}: {', '.join(dist)}")
+n = min(len(intent_acc), len(intent_yaw))
+ac = np.digitize(intent_acc[:n], [-1/3, 1/3])
+yc = np.digitize(intent_yaw[:n], [-1/3, 1/3])
+ic = ac * 3 + yc
+dist = [f"{labels[i]}={np.mean(ic==i)*100:.0f}%" for i in range(9)]
+print(f"\n  9-class: {', '.join(dist)}")

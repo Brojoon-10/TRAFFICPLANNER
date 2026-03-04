@@ -64,9 +64,18 @@ def load_state(load_path, model, optimizer=None, map_location=None, ignore_keys=
 def calc_conv_out(in_size, kernel_size, stride, padding_size=0):
     return int(((in_size - kernel_size - 2*padding_size) // stride) + 1)
 
-def compute_kl_weight(cur_epoch, end_epoch, final_kl_weight):
-    ''' Linear KL annealing starting at 0.0'''
-    return min(1.0, float(cur_epoch) / end_epoch)*final_kl_weight
+def compute_kl_weight(global_step, anneal_steps, final_kl_weight, kl_beta_floor=0.0):
+    ''' Step-based linear KL annealing with floor.
+        global_step: current training step (batch count)
+        anneal_steps: total steps for full ramp (0 = immediate full weight)
+        final_kl_weight: target β at end of annealing
+        kl_beta_floor: minimum β value (never zero, prevents decoder from ignoring z)
+        Returns: kl_beta_floor + (final - floor) * min(step/anneal_steps, 1.0)
+    '''
+    if anneal_steps <= 0:
+        return final_kl_weight
+    ramp = min(1.0, float(global_step) / anneal_steps)
+    return kl_beta_floor + (final_kl_weight - kl_beta_floor) * ramp
 
 def tensor_clamp(x, xmin, xmax):
     # https://github.com/pytorch/pytorch/issues/2793

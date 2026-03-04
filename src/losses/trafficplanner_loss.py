@@ -368,7 +368,8 @@ class TrafficPlannerLoss(nn.Module):
                     sparsity_cfg=None,
                     ego_only_recon=False,
                     aux_cfg=None,
-                    recon_pos_weight=1.0):
+                    recon_pos_weight=1.0,
+                    kl_free_bits=0.0):
         """
         :param loss_weights: dict of weightings for loss terms
         :param aux_cfg: dict of auxiliary loss config (optional)
@@ -377,6 +378,7 @@ class TrafficPlannerLoss(nn.Module):
             - map_gt_decay_lambda: 0.3 (exponential decay rate for GT step weights)
             - acc_bins: [-1.0, 1.0]  (3 bins: decel, maintain, accel)
             - yaw_bins: [-0.1, 0.1]  (3 bins: left, straight, right)
+        :param kl_free_bits: per-dim free nats for KL (0=off)
         """
         super(TrafficPlannerLoss, self).__init__()
         self.loss_weights = loss_weights
@@ -387,6 +389,7 @@ class TrafficPlannerLoss(nn.Module):
         self.use_potential_loss = use_potential_loss
         self.use_veh_potential = use_veh_potential
         self.ego_only_recon = ego_only_recon
+        self.kl_free_bits = kl_free_bits
         self.recon_pos_weight = recon_pos_weight
 
         # Auxiliary loss config
@@ -997,7 +1000,7 @@ class TrafficPlannerLoss(nn.Module):
         # KL divergence loss
         pm, pv = pred['prior_out']
         qm, qv = pred['posterior_out']
-        kl_loss = kl_normal(qm, qv, pm, pv)
+        kl_loss = kl_normal(qm, qv, pm, pv, free_bits=self.kl_free_bits)
 
         # total weighted loss
         loss = self.loss_weights['recon'] * recon_loss.mean()

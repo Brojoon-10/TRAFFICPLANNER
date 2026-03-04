@@ -194,27 +194,30 @@ NUSC_NORM_STATS = {
 }
 
 #
-# CARLA normalization statistics (300 scenarios, verify_norm_final.py)
-# Lincoln MKZ 2017, various_300_sample
+# CARLA normalization statistics (7798 scenarios, various_driving_data_20260224)
+# Lincoln MKZ 2017
+# a_stats/ddh_stats: verify_norm_final.py — _compute_gt_actions()와 동일한 순수 선형 차분
+#   raw_acc = (speed[t+1] - speed[t]) / dt,  raw_ddh = (hdot[t+1] - hdot[t]) / dt
+#   train split 85% (6628 files), seq_interval=5, 38326 subsequences
 #
 CARLA_BIKE_PARAMS = {
             'maxs' : BIKE_MAXS,
             'maxhdot' : BIKE_MAXHDOT,
             'dt' : 0.5,
-            'a_stats' : (0.416014, 2.176668),
-            'ddh_stats' : (0.001695, 0.335501)
+            'a_stats' : (0.252031, 1.923014),
+            'ddh_stats' : (0.003361, 0.371728)
 }
 
 CARLA_NORM_STATS = {
     ('car', 'truck') : {
         'l' : (4.9017, 0.001),   # Lincoln MKZ 2017 bbox, fixed (no variance)
         'w' : (2.1283, 0.001),   # Lincoln MKZ 2017 bbox, fixed (no variance)
-        's' : (6.247646, 2.678157),
+        's' : (6.225233, 2.673987),
         'h' : (0.0, 1.0),       # unit vector, no normalization
-        'hdot' : (0.048943, 0.234959),
+        'hdot' : (0.051012, 0.233765),
         'lscale' : (0.0, 15.0), # must have mean 0 (transform2frame subtraction)
-        'a' : (0.416014, 2.176668),
-        'ddh' : (0.001695, 0.335501)
+        'a' : (0.252031, 1.923014),
+        'ddh' : (0.003361, 0.371728)
     }
 }
 

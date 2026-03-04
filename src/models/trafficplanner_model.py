@@ -580,7 +580,7 @@ class IntentCodebook(nn.Module):
         if self.training:
             intent_weights = F.gumbel_softmax(logits, tau=temperature, hard=False)
         else:
-            intent_weights = F.one_hot(logits.argmax(-1), self.num_intents).float()
+            intent_weights = F.softmax(logits / temperature, dim=-1)
 
         z_local = intent_weights @ self.codebook.weight  # (N, intent_dim)
         return z_local, intent_weights
@@ -634,6 +634,8 @@ class TrafficPlannerModel(nn.Module):
                  use_a2a_rel_bias=False,
                  use_z_cross_attn=False,
                  num_z_tokens=4,
+                 enc_dropout=0.1,
+                 dec_past_dropout=0.0,
                  ):
         super(TrafficPlannerModel, self).__init__()
         self.normalizer = self.att_normalizer = None
@@ -734,7 +736,7 @@ class TrafficPlannerModel(nn.Module):
         )
 
         # Posterior temporal encoding: PE + Transformer
-        self.positional_encoding = PositionalEncoding(gcn_hidden_dim, max_len=max(self.PT, self.FT))
+        self.positional_encoding = PositionalEncoding(gcn_hidden_dim, dropout=enc_dropout, max_len=max(self.PT, self.FT))
         encoder_layer = TransformerEncoderLayer(
             d_model=gcn_hidden_dim, nhead=transformer_nhead, batch_first=True
         )
@@ -792,6 +794,7 @@ class TrafficPlannerModel(nn.Module):
         # 2. Token construction: GCN(64) + z_global(32) + lw(2) + sem(NC) -> d_model(128)
         token_input_dim = self.gcn_hidden_dim + self.z_size + self.att_feat_size + self.NC
         self.token_proj = nn.Linear(token_input_dim, trans_d_model)
+        self.dec_past_dropout = nn.Dropout(dec_past_dropout) if dec_past_dropout > 0.0 else None
 
         # 3. Learnable temporal positional encoding
         self.temporal_pe = nn.Embedding(self.PT + self.FT, trans_d_model)  # 16 positions
@@ -1150,17 +1153,24 @@ class TrafficPlannerModel(nn.Module):
         ego_mask = self._get_ego_mask(scene_graph)
         all_gcn_features = []
 
+        # Transform to local frame of last past step (same as original STRIVE encode_past/future).
+        # This ensures MLP input has relative displacements (~0.2) instead of
+        # absolute coordinates (~30), keeping all feature dimensions balanced.
+        ref_frame = scene_graph.past[:, -1, :4]  # (NA, 4) normalized global
+        local_kin = transform2frame(ref_frame, traj_data[:, :, :4])  # (NA, T, 4)
+        local_traj = torch.cat([local_kin, traj_data[:, :, 4:]], dim=2)  # (NA, T, 6)
+
         for t in range(T):
-            cur_state = traj_data[:, t, :]
+            cur_state_local = local_traj[:, t, :]  # (NA, 6) in local frame
             cur_vis = vis_data[:, t].unsqueeze(-1)
             cur_lw = scene_graph.lw
             cur_sem = scene_graph.sem
 
-            step_in_feat = torch.cat([cur_state, cur_lw, cur_vis, cur_sem], dim=-1)
+            step_in_feat = torch.cat([cur_state_local, cur_lw, cur_vis, cur_sem], dim=-1)
             gcn_node_in = self.step_feature_extractor(step_in_feat)
 
             g_in_data.x = gcn_node_in
-            g_in_data.pos = cur_state[:, :4]
+            g_in_data.pos = traj_data[:, t, :4]  # GCN edges use global coords (relative transform inside GCN)
 
             ego_feat_t, other_feat_t = self.temporal_gcn_encoder(g_in_data, ego_mask)
             gcn_feat_t = self._merge_ego_other_feat(ego_feat_t, other_feat_t, ego_mask)
@@ -1275,6 +1285,10 @@ class TrafficPlannerModel(nn.Module):
             cur_lw = scene_graph.lw  # (NA, 2)
             cur_sem = scene_graph.sem  # (NA, NC)
 
+        # Decoder past context dropout: force z_global dependency
+        if self.dec_past_dropout is not None and self.training:
+            gcn_feats = self.dec_past_dropout(gcn_feats)
+
         # Expand to (B, T, NA_eff, feat_dim) for concat
         z_expand = z.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
         lw_expand = cur_lw.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
@@ -1294,7 +1308,7 @@ class TrafficPlannerModel(nn.Module):
         """
         Run interaction GCN for T timesteps in parallel (using GT states).
 
-        :param states: (NA, T, state_dim) — states for each timestep
+        :param states: (NA, T, state_dim) — states for each timestep (global frame)
         :param scene_graph: for lw, sem, batch structure
         :param ego_mask: (NA,) bool
         :param T: number of timesteps
@@ -1304,14 +1318,24 @@ class TrafficPlannerModel(nn.Module):
         cur_lw = scene_graph.lw
         cur_sem = scene_graph.sem
 
+        # Transform to local frame of last past step for node features (same as encoder).
+        # GCN edge features use global coords internally via transform2frame.
+        ref_frame = scene_graph.past[:, -1, :4]  # (NA, 4)
+        local_kin = transform2frame(ref_frame, states[:, :, :4])  # (NA, T, 4)
+        local_states = torch.cat([local_kin, states[:, :, 4:]], dim=2)  # (NA, T, 6)
+
         all_gcn_features = []
         for t in range(T):
-            cur_state = states[:, t, :]
-            cur_state_6d = self._get_6d_state(cur_state, False, NA, None)
+            cur_state_global = states[:, t, :]
+            cur_state_6d_global = self._get_6d_state(cur_state_global, False, NA, None)
+            cur_state_local = local_states[:, t, :]
+            cur_state_6d_local = self._get_6d_state(cur_state_local, False, NA, None)
 
-            gcn_in = torch.cat([cur_state_6d, cur_lw, cur_sem], dim=-1)
+            # Node features use local coords for balanced MLP input scale
+            gcn_in = torch.cat([cur_state_6d_local, cur_lw, cur_sem], dim=-1)
             scene_graph.x = gcn_in
-            scene_graph.pos = cur_state_6d[:, :4]
+            # Edge features use global coords (transform2frame inside GCN)
+            scene_graph.pos = cur_state_6d_global[:, :4]
 
             ego_feat_t, sur_feat_t = self.interaction_gcn(scene_graph, ego_mask)
             merged_t = self._merge_ego_other_feat(ego_feat_t, sur_feat_t, ego_mask)
@@ -1705,9 +1729,15 @@ class TrafficPlannerModel(nn.Module):
                     accum_states = torch.cat([
                         accum_states, cur_state_6d.unsqueeze(1)], dim=1)
 
-                gcn_in = torch.cat([cur_state_6d, scene_graph.lw, scene_graph.sem], dim=-1)
+                # Local frame transform for GCN node features (same ref as encoder)
+                ref_frame = scene_graph.past[:, -1, :4]  # (NA, 4)
+                local_kin = transform2frame(ref_frame, prev_state[:, :4].unsqueeze(1))[:, 0]
+                local_state = torch.cat([local_kin, prev_state[:, 4:]], dim=1)
+                local_6d = self._get_6d_state(local_state, False, NA, None)
+
+                gcn_in = torch.cat([local_6d, scene_graph.lw, scene_graph.sem], dim=-1)
                 scene_graph.x = gcn_in
-                scene_graph.pos = cur_state_6d[:, :4]
+                scene_graph.pos = cur_state_6d[:, :4]  # global for edge transform
 
                 ego_gcn, sur_gcn = self.interaction_gcn(scene_graph, ego_mask)
                 gcn_merged = self._merge_ego_other_feat(ego_gcn, sur_gcn, ego_mask)
@@ -1952,17 +1982,28 @@ class TrafficPlannerModel(nn.Module):
                     accum_states = torch.cat([
                         accum_states, cur_state_6d.unsqueeze(1)], dim=1)
 
+                # Local frame transform for GCN node features (same ref as encoder)
+                ref_frame = scene_graph.past[:, -1, :4]  # (NA, 4)
+                if mult_samp:
+                    ref_frame_exp = ref_frame.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, 4)
+                else:
+                    ref_frame_exp = ref_frame
+                local_kin = transform2frame(ref_frame_exp, prev_state[:, :4].unsqueeze(1))[:, 0]
+                local_state = torch.cat([local_kin, prev_state[:, 4:]], dim=1)
+                local_6d = self._get_6d_state(local_state, False, NA_eff, None)
+
                 if mult_samp:
                     # Reshape for GCN: (NA*NS) → (NA, NS, ...)
-                    cur_state_for_gcn = cur_state_6d.reshape(NA, NS, -1)
-                    scene_graph.x = torch.cat([cur_state_for_gcn,
+                    local_for_gcn = local_6d.reshape(NA, NS, -1)
+                    scene_graph.x = torch.cat([local_for_gcn,
                                                 scene_graph.lw.unsqueeze(1).expand(-1, NS, -1),
                                                 scene_graph.sem.unsqueeze(1).expand(-1, NS, -1)], dim=-1)
-                    scene_graph.pos = cur_state_for_gcn[..., :4]
+                    cur_state_for_gcn = cur_state_6d.reshape(NA, NS, -1)
+                    scene_graph.pos = cur_state_for_gcn[..., :4]  # global for edge transform
                 else:
-                    gcn_in = torch.cat([cur_state_6d, scene_graph.lw, scene_graph.sem], dim=-1)
+                    gcn_in = torch.cat([local_6d, scene_graph.lw, scene_graph.sem], dim=-1)
                     scene_graph.x = gcn_in
-                    scene_graph.pos = cur_state_6d[:, :4]
+                    scene_graph.pos = cur_state_6d[:, :4]  # global for edge transform
 
                 ego_gcn, sur_gcn = self.interaction_gcn(scene_graph, ego_mask)
                 gcn_merged = self._merge_ego_other_feat(ego_gcn, sur_gcn, ego_mask)
