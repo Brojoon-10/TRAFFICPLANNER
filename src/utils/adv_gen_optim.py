@@ -406,17 +406,17 @@ def run_adv_gen_optim_reactive(cur_z, lr, loss_weights, model, scene_graph, map_
         with torch.no_grad():
             embed_info_current_attached = model.embed(scene_graph, map_idx, map_env)
         # Detach embed_info to avoid graph issues during optimization
-        # HJ_EDITED: Handle both 'past_feat' (original model) and 'past_seq_out' (transformer model)
+        # HJ_EDITED: Handle both 'past_feat' (original model) and 'context_base' (new model)
         embed_info_current = {
             'prior_out': (embed_info_current_attached['prior_out'][0].clone().detach(),
                           embed_info_current_attached['prior_out'][1].clone().detach()),
             'map_feat': embed_info_current_attached['map_feat'].clone().detach(),
         }
-        # Support both original model (past_feat) and transformer model (past_seq_out)
+        # Support both original model (past_feat) and new model (context_base)
         if 'past_feat' in embed_info_current_attached:
             embed_info_current['past_feat'] = embed_info_current_attached['past_feat'].clone().detach()
-        if 'past_seq_out' in embed_info_current_attached:
-            embed_info_current['past_seq_out'] = embed_info_current_attached['past_seq_out'].clone().detach()
+        if 'context_base' in embed_info_current_attached:
+            embed_info_current['context_base'] = embed_info_current_attached['context_base'].clone().detach()
         if 'posterior_out' in embed_info_current_attached:
             embed_info_current['posterior_out'] = (
                 embed_info_current_attached['posterior_out'][0].clone().detach(),
@@ -466,8 +466,8 @@ def run_adv_gen_optim_reactive(cur_z, lr, loss_weights, model, scene_graph, map_
         }
         if 'past_feat' in embed_info_sur:
             embed_info_sur_detached['past_feat'] = embed_info_sur['past_feat'].clone().detach()
-        if 'past_seq_out' in embed_info_sur:
-            embed_info_sur_detached['past_seq_out'] = embed_info_sur['past_seq_out'].clone().detach()
+        if 'context_base' in embed_info_sur:
+            embed_info_sur_detached['context_base'] = embed_info_sur['context_base'].clone().detach()
         if 'posterior_out' in embed_info_sur:
             embed_info_sur_detached['posterior_out'] = (
                 embed_info_sur['posterior_out'][0].clone().detach(),

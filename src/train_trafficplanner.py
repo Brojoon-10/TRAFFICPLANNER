@@ -205,9 +205,11 @@ def parse_cfg():
     # (use_adaln removed: replaced by LayerNorm in Enc-Dec redesign)
     parser.add_argument('--use_a2a_rel_bias', type=str2bool, default=False,
                         help='Enable A2A relative physical bias (8-feature MLP → attention bias)')
-    # (use_z_cross_attn removed: z goes through ContextEncoder)
+    # z separation: z(Q) × context(KV) → z_context → A2Z in decoder
     parser.add_argument('--num_z_tokens', type=int, default=4,
-                        help='Number of z tokens for context encoder')
+                        help='Number of z tokens for ZCrossAttention')
+    parser.add_argument('--num_z_queries', type=int, default=2,
+                        help='Number of learnable z_query tokens for cross-attention z generation')
     parser.add_argument('--context_num_layers', type=int, default=2,
                         help='Number of TransformerEncoder layers in context encoder')
     parser.add_argument('--map_summary_tokens', type=int, default=8,
@@ -566,6 +568,7 @@ def main():
         # V5/V6 redesign (Enc-Dec Cross-Attention)
         use_a2a_rel_bias=cfg.use_a2a_rel_bias,
         num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
+        num_z_queries=getattr(cfg, 'num_z_queries', 2),
         enc_dropout=getattr(cfg, 'enc_dropout', 0.1),
         context_num_layers=getattr(cfg, 'context_num_layers', 2),
         map_summary_tokens=getattr(cfg, 'map_summary_tokens', 8),
@@ -761,6 +764,7 @@ def main():
     Logger.log(f'  map_recrop: {model.map_recrop}')
     Logger.log(f'  use_a2a_rel_bias: {model.use_a2a_rel_bias}')
     Logger.log(f'  context_encoder: {model.context_encoder}')
+    Logger.log(f'  z_cross_attn: {model.z_cross_attn}')
     Logger.log(f'  map_summary_pooling: {model.map_summary_pooling.num_queries} tokens')
 
     # Action blending
