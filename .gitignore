@@ -5,6 +5,7 @@ wandb
 data/
 !data/race_scenarios/
 !data/race_scenarios/various_300_sample/
+!data/race_scenarios/various_500_samples/
 *.zip
 
 # Byte-compiled / optimized / DLL files
