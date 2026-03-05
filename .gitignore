@@ -2,8 +2,9 @@
 strive_env
 out
 wandb
-data/
+data/*
 !data/race_scenarios/
+data/race_scenarios/*
 !data/race_scenarios/various_300_sample/
 !data/race_scenarios/various_500_samples/
 *.zip
