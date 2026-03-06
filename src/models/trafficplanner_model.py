@@ -317,11 +317,10 @@ class SharedKVAttention(nn.Module):
 
 class TransDecoderLayer(nn.Module):
     """
-    One Transformer decoder layer: A2A → A2Z → A2S → FFN.
-    (z_global separation redesign: A2C removed, A2Z added)
+    One Transformer decoder layer: A2A → Z_inject → A2S → FFN.
 
     A2A: K/V shared + Q/O separate (ego/sur) — agent interaction
-    A2Z: z_context cross-attention (shared K/V + ego/sur Q/O) — z + past trend
+    Z_inject: z_proj residual add (Linear transform + add) — z_global injection
     A2S: K/V shared + Q/O separate (ego/sur) — high-res map cross-attention
     FFN: ego/sur fully separate
     """
@@ -340,19 +339,9 @@ class TransDecoderLayer(nn.Module):
             self.a2a_rel_bias_module = A2ARelativeBias(
                 num_features=8, nhead=nhead, hidden_dim=32)
 
-        # A2Z: z_context cross-attention (shared K/V + ego/sur Q/O)
-        # KV = z_context (4 tokens), Q = decoder tokens (per agent)
-        self.a2z_norm = nn.LayerNorm(d_model)
-        self.a2z_k_proj = nn.Linear(d_model, d_model)
-        self.a2z_v_proj = nn.Linear(d_model, d_model)
-        self.a2z_ego_q_proj = nn.Linear(d_model, d_model)
-        self.a2z_ego_o_proj = nn.Linear(d_model, d_model)
-        self.a2z_sur_q_proj = nn.Linear(d_model, d_model)
-        self.a2z_sur_o_proj = nn.Linear(d_model, d_model)
-        self.a2z_nhead = nhead
-        self.a2z_head_dim = d_model // nhead
-        self.a2z_scale = self.a2z_head_dim ** -0.5
-        self.a2z_dropout = nn.Dropout(dropout)
+        # Z injection: z_proj (NA, D) → residual add per step
+        self.z_inject_norm = nn.LayerNorm(d_model)
+        self.z_inject_proj = nn.Linear(d_model, d_model)
 
         # A2S: shared K/V (map) + ego/sur separate Q/O
         self.a2s_norm = nn.LayerNorm(d_model)
@@ -384,59 +373,6 @@ class TransDecoderLayer(nn.Module):
             nn.Linear(ffn_dim, d_model),
             nn.Dropout(dropout),
         )
-
-    def _a2z_attention(self, query_tokens, z_context, ego_mask):
-        """
-        A2Z: z_context cross-attention with shared K/V and separate ego/sur Q/O.
-        :param query_tokens: (BT, N, D) — decoder tokens
-        :param z_context: (N, K, D) — z cross-attention output (K=num_z_tokens, shared across steps)
-        :return: output (BT, N, D)
-        """
-        BT, N, D = query_tokens.shape
-        nhead = self.a2z_nhead
-        head_dim = self.a2z_head_dim
-        K = z_context.size(1)
-
-        # Shared K/V from z_context: (N, K, D) → project → broadcast over BT
-        z_k = self.a2z_k_proj(z_context)  # (N, K, D)
-        z_v = self.a2z_v_proj(z_context)  # (N, K, D)
-
-        ego_idx = ego_mask.nonzero(as_tuple=True)[0]
-        sur_idx = (~ego_mask).nonzero(as_tuple=True)[0]
-
-        output = query_tokens.new_zeros(BT, N, D)
-
-        def _do_a2z(agent_idx, q_proj, o_proj):
-            if agent_idx.numel() == 0:
-                return
-            # Q from decoder tokens: (BT, N_sel, D)
-            q_in = query_tokens[:, agent_idx]
-            q = q_proj(q_in).view(BT, agent_idx.numel(), nhead, head_dim).transpose(1, 2)
-            # (BT, nhead, N_sel, head_dim)
-
-            # K/V from z_context: (N_sel, K, D) → broadcast over BT
-            k_sel = z_k[agent_idx]  # (N_sel, K, D)
-            v_sel = z_v[agent_idx]
-            k_sel = k_sel.view(agent_idx.numel(), K, nhead, head_dim)
-            k_sel = k_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
-            # (BT, nhead, N_sel, K, head_dim)
-            v_sel = v_sel.view(agent_idx.numel(), K, nhead, head_dim)
-            v_sel = v_sel.permute(2, 0, 1, 3).unsqueeze(0).expand(BT, -1, -1, -1, -1)
-
-            # Attention: Q(BT, nhead, N_sel, 1, head_dim) @ K^T(BT, nhead, N_sel, head_dim, K)
-            q = q.unsqueeze(3)  # (BT, nhead, N_sel, 1, head_dim)
-            scores = torch.matmul(q, k_sel.transpose(-2, -1)) * self.a2z_scale
-            # (BT, nhead, N_sel, 1, K)
-            attn_w = F.softmax(scores, dim=-1)
-            attn_w = self.a2z_dropout(attn_w)
-            attn_out = torch.matmul(attn_w, v_sel)  # (BT, nhead, N_sel, 1, head_dim)
-            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().view(BT, agent_idx.numel(), D)
-            output[:, agent_idx] = o_proj(attn_out)
-
-        _do_a2z(ego_idx, self.a2z_ego_q_proj, self.a2z_ego_o_proj)
-        _do_a2z(sur_idx, self.a2z_sur_q_proj, self.a2z_sur_o_proj)
-
-        return output
 
     def _a2s_attention(self, query_tokens, map_tokens, ego_mask):
         """
@@ -490,7 +426,7 @@ class TransDecoderLayer(nn.Module):
         """
         :param x: (B, T, N, D) — decoder tokens (T=1 for AR single-step)
         :param ego_mask: (N,) bool — True for ego
-        :param z_context: (N, K, D) — z cross-attention output (past trend + z info)
+        :param z_context: (N, 1, D) — z_proj token for residual injection
         :param map_tokens: (N, num_tokens, map_dim) — per-agent map crop
         :param return_a2a_output: return tokens after A2A (for pred loss)
         :param return_a2s_weights: return A2S attention weights (for map guidance loss)
@@ -516,14 +452,14 @@ class TransDecoderLayer(nn.Module):
         if return_a2a_output:
             extras['a2a_output'] = x_a2a.view(B, T, N, D)
 
-        # --- A2Z: z_context cross-attention ---
-        x_a2z = x_a2a  # (BT, N, D) — stays flat
-        x_norm = self.a2z_norm(x_a2z)
-        a2z_out = self._a2z_attention(x_norm, z_context, ego_mask)
-        x_a2z = x_a2z + a2z_out
+        # --- Z injection: residual add ---
+        # z_context here is (NA, 1, D) z_proj token; squeeze and broadcast over BT
+        z_vec = z_context.squeeze(1)  # (N, D)
+        z_injected = self.z_inject_proj(self.z_inject_norm(z_vec))  # (N, D)
+        x_z = x_a2a + z_injected.unsqueeze(0).expand(x_a2a.size(0), -1, -1)
 
         # --- A2S: map cross-attention ---
-        x_a2s = x_a2z  # (BT, N, D)
+        x_a2s = x_z  # (BT, N, D)
         x_norm = self.a2s_norm(x_a2s)
         a2s_out, ego_map_w, sur_map_w = self._a2s_attention(x_norm, map_tokens, ego_mask)
         x_a2s = x_a2s + a2s_out
@@ -838,8 +774,12 @@ class TrafficPlannerModel(nn.Module):
             dropout=trans_dropout,
         )
 
-        # 3.5. Z Cross-Attention: z(Q) × context(KV) → z_context
-        # Past trend info is ONLY accessible through z_context
+        # 3.5. Z direct projection: z_global(z_size) → d_model
+        # z_global is directly projected and injected into decoder (no cross-attn)
+        self.z_direct_proj = nn.Linear(self.z_size, trans_d_model)
+        self.num_z_tokens = num_z_tokens  # kept for checkpoint compat
+
+        # Legacy z_cross_attn kept for checkpoint loading compatibility
         self.z_cross_attn = ZCrossAttention(
             d_model=trans_d_model,
             nhead=4,
@@ -847,16 +787,16 @@ class TrafficPlannerModel(nn.Module):
             num_z_tokens=num_z_tokens,
             dropout=trans_dropout,
         )
-        self.num_z_tokens = num_z_tokens
 
         # 4. Decoder query construction: GCN(64) + lw(2) + sem(NC) → d_model(128)
+        #    z_proj is NOT in query — z is injected via residual add in each layer
         query_input_dim = self.gcn_hidden_dim + self.att_feat_size + self.NC
         self.query_proj = nn.Linear(query_input_dim, trans_d_model)
 
         # 5. Decoder step PE: nn.Embedding(FT=12, d_model)
         self.step_pe = nn.Embedding(self.FT, trans_d_model)
 
-        # 6. Transformer decoder layers: A2A → A2Z → A2S → FFN
+        # 6. Transformer decoder layers: A2A → Z_inject → A2S → FFN
         self.trans_layers = nn.ModuleList([
             TransDecoderLayer(trans_d_model, trans_nhead, trans_ffn_dim,
                               self.map_token_ch, trans_dropout,
@@ -893,14 +833,9 @@ class TrafficPlannerModel(nn.Module):
         self.intent_ce_head = nn.Linear(self.intent_dim, self.num_intents)  # ego intent CE
 
         # 8. z_global auxiliary decoder: z + step_embed -> action prediction (training only)
+        # Intentionally shallow (single linear) so z must encode rich information
         self.z_aux_step_embed = nn.Embedding(self.FT, self.z_size)  # 12 steps -> 32-dim
-        self.z_aux_decoder = nn.Sequential(
-            nn.Linear(self.z_size * 2, 128),  # z(32) + step_embed(32) = 64 -> 128
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, self.traj_out_size),  # -> 2 (acc, ddh)
-        )
+        self.z_aux_decoder = nn.Linear(self.z_size * 2, self.traj_out_size)  # z(32)+step(32)=64 -> 2
 
         # Phase control
         self.phase = 1
@@ -953,11 +888,12 @@ class TrafficPlannerModel(nn.Module):
         else:
             z_samp = self.rsample(post_mu, post_var)
 
-        # z_context: z enriched by context
-        z_context = self.z_cross_attn(z_samp, context_base)
+        # z_proj: direct projection of z_global → d_model (no cross-attn)
+        z_proj = self.z_direct_proj(z_samp)  # (NA, d_model)
 
         # Store health monitoring intermediates
         self._last_z_samp = z_samp.detach()
+        self._last_z_proj = z_proj.detach()
         self._last_prior_out = (prior_mu.detach(), prior_var.detach())
         self._last_posterior_out = (post_mu.detach(), post_var.detach())
 
@@ -981,7 +917,7 @@ class TrafficPlannerModel(nn.Module):
                                    teacher_forcing=teacher_forcing,
                                    blend_alpha=blend_alpha,
                                    context_base=context_base,
-                                   z_context=z_context)
+                                   z_proj=z_proj)
 
         net_out = {
             'prior_out': (prior_mu, prior_var),
@@ -991,12 +927,11 @@ class TrafficPlannerModel(nn.Module):
 
         if future_sample:
             prior_samp = self.rsample(prior_mu, prior_var)
-            # Need z_context for prior sample too
-            z_context_prior = self.z_cross_attn(prior_samp, context_base)
+            z_proj_prior = self.z_direct_proj(prior_samp)
             future_samp = self.decoder(scene_graph, map_feat, prior_samp, map_idx, map_env,
                                        map_tokens=map_tokens,
                                        context_base=context_base,
-                                       z_context=z_context_prior)
+                                       z_proj=z_proj_prior)
             net_out['future_samp'] = future_samp
 
         return net_out
@@ -1026,15 +961,11 @@ class TrafficPlannerModel(nn.Module):
             metrics['z_global/prior_post_mean_gap'] = (qm - pm).abs().mean().item()
             metrics['z_global/posterior_var_mean'] = qv.mean().item()
 
-        # z cross-attention health: how much attn_out contributes vs raw z_tokens
-        if hasattr(self, 'z_cross_attn') and hasattr(self.z_cross_attn, '_last_attn_ratio'):
-            metrics['z_cross_attn/attn_ratio'] = self.z_cross_attn._last_attn_ratio
-
-        # z_context health
-        if hasattr(self, '_last_z_context') and self._last_z_context is not None:
-            ze = self._last_z_context
-            metrics['z_context/norm'] = ze.norm(dim=-1).mean().item()
-            metrics['z_context/std'] = ze.std(dim=0).mean().item()
+        # z_proj health (direct projection, no cross-attn)
+        if hasattr(self, '_last_z_proj') and self._last_z_proj is not None:
+            zp = self._last_z_proj
+            metrics['z_proj/norm'] = zp.norm(dim=-1).mean().item()
+            metrics['z_proj/std'] = zp.std(dim=0).mean().item()
 
         # Intent health
         if hasattr(self, '_intent_weights_outputs') and isinstance(self._intent_weights_outputs, torch.Tensor):
@@ -1080,7 +1011,7 @@ class TrafficPlannerModel(nn.Module):
             'interaction_gcn': [self.interaction_gcn],
             'query_proj': [self.query_proj],
             'context_encoder': [self.context_encoder, self.map_summary_pooling],
-            'z_cross_attn': [self.z_cross_attn],
+            'z_direct_proj': [self.z_direct_proj],
             'trans_layers': list(self.trans_layers),
             'output_heads': [self.ego_output_head, self.sur_output_head],
             'intent': [self.intent_codebook, self.ego_intent_proj],
@@ -1118,13 +1049,13 @@ class TrafficPlannerModel(nn.Module):
         prior_out = self.prior(context_base)
         post_mu, post_var = self.encoder(scene_graph, context_base)
         z_samp = post_mu  # use posterior mean
-        z_context = self.z_cross_attn(z_samp, context_base)
+        z_proj = self.z_direct_proj(z_samp)
 
         future_pred = self.decoder(scene_graph, map_feat, z_samp, map_idx, map_env,
                                    map_tokens=map_tokens,
                                    sur_gt_replay=sur_gt_replay,
                                    context_base=context_base,
-                                   z_context=z_context)
+                                   z_proj=z_proj)
 
         return {
             'prior_out': prior_out,
@@ -1156,12 +1087,11 @@ class TrafficPlannerModel(nn.Module):
                 z_samp = self.rsample(prior_mu, prior_var)
             z_logprob = prior_distrib.log_prob(z_samp).sum(dim=-1)
             z_mdist = torch.norm((z_samp - prior_mu) / torch.sqrt(prior_var), dim=-1)
-            # Compute z_context for this sample
-            z_context_s = self.z_cross_attn(z_samp, context_base)
+            z_proj_s = self.z_direct_proj(z_samp)
             future_pred = self.decoder(scene_graph, map_feat, z_samp, map_idx, map_env,
                                        map_tokens=map_tokens,
                                        nfuture=nfuture, sur_gt_replay=sur_gt_replay,
-                                       context_base=context_base, z_context=z_context_s)
+                                       context_base=context_base, z_proj=z_proj_s)
             net_out['z_samp'].append(z_samp)
             net_out['z_logprob'].append(z_logprob)
             net_out['z_mdist'].append(z_mdist)
@@ -1193,7 +1123,7 @@ class TrafficPlannerModel(nn.Module):
             z_samp[-1, :, :] = prior_mu
         # decoder expects z: (NA, NS, z_size) — transpose from (NS, NA, z_size)
         z_for_decoder = z_samp.transpose(0, 1)
-        # z_context computed inside decoder (multi-sample expansion handled there)
+        # z_proj computed inside decoder (multi-sample expansion handled there)
         future_pred = self.decoder(scene_graph, map_feat, z_for_decoder, map_idx, map_env,
                                    map_tokens=map_tokens,
                                    nfuture=nfuture, sur_gt_replay=sur_gt_replay,
@@ -1231,13 +1161,12 @@ class TrafficPlannerModel(nn.Module):
     def decode_embedding(self, z, embed_out, scene_graph, map_idx, map_env,
                          ext_future=None, nfuture=None):
         context_base = embed_out.get('context_base')
-        # Compute z_context for this z
-        z_context = self.z_cross_attn(z, context_base) if context_base is not None else None
+        z_proj = self.z_direct_proj(z)
         future_pred = self.decoder(scene_graph, embed_out['map_feat'],
                                    z, map_idx, map_env,
                                    map_tokens=embed_out.get('map_tokens'),
                                    ext_future=ext_future, nfuture=nfuture,
-                                   context_base=context_base, z_context=z_context)
+                                   context_base=context_base, z_proj=z_proj)
         return {'future_pred': future_pred}
 
     # ============================================================
@@ -1452,14 +1381,14 @@ class TrafficPlannerModel(nn.Module):
                 sur_gt_replay=False,
                 blend_alpha=0.0,
                 context_base=None,
-                z_context=None):
+                z_proj=None):
         """
         Decoder dispatcher (Enc-Dec Cross-Attention).
         Training: AR loop with GT action interpolation (blend_alpha ∈ [0,1])
         Inference: autoregressive (teacher_forcing=False)
 
         :param context_base: precomputed context (NA, C, d_model). If None, computed internally.
-        :param z_context: precomputed z_context (NA, num_z_tokens, d_model). If None, computed internally.
+        :param z_proj: precomputed z_direct_proj(z_global) (NA, d_model). If None, computed internally.
         """
         if map_tokens is None:
             scene_graph_pos_backup = scene_graph.pos.clone()
@@ -1470,31 +1399,32 @@ class TrafficPlannerModel(nn.Module):
         if teacher_forcing:
             return self.transformer_decoder_training_blended(
                 scene_graph, z, map_tokens, map_idx, map_env, blend_alpha,
-                context_base=context_base, z_context=z_context)
+                context_base=context_base, z_proj=z_proj)
         else:
             return self.transformer_decoder_inference(
                 scene_graph, z, map_tokens, map_idx, map_env,
                 ext_future=ext_future, nfuture=nfuture,
                 sur_gt_replay=sur_gt_replay,
-                context_base=context_base, z_context=z_context)
+                context_base=context_base, z_proj=z_proj)
 
     def transformer_decoder_training_blended(self, scene_graph, z, map_tokens, map_idx, map_env,
                                               blend_alpha=0.5,
-                                              context_base=None, z_context=None):
+                                              context_base=None, z_proj=None):
         """
         z-separated decoder — blended training mode.
 
         Architecture:
-          1. Context + z_context precomputed by _build_context_base() + prior()/encoder()
-          2. AR loop (12 steps):
+          1. Context precomputed by _build_context_base() + prior()/encoder()
+          2. z_proj = z_direct_proj(z_global) — direct z injection (no cross-attn)
+          3. AR loop (12 steps):
              a. GCN(current state) → interaction_feat
-             b. query = query_proj(gcn ⊕ z_local ⊕ lw ⊕ sem) + step_PE(t)
-             c. TransDecoderLayer ×2: A2A → A2Z(z_context) → A2S(map) → FFN
+             b. query = query_proj(gcn ⊕ lw ⊕ sem ⊕ z_proj) + step_PE(t)
+             c. TransDecoderLayer ×2: A2A → Z_inject(z_proj) → A2S(map) → FFN
              d. output_head → action → blend with GT → bicycle model
 
         :param blend_alpha: interpolation weight (0=pure GT, 1=pure predicted)
         :param context_base: precomputed context (NA, C, d_model)
-        :param z_context: precomputed z_context (NA, num_z_tokens, d_model)
+        :param z_proj: precomputed z_direct_proj(z_global) (NA, d_model)
         :return: traj_out (NA, FT, 4)
         """
         NA = z.size(0)
@@ -1519,19 +1449,24 @@ class TrafficPlannerModel(nn.Module):
         self._ego_pred_outputs = []
 
         # ================================================================
-        # 1. Context + z_context (precomputed or fallback)
+        # 1. Context (precomputed or fallback)
         # ================================================================
-        if context_base is None or z_context is None:
+        if context_base is None:
             gt_past = scene_graph.past
             past_gcn_feats = self._run_interaction_gcn_parallel(
                 gt_past, scene_graph, ego_mask, PT)
             map_summary = self.map_summary_pooling(map_tokens)
             context_base = self.context_encoder(past_gcn_feats, map_summary)
-            z_context = self.z_cross_attn(z, context_base)
+
+        if z_proj is None:
+            z_proj = self.z_direct_proj(z)  # (NA, d_model)
+
+        # z_proj as (NA, 1, d_model) for layer z_inject
+        z_tokens_for_a2z = z_proj.unsqueeze(1)
 
         # Store for health metrics
         self._last_context = context_base.detach()
-        self._last_z_context = z_context.detach()
+        self._last_z_proj = z_proj.detach()
 
         # ================================================================
         # 2. AR loop
@@ -1580,7 +1515,7 @@ class TrafficPlannerModel(nn.Module):
             for layer_idx, layer in enumerate(self.trans_layers):
                 is_first_layer = (layer_idx == 0)
                 x_out, extras = layer(
-                    x, ego_mask, z_context, cur_map,
+                    x, ego_mask, z_tokens_for_a2z, cur_map,
                     return_a2a_output=is_first_layer,
                     return_a2s_weights=is_first_layer,
                     agent_states=agent_states_for_bias,
@@ -1675,11 +1610,11 @@ class TrafficPlannerModel(nn.Module):
 
     def transformer_decoder_inference(self, scene_graph, z, map_tokens, map_idx, map_env,
                                        ext_future=None, nfuture=None, sur_gt_replay=False,
-                                       context_base=None, z_context=None):
+                                       context_base=None, z_proj=None):
         """
         z-separated decoder — inference mode (autoregressive).
 
-        Same architecture as training: context + z_context + single-query AR loop.
+        Same architecture as training: z_proj (direct z projection) + single-query AR loop.
         Supports multi-sample (z: NA, NS, z_size).
 
         :return: traj_out (NA, FT, 4) or (NA, NS, FT, 4) for multi-sample
@@ -1721,30 +1656,17 @@ class TrafficPlannerModel(nn.Module):
         NA_eff = NA * NS if mult_samp else NA
 
         # ================================================================
-        # 1. Context + z_context (precomputed or fallback)
+        # 1. z_proj: direct projection (no cross-attn)
         # ================================================================
-        if context_base is None or z_context is None:
-            gt_past = scene_graph.past
-            past_gcn_feats = self._run_interaction_gcn_parallel(
-                gt_past, scene_graph, ego_mask, PT)
-
-            if mult_samp:
-                past_gcn_feats_exp = past_gcn_feats.unsqueeze(1).expand(-1, NS, -1, -1).reshape(
-                    NA_eff, PT, self.gcn_hidden_dim)
-                map_summary = self.map_summary_pooling(map_tokens_flat)
-                context_base = self.context_encoder(past_gcn_feats_exp, map_summary)
-            else:
-                map_summary = self.map_summary_pooling(map_tokens)
-                context_base = self.context_encoder(past_gcn_feats, map_summary)
-
-            z_context = self.z_cross_attn(z_flat, context_base)
+        if z_proj is None:
+            z_proj = self.z_direct_proj(z_flat)  # (NA_eff, d_model)
         else:
-            # context_base/z_context precomputed — expand for multi-sample if needed
-            if mult_samp and context_base.size(0) == NA:
-                context_base = context_base.unsqueeze(1).expand(-1, NS, -1, -1).reshape(
-                    NA_eff, context_base.size(1), context_base.size(2))
-                z_context = z_context.unsqueeze(1).expand(-1, NS, -1, -1).reshape(
-                    NA_eff, z_context.size(1), z_context.size(2))
+            # z_proj precomputed — expand for multi-sample if needed
+            if mult_samp and z_proj.size(0) == NA:
+                z_proj = z_proj.unsqueeze(1).expand(-1, NS, -1).reshape(NA_eff, -1)
+
+        # z_proj as single token for A2Z: (NA_eff, 1, d_model)
+        z_tokens_for_a2z = z_proj.unsqueeze(1)
 
         # ================================================================
         # 2. AR loop
@@ -1816,7 +1738,7 @@ class TrafficPlannerModel(nn.Module):
             for layer_idx, layer in enumerate(self.trans_layers):
                 is_first_layer = (layer_idx == 0)
                 x_out, extras = layer(
-                    x, cur_ego, z_context, cur_map,
+                    x, cur_ego, z_tokens_for_a2z, cur_map,
                     return_a2a_output=is_first_layer,
                     return_a2s_weights=is_first_layer,
                     agent_states=agent_states_for_bias,
@@ -2234,10 +2156,10 @@ class TrafficPlannerModel(nn.Module):
                 layer.a2a_attn.ego_q_proj,
                 layer.a2a_attn.ego_o_proj,
             ])
-            # A2Z: ego Q/O
+            # Z injection
             trainable_modules.extend([
-                layer.a2z_ego_q_proj,
-                layer.a2z_ego_o_proj,
+                layer.z_inject_norm,
+                layer.z_inject_proj,
             ])
             # A2S: ego Q/O
             trainable_modules.extend([
