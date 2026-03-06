@@ -186,3 +186,27 @@ action_blending: False        # 기존 True
 2. **error accumulation 대응**: 필요 시 scheduled sampling (blend를 나중에 서서히 도입)
 3. **map_attn_loss 실험**: TF 없는 상태에서 map_attn_loss가 z에 미치는 영향 재확인
 4. **z 품질 정성 평가**: z 변경 시 trajectory 변화 시각화 (적대적 최적화)
+
+---
+
+## TODO (260306 세션 후반)
+
+### viz_attn_intent.py 좌표 수정 필요 (0306_force_z_add 브랜치 stash)
+- `_overlay_heatmap`: 기존 단순 zoom → RF-aware canvas 매핑으로 변경 (작업 중)
+- `compute_soft_label_grid`: `pix2grid = grid_size/pix_size` → RF 기반 `_m2token()` 변경 완료
+- **아직 얼라인 안 맞음**: 축 방향(long/lat ↔ x/y) 매핑 재검증 필요
+- 이론상 `grid[i,j]` i=long, j=lat → `canvas[py,px]` px=long, py=lat 맞지만 실제 이미지에서 어긋남
+- `0306_force_z_add` 브랜치에 stash 되어 있음
+
+### Loss weight 밸런스 분석 결과
+- recon_loss가 total의 99.4% 독점 (log_normal 상수 텀 포함)
+- KL weight=0.001 → 0.2% (너무 작지만, 구조적으로 z 살아있음)
+- intent_ce: 2.05→1.08 (학습 중, 9slot 중 6개 활용)
+- map_attn: loss=0 → A2S uniform (학습 안 됨, map 활용 못 함)
+- map_attn_loss 넣으면 A2S 부트스트랩 가능 (weight 0.005 수준)
+
+### 학습 상태 (epoch 33 기준)
+- pos_err: train=2.4m, val=2.3m (gap ≈ 1.0x)
+- KL: 17.6→7.0 (하락 추세, 아직 건강 범위)
+- z_global/std ≈ 1.0 (살아있음)
+- active_dims: 32/32

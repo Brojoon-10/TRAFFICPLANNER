@@ -8,7 +8,7 @@
 # - Phase-based training (Phase 1: pretrain, Phase 2: finetune)
 # - Potential-based collision avoidance loss
 
-import os, argparse, time, csv
+import os, argparse, time, csv, subprocess, socket, webbrowser
 
 import gc
 import math
@@ -833,6 +833,27 @@ def main():
     tb_writer = SummaryWriter(log_dir=tb_log_dir)
     Logger.log(f'TensorBoard logs: {tb_log_dir}')
 
+    # Auto-start TensorBoard server (port 6006, skip if already running)
+    tb_proc = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        port_in_use = s.connect_ex(('localhost', 6006)) == 0
+        s.close()
+        if not port_in_use:
+            tb_proc = subprocess.Popen(
+                ['tensorboard', '--logdir', cfg.out, '--host', '0.0.0.0', '--port', '6006'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            Logger.log(f'TensorBoard server started on http://0.0.0.0:6006 (PID: {tb_proc.pid})')
+            time.sleep(2)
+            webbrowser.open('http://localhost:6006')
+        else:
+            Logger.log('TensorBoard server already running on port 6006')
+            webbrowser.open('http://localhost:6006')
+    except Exception as e:
+        Logger.log(f'TensorBoard auto-start failed: {e}')
+
     # CSV logging
     csv_dir = os.path.join(cfg.out, 'csv_logs')
     mkdir(csv_dir)
@@ -979,6 +1000,9 @@ def main():
         tb_writer.close()
     csv_train_file.close()
     csv_val_file.close()
+    if tb_proc is not None:
+        tb_proc.terminate()
+        Logger.log('TensorBoard server stopped.')
     Logger.log(f'Training complete. TensorBoard: tensorboard --logdir {tb_log_dir}')
 
     if use_wandb:
