@@ -90,16 +90,18 @@ def render_map_bg(map_obs_np):
     With origin='lower': x-axis=cols=H=longitudinal, y-axis=rows=W=lateral
     Returns: (W, H, 3) RGB image for use with imshow(origin='lower')
     """
-    map_color_list = ['darkgray', 'coral', 'orange', 'gold', 'lightblue', 'lightblue']
-    map_alpha_list = [1.0, 0.6, 0.6, 0.6, 1.0, 0.5]
+    # Only render binary channels (ch0-2). ch3+ are distance fields (continuous 0~1), skip for viz.
+    map_color_list = ['darkgray', 'coral', 'orange']
+    map_alpha_list = [1.0, 0.6, 0.6]
+    num_binary_ch = min(map_obs_np.shape[0], len(map_color_list))
 
     # After .T: display shape is (W, H) — matches nuscenes_utils convention
     disp_h, disp_w = map_obs_np.shape[2], map_obs_np.shape[1]  # W, H after transpose
     img = np.ones((disp_h, disp_w, 3))
 
-    for i in range(map_obs_np.shape[0]):
-        c = np.array(mcolors.to_rgba(map_color_list[i % len(map_color_list)])[:3])
-        alpha = map_alpha_list[i % len(map_alpha_list)]
+    for i in range(num_binary_ch):
+        c = np.array(mcolors.to_rgba(map_color_list[i])[:3])
+        alpha = map_alpha_list[i]
         mask = map_obs_np[i].T  # (H,W) → (W,H), matching nuscenes_utils
         for ch in range(3):
             img[:, :, ch] = img[:, :, ch] * (1 - mask * alpha) + c[ch] * mask * alpha
@@ -107,29 +109,37 @@ def render_map_bg(map_obs_np):
     return img
 
 
-def remap_attn_to_gt_frame(attn_grid, pred_frame, gt_frame, grid_size, bounds):
+def remap_attn_to_gt_frame(attn_grid, pred_frame, gt_frame, grid_size, bounds,
+                           pix_size=256, rf_stride=None, rf_offset=None):
     """
     Remap model attention from predicted-frame local coords to GT-frame local coords.
 
-    Each attn grid cell (i, j) corresponds to a local coordinate in the pred frame.
-    We convert that to world coords, then to GT frame local coords, and scatter
-    the attention weight onto the GT-frame grid.
+    Uses CNN receptive field centers: token[m] center = rf_offset + m * rf_stride pixels.
 
     :param attn_grid: (grid_size, grid_size) attention in pred frame (H'=long, W'=lat)
     :param pred_frame: (4,) predicted frame (x, y, hx, hy) in world coords
     :param gt_frame: (4,) GT frame (x, y, hx, hy) in world coords
     :param grid_size: 29
     :param bounds: [low_l, low_w, high_l, high_w]
+    :param pix_size: pixel size of map crop (256)
+    :param rf_stride: CNN receptive field stride
+    :param rf_offset: CNN receptive field offset
     :returns: (grid_size, grid_size) attention remapped to GT frame
     """
-    # Grid cell centers in local coords (pred frame)
-    gi = np.arange(grid_size, dtype=np.float32) + 0.5
-    gj = np.arange(grid_size, dtype=np.float32) + 0.5
+    if rf_stride is None:
+        rf_stride = pix_size / grid_size
+    if rf_offset is None:
+        rf_offset = 0.0
+
+    # Token index → pixel center → local meters (pred frame)
+    gi = np.arange(grid_size, dtype=np.float32)
+    gj = np.arange(grid_size, dtype=np.float32)
     gi_grid, gj_grid = np.meshgrid(gi, gj, indexing='ij')  # (GS, GS)
 
-    # Grid cell → local meters (pred frame)
-    local_l = gi_grid / grid_size * (bounds[2] - bounds[0]) + bounds[0]
-    local_w = gj_grid / grid_size * (bounds[3] - bounds[1]) + bounds[1]
+    pix_l = rf_offset + gi_grid * rf_stride
+    pix_w = rf_offset + gj_grid * rf_stride
+    local_l = pix_l / pix_size * (bounds[2] - bounds[0]) + bounds[0]
+    local_w = pix_w / pix_size * (bounds[3] - bounds[1]) + bounds[1]
 
     # Pred frame local → world
     px, py, phx, phy = pred_frame
@@ -143,9 +153,11 @@ def remap_attn_to_gt_frame(attn_grid, pred_frame, gt_frame, grid_size, bounds):
     gt_local_l = dx * ghx + dy * ghy
     gt_local_w = -dx * ghy + dy * ghx
 
-    # GT local meters → GT grid indices (continuous)
-    gt_gi = (gt_local_l - bounds[0]) / (bounds[2] - bounds[0]) * grid_size
-    gt_gj = (gt_local_w - bounds[1]) / (bounds[3] - bounds[1]) * grid_size
+    # GT local meters → pixel → GT grid indices (continuous, RF-aware)
+    gt_pix_l = (gt_local_l - bounds[0]) / (bounds[2] - bounds[0]) * pix_size
+    gt_pix_w = (gt_local_w - bounds[1]) / (bounds[3] - bounds[1]) * pix_size
+    gt_gi = (gt_pix_l - rf_offset) / rf_stride
+    gt_gj = (gt_pix_w - rf_offset) / rf_stride
 
     # Scatter attention weights onto GT grid (bilinear splatting)
     out = np.zeros((grid_size, grid_size), dtype=np.float64)
@@ -175,31 +187,39 @@ def remap_attn_to_gt_frame(attn_grid, pred_frame, gt_frame, grid_size, bounds):
 
 
 def compute_soft_label_grid(gt_future_world, ego_frames_world, grid_size, bounds, pix_size,
-                             sigma_d=0.8, decay_lambda=0.3, map_gt_steps=6):
+                             sigma_d=0.8, decay_lambda=0.3, map_gt_steps=6,
+                             rf_stride=None, rf_offset=None):
     """
     Compute soft label for a single agent at each timestep.
     Mirrors _make_soft_label logic from trafficplanner_loss.py.
 
-    At each timestep t, the frame (agent position) is:
-      t=0: past last position
-      t>0: gt_future[t-1] position
-    Future waypoints are transformed to that frame's local coords.
+    Uses CNN receptive field centers: token[m] center = rf_offset + m * rf_stride pixels.
 
     :param gt_future_world: (FT, 4+) GT future in world coords (x,y,hx,hy,...)
     :param ego_frames_world: (FT+1, 4) frame positions: [past_last, gt_future[0], ..., gt_future[FT-1]]
-                              i.e. ego_frames_world[0] = past last, ego_frames_world[t+1] = gt_future[t]
     :param grid_size: 29
     :param bounds: [-17, -38.5, 60, 38.5]
     :param pix_size: 256
+    :param rf_stride: CNN receptive field stride
+    :param rf_offset: CNN receptive field offset
     :return: (FT, grid_size, grid_size) soft labels in (H', W') = (long, lat) order
     """
-    FT = gt_future_world.shape[0]
-    m2pix_l = pix_size / (bounds[2] - bounds[0])
-    m2pix_w = pix_size / (bounds[3] - bounds[1])
-    pix2grid_l = grid_size / pix_size
-    pix2grid_w = grid_size / pix_size
+    if rf_stride is None:
+        rf_stride = pix_size / grid_size
+    if rf_offset is None:
+        rf_offset = 0.0
 
-    # Grid coordinates
+    FT = gt_future_world.shape[0]
+
+    def _m2token_l(meters):
+        pixel = (meters - bounds[0]) / (bounds[2] - bounds[0]) * pix_size
+        return (pixel - rf_offset) / rf_stride
+
+    def _m2token_w(meters):
+        pixel = (meters - bounds[1]) / (bounds[3] - bounds[1]) * pix_size
+        return (pixel - rf_offset) / rf_stride
+
+    # Grid coordinates (token indices)
     gi_range = np.arange(grid_size, dtype=np.float32)
     gj_range = np.arange(grid_size, dtype=np.float32)
     grid_i, grid_j = np.meshgrid(gi_range, gj_range, indexing='ij')
@@ -219,8 +239,8 @@ def compute_soft_label_grid(gt_future_world, ego_frames_world, grid_size, bounds
         fx, fy, fhx, fhy = frame[0], frame[1], frame[2], frame[3]
 
         # Agent pos in its own local frame is always (0, 0)
-        agent_gi = (0.0 - bounds[0]) * m2pix_l * pix2grid_l
-        agent_gj = (0.0 - bounds[1]) * m2pix_w * pix2grid_w
+        agent_gi = _m2token_l(0.0)
+        agent_gj = _m2token_w(0.0)
 
         # Polyline: agent pos + future waypoints in grid coords (relative to this frame)
         wp_i = [agent_gi]
@@ -234,8 +254,8 @@ def compute_soft_label_grid(gt_future_world, ego_frames_world, grid_size, bounds
             dy = gt_future_world[ft_idx, 1] - fy
             local_l = dx * fhx + dy * fhy       # longitudinal
             local_w = -dx * fhy + dy * fhx      # lateral
-            gi_f = (local_l - bounds[0]) * m2pix_l * pix2grid_l
-            gj_f = (local_w - bounds[1]) * m2pix_w * pix2grid_w
+            gi_f = _m2token_l(local_l)
+            gj_f = _m2token_w(local_w)
             wp_i.append(gi_f)
             wp_j.append(gj_f)
 
@@ -294,7 +314,9 @@ def visualize_map_attention(map_obs_dict, attn_weights, out_path, agent_idx=0,
                              soft_labels=None,
                              pred_pix_per_step=None,
                              gt_traj_pix=None, pred_traj_pix=None,
-                             tf_attn_weights=None):
+                             tf_attn_weights=None,
+                             rf_stride=None, rf_offset=None, pix_size=256,
+                             bounds=None):
     """
     Map attention heatmap overlay on per-timestep GT-position map crops.
 
@@ -332,24 +354,42 @@ def visualize_map_attention(map_obs_dict, attn_weights, out_path, agent_idx=0,
 
     from scipy.ndimage import zoom
 
+    # RF params for heatmap alignment (closure vars for _overlay_heatmap)
+    _viz_rf_stride = rf_stride
+    _viz_rf_offset = rf_offset
+    _viz_pix_size = pix_size
+
     def _overlay_heatmap(ax, map_bg_t, grid_data, title, pred_pix=None):
         disp_h_t, disp_w_t = map_bg_t.shape[:2]
-        ax.imshow(map_bg_t, origin='lower')
+        ax.imshow(map_bg_t, origin='lower', extent=[0, disp_w_t, 0, disp_h_t])
         # grid_data: (H', W') = (long, lat), transpose for display
         grid_disp = grid_data.T  # (lat, long)
-        scale_h = disp_h_t / grid_disp.shape[0]
-        scale_w = disp_w_t / grid_disp.shape[1]
-        upsampled = zoom(grid_disp, (scale_h, scale_w), order=1)
+        gs_h, gs_w = grid_disp.shape
+        # Upsample grid for smooth display (keep in token space)
+        up_factor = 4
+        upsampled = zoom(grid_disp, (up_factor, up_factor), order=1)
         vmax = upsampled.max()
         if vmax > 0:
             upsampled = upsampled / vmax
         cmap = plt.cm.jet
         heatmap = cmap(upsampled)
         heatmap[:, :, 3] = upsampled * 0.7
-        ax.imshow(heatmap, origin='lower')
+        # RF-aware extent: token[i] center = (rf_offset + i * rf_stride) pixels
+        # Map from pixel coords to display coords (display = pixel * disp/pix)
+        _rf_s = _viz_rf_stride if _viz_rf_stride is not None else (disp_w_t / gs_w)
+        _rf_o = _viz_rf_offset if _viz_rf_offset is not None else 0.0
+        _pix = _viz_pix_size if _viz_pix_size is not None else disp_w_t
+        # Half-stride padding so each token covers its full RF cell
+        half = _rf_s * 0.5
+        x0 = (_rf_o - half) / _pix * disp_w_t
+        x1 = (_rf_o + (gs_w - 1) * _rf_s + half) / _pix * disp_w_t
+        y0 = (_rf_o - half) / _pix * disp_h_t
+        y1 = (_rf_o + (gs_h - 1) * _rf_s + half) / _pix * disp_h_t
+        ax.imshow(heatmap, origin='lower', extent=[x0, x1, y0, y1])
         # Mark GT agent position (white star)
-        agent_pix_x = (0.0 - (-17.0)) / (60.0 - (-17.0)) * disp_w_t
-        agent_pix_y = (0.0 - (-38.5)) / (38.5 - (-38.5)) * disp_h_t
+        _b = bounds if bounds is not None else [-17, -38.5, 60, 38.5]
+        agent_pix_x = (0.0 - _b[0]) / (_b[2] - _b[0]) * disp_w_t
+        agent_pix_y = (0.0 - _b[1]) / (_b[3] - _b[1]) * disp_h_t
         ax.plot(agent_pix_x, agent_pix_y, 'w*', markersize=10)
         # Mark predicted position (red dot)
         if pred_pix is not None:
@@ -440,7 +480,9 @@ def visualize_map_attention(map_obs_dict, attn_weights, out_path, agent_idx=0,
     print(f'  Saved map attn: {out_path}')
 
 
-def visualize_intent_codebook(intent_weights, out_path, agent_idx=0, num_intents=9):
+def visualize_intent_codebook(intent_weights, out_path, agent_idx=0, num_intents=9,
+                              gt_intent_label=None,
+                              map_obs=None, gt_traj_pix=None, pred_traj_pix=None):
     """
     Intent codebook slot selection visualization.
 
@@ -448,25 +490,67 @@ def visualize_intent_codebook(intent_weights, out_path, agent_idx=0, num_intents
     :param out_path: output path
     :param agent_idx: agent index
     :param num_intents: K
+    :param gt_intent_label: (FT, K) GT soft label (optional)
+    :param map_obs: (C, H, W) map crop (optional)
+    :param gt_traj_pix: (FT, 2) GT trajectory in pixel coords (optional)
+    :param pred_traj_pix: (FT, 2) pred trajectory in pixel coords (optional)
     """
     FT, K = intent_weights.shape
+    has_gt = gt_intent_label is not None
+    has_map = map_obs is not None
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    n_cols = (1 if has_map else 0) + (1 if has_gt else 0) + 2  # map? + gt? + model + bar
+    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4))
+    if n_cols == 1:
+        axes = [axes]
 
-    # Left: heatmap of intent weights over time
-    ax = axes[0]
+    col = 0
+
+    # Col 0: Map + Traj (optional)
+    if has_map:
+        ax = axes[col]
+        bg = render_map_bg(map_obs)
+        ax.imshow(bg, origin='upper')
+        if gt_traj_pix is not None:
+            ax.plot(gt_traj_pix[:, 0], gt_traj_pix[:, 1], 'o-',
+                    color='white', markersize=3, linewidth=1.5, label='GT')
+        if pred_traj_pix is not None:
+            ax.plot(pred_traj_pix[:, 0], pred_traj_pix[:, 1], 'x-',
+                    color='red', markersize=3, linewidth=1.5, label='Pred')
+        ax.legend(fontsize=8, loc='upper right')
+        ax.set_title(f'Map + Trajectory\n(Agent {agent_idx})', fontsize=10)
+        ax.axis('off')
+        col += 1
+
+    # GT intent soft label heatmap (if available)
+    if has_gt:
+        ax = axes[col]
+        im = ax.imshow(gt_intent_label.T, aspect='auto', cmap='YlOrRd',
+                       interpolation='nearest', vmin=0, vmax=1)
+        ax.set_xlabel('Future Timestep', fontsize=10)
+        ax.set_ylabel('Intent Slot', fontsize=10)
+        ax.set_yticks(range(K))
+        ax.set_xticks(range(0, FT, 2))
+        ax.set_xticklabels([f'{(t+1)*0.5:.1f}s' for t in range(0, FT, 2)], fontsize=8)
+        ax.set_title(f'GT Intent Soft Label\n(Agent {agent_idx})', fontsize=10)
+        plt.colorbar(im, ax=ax, shrink=0.8)
+        col += 1
+
+    # Model intent weights heatmap
+    ax = axes[col]
     im = ax.imshow(intent_weights.T, aspect='auto', cmap='YlOrRd',
                    interpolation='nearest', vmin=0, vmax=1)
     ax.set_xlabel('Future Timestep', fontsize=10)
     ax.set_ylabel('Intent Slot', fontsize=10)
     ax.set_yticks(range(K))
     ax.set_xticks(range(0, FT, 2))
-    ax.set_xticklabels([f'{t*0.5:.1f}s' for t in range(0, FT, 2)], fontsize=8)
-    ax.set_title(f'Intent Weights Over Time\n(Agent {agent_idx})', fontsize=10)
+    ax.set_xticklabels([f'{(t+1)*0.5:.1f}s' for t in range(0, FT, 2)], fontsize=8)
+    ax.set_title(f'Model Intent Weights\n(Agent {agent_idx})', fontsize=10)
     plt.colorbar(im, ax=ax, shrink=0.8)
+    col += 1
 
-    # Right: bar chart of most selected slot per timestep
-    ax = axes[1]
+    # Bar chart of slot usage
+    ax = axes[col]
     selected_slots = intent_weights.argmax(axis=1)
     slot_counts = np.bincount(selected_slots, minlength=K)
     colors = plt.cm.Set3(np.linspace(0, 1, K))
@@ -489,6 +573,101 @@ def visualize_intent_codebook(intent_weights, out_path, agent_idx=0, num_intents
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'  Saved intent: {out_path}')
+
+
+def visualize_intent_grid(gt_xy, prototypes, intent_weights, out_path,
+                          agent_idx=0, intent_range=2.0,
+                          map_obs=None, gt_traj_pix=None, pred_traj_pix=None):
+    """
+    4-panel: [Map+Traj] [GT intent] [colorbar] [Model intent]
+
+    :param gt_xy: (FT, 2) — GT (acc_norm, yaw_rate_norm) per timestep
+    :param prototypes: (K, 2) — prototype positions
+    :param intent_weights: (FT, K) — model intent weights
+    :param out_path: output path
+    :param agent_idx: agent index
+    :param intent_range: grid range [-r, r]
+    :param map_obs: (C, H, W) map crop at t=0 (optional)
+    :param gt_traj_pix: (FT, 2) GT trajectory in pixel coords (optional)
+    :param pred_traj_pix: (FT, 2) pred trajectory in pixel coords (optional)
+    """
+    FT = gt_xy.shape[0]
+    K = prototypes.shape[0]
+    n_side = int(np.sqrt(K))
+    colors = plt.cm.Reds(np.linspace(0.2, 1.0, FT))
+    grid_vals = np.linspace(-intent_range, intent_range, n_side)
+
+    has_map = map_obs is not None
+    if has_map:
+        fig = plt.figure(figsize=(18, 5))
+        gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 0.05, 1], wspace=0.3)
+        ax_map = fig.add_subplot(gs[0])
+        ax_gt = fig.add_subplot(gs[1])
+        cbar_ax = fig.add_subplot(gs[2])
+        ax_model = fig.add_subplot(gs[3])
+    else:
+        fig = plt.figure(figsize=(14, 5))
+        gs = fig.add_gridspec(1, 3, width_ratios=[1, 0.05, 1], wspace=0.3)
+        ax_gt = fig.add_subplot(gs[0])
+        cbar_ax = fig.add_subplot(gs[1])
+        ax_model = fig.add_subplot(gs[2])
+
+    # --- Map + Traj panel ---
+    if has_map:
+        bg = render_map_bg(map_obs)
+        ax_map.imshow(bg, origin='upper')
+        if gt_traj_pix is not None:
+            ax_map.plot(gt_traj_pix[:, 0], gt_traj_pix[:, 1], 'o-',
+                        color='white', markersize=3, linewidth=1.5, label='GT')
+        if pred_traj_pix is not None:
+            ax_map.plot(pred_traj_pix[:, 0], pred_traj_pix[:, 1], 'x-',
+                        color='red', markersize=3, linewidth=1.5, label='Pred')
+        ax_map.legend(fontsize=8, loc='upper right')
+        ax_map.set_title(f'Map + Trajectory (Agent {agent_idx})', fontsize=11)
+        ax_map.axis('off')
+
+    # prototypes[:, 0]=acc, [:, 1]=yaw → plot x=yaw, y=acc
+    def _draw_base(ax):
+        for v in grid_vals:
+            ax.axhline(v, color='lightgray', linewidth=0.5)
+            ax.axvline(v, color='lightgray', linewidth=0.5)
+        ax.scatter(prototypes[:, 1], prototypes[:, 0], marker='s', s=140,
+                   c='lightblue', edgecolors='navy', linewidth=1.5, zorder=2)
+        lim = intent_range * 1.3
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_xlabel('Yaw Rate (normalized)', fontsize=10)
+        ax.set_ylabel('Acc (normalized)', fontsize=10)
+        ax.set_aspect('equal')
+        # 코너 방향 라벨
+        ax.text(-lim * 0.95, lim * 0.95, 'Accel+Right', fontsize=7, ha='left', va='top', color='gray')
+        ax.text(lim * 0.95, lim * 0.95, 'Accel+Left', fontsize=7, ha='right', va='top', color='gray')
+        ax.text(-lim * 0.95, -lim * 0.95, 'Decel+Right', fontsize=7, ha='left', va='bottom', color='gray')
+        ax.text(lim * 0.95, -lim * 0.95, 'Decel+Left', fontsize=7, ha='right', va='bottom', color='gray')
+
+    # --- GT panel --- (x=yaw, y=acc)
+    _draw_base(ax_gt)
+    for t in range(FT):
+        ax_gt.scatter(gt_xy[t, 1], gt_xy[t, 0], c=[colors[t]], s=140, zorder=3,
+                      edgecolors='black', linewidth=0.8, alpha=0.85)
+    ax_gt.set_title(f'GT (Agent {agent_idx})', fontsize=11)
+
+    # --- Model panel --- (x=yaw, y=acc)
+    _draw_base(ax_model)
+    model_xy = intent_weights @ prototypes  # (FT, 2) → [:, 0]=acc, [:, 1]=yaw
+    for t in range(FT):
+        ax_model.scatter(model_xy[t, 1], model_xy[t, 0], c=[colors[t]], s=140, zorder=3,
+                         edgecolors='black', linewidth=0.8, alpha=0.85)
+    ax_model.set_title(f'Model Intent (Agent {agent_idx})', fontsize=11)
+
+    # --- Colorbar (between GT and Model) ---
+    sm = plt.cm.ScalarMappable(cmap='Reds', norm=plt.Normalize(0.5, FT * 0.5))
+    sm.set_array([])
+    fig.colorbar(sm, cax=cbar_ax)
+    cbar_ax.set_title('Time (s)', fontsize=8, pad=5)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved intent grid: {out_path}')
 
 
 def visualize_intent_aggregate(all_intent_weights, out_path, num_intents=9):
@@ -540,7 +719,7 @@ def visualize_intent_aggregate(all_intent_weights, out_path, num_intents=9):
     ax.set_xlabel('Future Timestep', fontsize=10)
     ax.set_ylabel('Intent Slot', fontsize=10)
     ax.set_xticks(range(0, FT, 2))
-    ax.set_xticklabels([f'{t*0.5:.1f}s' for t in range(0, FT, 2)], fontsize=8)
+    ax.set_xticklabels([f'{(t+1)*0.5:.1f}s' for t in range(0, FT, 2)], fontsize=8)
     ax.set_yticks(range(K))
     ax.set_title(f'Mean Intent Weights Over Time', fontsize=10)
     plt.colorbar(im, ax=ax, shrink=0.8)
@@ -641,7 +820,7 @@ def main():
         use_ego_z_local=cfg.use_ego_z_local,
         use_sur_z_local=cfg.use_sur_z_local,
         use_a2a_rel_bias=getattr(cfg, 'use_a2a_rel_bias', False),
-        num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
+        num_z_queries=getattr(cfg, 'num_z_queries', 4),
         context_num_layers=getattr(cfg, 'context_num_layers', 2),
         map_summary_tokens=getattr(cfg, 'map_summary_tokens', 8),
     ).to(device)
@@ -814,9 +993,14 @@ def main():
                 ego_frames_world[0] = ego_pos[:4]
                 ego_frames_world[1:] = gt_future[:, :4]
 
+                num_tokens = attn_np.shape[1]
+                gs = int(np.sqrt(num_tokens))
+                _rf_s = getattr(model, 'map_rf_stride', None)
+                _rf_o = getattr(model, 'map_rf_offset', None)
                 soft_labels = compute_soft_label_grid(
-                    gt_future, ego_frames_world, grid_size=29,
-                    bounds=cfg.map_obs_bounds, pix_size=cfg.map_obs_size_pix
+                    gt_future, ego_frames_world, grid_size=gs,
+                    bounds=cfg.map_obs_bounds, pix_size=cfg.map_obs_size_pix,
+                    rf_stride=_rf_s, rf_offset=_rf_o
                 )
 
                 # Remap model attention from pred frame to GT frame
@@ -825,7 +1009,7 @@ def main():
                 ).cpu().numpy()  # (FT, 4)
                 bounds = cfg.map_obs_bounds
                 L = cfg.map_obs_size_pix
-                grid_size = 29
+                grid_size = gs
 
                 # Build pred frames: t=0 → past_last, t>0 → pred_future[t-1]
                 pred_frames_world = np.zeros((FT_len + 1, 4))
@@ -841,7 +1025,8 @@ def main():
                     # Remap attn grid: pred frame → GT frame
                     attn_grid = attn_np[t].reshape(grid_size, grid_size)
                     remapped = remap_attn_to_gt_frame(
-                        attn_grid, pred_frame, gt_frame, grid_size, bounds)
+                        attn_grid, pred_frame, gt_frame, grid_size, bounds,
+                        pix_size=L, rf_stride=_rf_s, rf_offset=_rf_o)
                     attn_remapped[t] = remapped.reshape(-1)
 
                     # Pred position in GT-frame local → pixel
@@ -870,7 +1055,11 @@ def main():
                     tf_attn_weights=tf_attn_np,
                     pred_pix_per_step=pred_pix_per_step,
                     gt_traj_pix=gt_traj_pix,
-                    pred_traj_pix=pred_traj_pix
+                    pred_traj_pix=pred_traj_pix,
+                    rf_stride=_rf_s,
+                    rf_offset=_rf_o,
+                    pix_size=cfg.map_obs_size_pix,
+                    bounds=cfg.map_obs_bounds,
                 )
 
                 # Visualize intent codebook

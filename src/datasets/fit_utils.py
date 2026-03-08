@@ -222,17 +222,45 @@ def fit_raster(drivable_area_osm, line_markings_osm, shp_folder):
             pt2_pixel = world_to_pixel(p2[0], p2[1], target_transform)
             cv2.line(dashed_line_raster, pt1_pixel, pt2_pixel, 1, thickness=1)
 
-    # --- 3. Stack all layers and return ---
+    # --- 3. Distance field channels ---
+    # solid_dist: 1/(1+d), d = distance in pixels to nearest solid line pixel
+    # dashed_dist: 1/(1+d), d = distance in pixels to nearest dashed line pixel
+    # cv2.distanceTransform requires binary input where 0 = foreground (line pixels)
+    # We invert: line=1 → 0 (foreground), non-line=0 → 1 (background)
+    solid_dist_raw = cv2.distanceTransform(
+        (1 - solid_line_raster).astype(np.uint8), cv2.DIST_L2, 5
+    )
+    dashed_dist_raw = cv2.distanceTransform(
+        (1 - dashed_line_raster).astype(np.uint8), cv2.DIST_L2, 5
+    )
+    # Convert pixel distance to meters (raster resolution = 0.25m/pixel = 4 pix/m)
+    pix_per_m = 4.0
+    solid_dist_m = solid_dist_raw / pix_per_m
+    dashed_dist_m = dashed_dist_raw / pix_per_m
+    # Apply 1/(1+d) transform: close to line → ~1, far from line → ~0
+    solid_dist_field = 1.0 / (1.0 + solid_dist_m)
+    dashed_dist_field = 1.0 / (1.0 + dashed_dist_m)
+
+    # --- 4. Stack all layers and return ---
     # Apply convert_array (flip) to all layers to match the trajectory coordinate system
     final_raster_drivable = convert_array(drivable_raster_data)
     final_raster_solid = convert_array(solid_line_raster)
     final_raster_dashed = convert_array(dashed_line_raster)
-    
+    final_solid_dist = convert_array(solid_dist_field)
+    final_dashed_dist = convert_array(dashed_dist_field)
+
     # Stack the flipped arrays into a multi-channel raster (C, H, W)
+    # ch0: drivable_area (binary)
+    # ch1: solid_line (binary)
+    # ch2: dashed_line (binary)
+    # ch3: solid_dist — 1/(1+d), d = distance to solid line in meters
+    # ch4: dashed_dist — 1/(1+d), d = distance to dashed line in meters
     stacked_raster = np.stack([
         final_raster_drivable,
         final_raster_solid,
-        final_raster_dashed
+        final_raster_dashed,
+        final_solid_dist.astype(np.float32),
+        final_dashed_dist.astype(np.float32),
     ], axis=0)
     
     # The original code reshaped to (1, H, W). The calling function will now handle

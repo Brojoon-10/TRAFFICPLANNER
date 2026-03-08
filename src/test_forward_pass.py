@@ -120,8 +120,7 @@ def setup_model(device):
         use_sur_z_local=False,
         # Enc-Dec Cross-Attention params
         use_a2a_rel_bias=True,
-        num_z_tokens=4,
-        num_z_queries=2,
+        num_z_queries=4,
         context_num_layers=2,
         map_summary_tokens=8,
     ).to(device)
@@ -162,14 +161,14 @@ def test_model_instantiation(device):
     assert hasattr(model, 'query_proj'), "Missing query_proj"
     assert hasattr(model, 'step_pe'), "Missing step_pe"
     assert hasattr(model, 'context_encoder'), "Missing context_encoder"
-    assert hasattr(model, 'z_cross_attn'), "Missing z_cross_attn"
+    # S1: ZCrossAttention removed — z_global injected via A2S query
     assert hasattr(model, 'z_query'), "Missing z_query"
     assert hasattr(model, 'z_gen_q_proj'), "Missing z_gen_q_proj"
     assert hasattr(model, 'future_proj'), "Missing future_proj"
     assert hasattr(model, 'future_temporal_pe'), "Missing future_temporal_pe"
     assert hasattr(model, 'map_summary_pooling'), "Missing map_summary_pooling"
     assert hasattr(model, 'intent_codebook'), "Missing intent_codebook"
-    assert hasattr(model, 'ego_output_head'), "Missing ego_output_head"
+    assert hasattr(model, 'ego_adaln_linear'), "Missing ego_adaln_linear (AdaLN output head)"
     assert hasattr(model, 'sur_output_head'), "Missing sur_output_head"
     assert hasattr(model, 'sur_pred_head'), "Missing sur_pred_head"
     assert hasattr(model, 'ego_pred_head'), "Missing ego_pred_head"
@@ -479,8 +478,8 @@ def test_freeze_for_finetuning(model, device):
     frozen = {n for n, p in model.named_parameters() if not p.requires_grad}
 
     # Key ego components should be trainable (Transformer version)
-    trainable_keywords = ['ego_output_head', 'intent_codebook', 'intent_ce_head',
-                          'ego_intent_proj', 'sur_pred_head']
+    trainable_keywords = ['ego_adaln', 'intent_codebook', 'intent_ce_head',
+                          'sur_pred_head']
     for kw in trainable_keywords:
         matching = [n for n in trainable if kw in n]
         if len(matching) > 0:
@@ -506,11 +505,9 @@ def test_freeze_for_finetuning(model, device):
         else:
             print(f"  [WARNING] {kw}: not found in frozen")
 
-    # A2Z (z_context cross-attn) ego Q/O should be trainable, K/V frozen
-    a2z_ego = [n for n in trainable if 'a2z_ego' in n]
-    print(f"  [TRAINABLE] A2Z ego Q/O: {len(a2z_ego)} params")
-    a2z_kv = [n for n in frozen if 'a2z_k_proj' in n or 'a2z_v_proj' in n]
-    print(f"  [FROZEN] A2Z K/V: {len(a2z_kv)} params")
+    # A2S+z: a2s_z_proj should be trainable (decoder side)
+    a2s_z = [n for n in trainable if 'a2s_z_proj' in n]
+    print(f"  [TRAINABLE] A2S z_proj: {len(a2s_z)} params")
 
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     num_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)

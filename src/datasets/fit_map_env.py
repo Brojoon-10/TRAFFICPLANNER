@@ -23,7 +23,7 @@ class FITMapEnv(object):
     def __init__(self, map_data_path,
                        bounds=[-17.0, -38.5, 60.0, 38.5],
                     #layers=['drivable_area', 'carpark_area', 'road_divider', 'lane_divider'],
-                       layers=['drivable_area', 'solid_line', 'dashed_line'],
+                       layers=['drivable_area', 'solid_line', 'dashed_line', 'solid_dist', 'dashed_dist'],
                        L=256,
                        W=256,
                        device='cpu',
@@ -192,7 +192,7 @@ class FITMapEnv(object):
         # self.nusc_raster = torch.stack(self.nusc_raster, dim=0).to(device)
         # self.nusc_dx = torch.from_numpy(np.stack(self.nusc_dx, axis=0)).to(device) 
         
-        self.nusc_raster = torch.from_numpy(self.nusc_raster).unsqueeze(0).to(device)
+        self.nusc_raster = torch.from_numpy(self.nusc_raster.astype(np.float32)).unsqueeze(0).to(device)
         self.nusc_dx = torch.from_numpy(self.nusc_dx).unsqueeze(0).to(device)
 
     def get_map_crop(self, scene_graph, map_idx,

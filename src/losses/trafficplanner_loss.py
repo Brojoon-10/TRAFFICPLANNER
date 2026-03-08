@@ -475,7 +475,8 @@ class TrafficPlannerLoss(nn.Module):
         '''Enable or disable potential-based repulsion loss.'''
         self.use_potential_loss = enable
 
-    def _compute_auxiliary_losses(self, model, scene_graph, loss_out_dict):
+    def _compute_auxiliary_losses(self, model, scene_graph, loss_out_dict,
+                                     map_idx=None, map_env=None):
         """
         Compute auxiliary losses from model's stored outputs (Transformer Decoder).
 
@@ -568,7 +569,7 @@ class TrafficPlannerLoss(nn.Module):
         # 9 prototypes in normalized (acc, yaw) space: 3x3 grid
         # Soft label via Gaussian distance, loss via KL divergence
         intent_ce_w = self.loss_weights.get('intent_ce', 0.0)
-        if intent_ce_w > 0.0 and model is not None:
+        if intent_ce_w > 0.0 and model is not None and self.phase == 2:
             z_local_raw = model.get_z_local()
             if z_local_raw is not None and hasattr(model, 'intent_ce_head'):
                 num_intents = model.num_intents
@@ -634,17 +635,124 @@ class TrafficPlannerLoss(nn.Module):
                 aux_loss = aux_loss + map_attn_w * map_attn_loss
                 loss_out_dict['map_attn_loss'] = map_attn_loss.detach().view((1,))
 
-        # ---- (E) z_global Auxiliary Decoder Loss: z-only action prediction ----
+        # ---- (E) z_aux: z_global → future trajectory features (Phase 1 only) ----
         z_aux_w = self.loss_weights.get('z_aux', 0.0)
-        if z_aux_w > 0.0 and model is not None:
-            z_aux_traj = getattr(model, '_z_aux_traj', None)
-            if z_aux_traj is not None:
-                gt_actions = model._compute_gt_actions(scene_graph, ego_only=True)  # (N_ego, FT, 2)
-                z_aux_loss = nn.functional.mse_loss(z_aux_traj, gt_actions)
+        if z_aux_w > 0.0 and model is not None and self.phase == 1:
+            z_aux_pred = getattr(model, '_z_aux_pred', None)
+            if z_aux_pred is not None:
+                # GT: ego future in local frame (x, y, hx, hy, speed)
+                ego_gt = gt_future[ego_mask]       # (N_ego, FT, 6) global normalized
+                ego_ref = scene_graph.past[ego_inds, -1, :4]  # (N_ego, 4)
+                local_kin = transform2frame(ego_ref, ego_gt[:, :, :4])  # (N_ego, FT, 4)
+                gt_traj = torch.cat([local_kin, ego_gt[:, :, 4:5]], dim=-1)  # (N_ego, FT, 5)
+                z_aux_loss = nn.functional.mse_loss(z_aux_pred, gt_traj)
                 aux_loss = aux_loss + z_aux_w * z_aux_loss
                 loss_out_dict['z_aux_loss'] = z_aux_loss.detach().view((1,))
 
+        # ---- (F) dist_aux: decoder cross_attn → distance prediction (Phase 2) ----
+        # Per-step GT: recrop map at each ego GT position, sample center pixel
+        dist_aux_w = self.loss_weights.get('dist_aux', 0.0)
+        if dist_aux_w > 0.0 and model is not None and self.phase == 2:
+            dist_preds = getattr(model, '_dist_aux_pred_outputs', [])
+            if len(dist_preds) > 0:
+                dist_pred_stack = torch.stack(dist_preds, dim=1)  # (num_ego, FT, 2)
+                num_steps = dist_pred_stack.size(1)
+
+                # Get ego GT positions for each step (normalized)
+                ego_gt_future = gt_future[ego_mask]  # (N_ego, FT, 6)
+                num_ego = ego_gt_future.size(0)
+
+                # Batch all ego GT positions: (N_ego * num_steps, 4)
+                ego_gt_pos = ego_gt_future[:, :num_steps, :4].reshape(num_ego * num_steps, 4)
+
+                # Unnormalize for map crop
+                ego_gt_pos_unnorm = self.state_normalizer.unnormalize(ego_gt_pos)
+
+                # Build mapixes: each ego → its batch's map_idx, expanded for all steps
+                ego_map_idx = map_idx[scene_graph.batch[ego_inds]]  # (N_ego,)
+                mapixes = ego_map_idx.unsqueeze(1).expand(-1, num_steps).reshape(-1)  # (N_ego*num_steps,)
+
+                # Recrop map at each GT position
+                ego_crops = map_env.get_map_crop_pos(ego_gt_pos_unnorm, mapixes).to(torch.float)
+                # ego_crops: (N_ego*num_steps, C, H, W)
+
+                if ego_crops.size(1) >= 5:
+                    center_h = ego_crops.size(2) // 2
+                    center_w = ego_crops.size(3) // 2
+                    gt_solid = ego_crops[:, 3, center_h, center_w]   # (N_ego*num_steps,)
+                    gt_dashed = ego_crops[:, 4, center_h, center_w]  # (N_ego*num_steps,)
+                    gt_dist = torch.stack([gt_solid, gt_dashed], dim=-1)  # (N_ego*num_steps, 2)
+                    gt_dist = gt_dist.reshape(num_ego, num_steps, 2)  # (N_ego, FT, 2)
+                    dist_aux_loss = nn.functional.mse_loss(dist_pred_stack, gt_dist)
+                    aux_loss = aux_loss + dist_aux_w * dist_aux_loss
+                    loss_out_dict['dist_aux_loss'] = dist_aux_loss.detach().view((1,))
+
+        # ---- (G) map_dist_aux: CNN token → distance field prediction (Phase 1 only) ----
+        map_dist_aux_w = self.loss_weights.get('map_dist_aux', 0.0)
+        if map_dist_aux_w > 0.0 and model is not None and self.phase == 1:
+            map_dist_pred = getattr(model, '_map_dist_pred', None)
+            if map_dist_pred is not None:
+                map_dist_loss = self._compute_map_dist_aux_loss(
+                    model, scene_graph, map_dist_pred, map_idx, map_env)
+                if map_dist_loss is not None:
+                    aux_loss = aux_loss + map_dist_aux_w * map_dist_loss
+                    loss_out_dict['map_dist_aux_loss'] = map_dist_loss.detach().view((1,))
+
         return aux_loss
+
+    def _compute_map_dist_aux_loss(self, model, scene_graph, map_dist_pred, map_idx, map_env):
+        """
+        Map Distance Auxiliary Loss (Phase 1): CNN token → [solid_dist, dashed_dist] prediction.
+
+        GT is extracted from the map crop's distance field channels (ch3=solid_dist, ch4=dashed_dist).
+        Each token corresponds to a spatial region; we sample GT at the RF center of each token.
+
+        :param model: TrafficPlannerModel (for rf_stride, rf_offset, map_token_spatial)
+        :param scene_graph: scene graph
+        :param map_dist_pred: (N_ego, num_tokens, 2) predicted distances
+        :param map_idx: map indices
+        :param map_env: map environment with raster data
+        :return: scalar MSE loss or None
+        """
+        if map_env is None or map_idx is None:
+            return None
+
+        # Get ego map crops: (N_ego, C, H, W) where C=5, H=W=256
+        ego_mask = torch.zeros(scene_graph.pos.size(0), dtype=torch.bool, device=scene_graph.pos.device)
+        ego_mask[scene_graph.ptr[:-1]] = True
+        ego_crops = map_env.get_map_crop(scene_graph, map_idx)  # (NA, C, H, W)
+        ego_crops = ego_crops[ego_mask]  # (N_ego, C, H, W)
+
+        # Extract distance field channels: ch3=solid_dist, ch4=dashed_dist
+        if ego_crops.size(1) < 5:
+            return None  # No distance field channels
+        gt_solid_dist = ego_crops[:, 3, :, :]   # (N_ego, H, W)
+        gt_dashed_dist = ego_crops[:, 4, :, :]  # (N_ego, H, W)
+
+        # Sample GT at RF centers of each token
+        rf_stride = model.map_rf_stride
+        rf_offset = model.map_rf_offset
+        spatial = model.map_token_spatial  # e.g. 29
+
+        # Token grid centers in pixel space
+        token_centers = rf_offset + torch.arange(spatial, device=ego_crops.device).float() * rf_stride
+        token_centers = token_centers.long().clamp(0, ego_crops.size(2) - 1)
+
+        # Sample: gt_solid[i, row, col] for each token (row, col)
+        # tokens are arranged as (row * spatial + col) = (H_tok, W_tok) flattened
+        row_centers = token_centers  # H dimension
+        col_centers = token_centers  # W dimension
+        # Create mesh grid: (spatial, spatial)
+        row_grid, col_grid = torch.meshgrid(row_centers, col_centers)
+        row_flat = row_grid.reshape(-1)  # (num_tokens,)
+        col_flat = col_grid.reshape(-1)  # (num_tokens,)
+
+        # Extract GT values at RF centers: (N_ego, num_tokens)
+        gt_solid = gt_solid_dist[:, row_flat, col_flat]    # (N_ego, num_tokens)
+        gt_dashed = gt_dashed_dist[:, row_flat, col_flat]  # (N_ego, num_tokens)
+        gt_dist = torch.stack([gt_solid, gt_dashed], dim=-1)  # (N_ego, num_tokens, 2)
+
+        return nn.functional.mse_loss(map_dist_pred, gt_dist)
 
     def _compute_map_attn_guidance_loss(self, model, scene_graph, ego_mask, gt_future, FT):
         """
@@ -987,25 +1095,30 @@ class TrafficPlannerLoss(nn.Module):
             gt_future_valid = gt_future[scene_graph.future_vis == 1.0]
             pred_future_valid = pred_future[scene_graph.future_vis == 1.0]
 
-        # Reconstruction loss: log_normal (all 4 dims) + position MSE boost
-        recon_loss = -log_normal(pred_future_valid, gt_future_valid[:, :4], torch.ones_like(pred_future_valid))
-        pos_mse = ((pred_future_valid[:, :2] - gt_future_valid[:, :2]) ** 2).sum(dim=-1)
-        head_mse = ((pred_future_valid[:, 2:4] - gt_future_valid[:, 2:4]) ** 2).sum(dim=-1)
-        if self.recon_pos_weight > 0.0:
-            recon_loss = recon_loss + self.recon_pos_weight * pos_mse
-        # monitoring: MSE for each component
-        pos_loss = pos_mse
-        head_loss = head_mse
-
-        # KL divergence loss
+        # KL divergence loss (computed in both phases)
         pm, pv = pred['prior_out']
         qm, qv = pred['posterior_out']
         kl_loss = kl_normal(qm, qv, pm, pv, free_bits=self.kl_free_bits)
 
-        # total weighted loss
-        loss = self.loss_weights['recon'] * recon_loss.mean()
+        if self.phase == 1:
+            # Phase 1: encoder-only, skip recon entirely (pred is dummy zeros with wrong dim)
+            device = gt_future.device
+            recon_loss = torch.zeros(1, device=device)
+            pos_loss = torch.zeros(1, device=device)
+            head_loss = torch.zeros(1, device=device)
+            loss = torch.tensor(0.0, device=device)
+        else:
+            # Reconstruction loss: log_normal (all 4 dims) + position MSE boost
+            recon_loss = -log_normal(pred_future_valid, gt_future_valid[:, :4], torch.ones_like(pred_future_valid))
+            pos_mse = ((pred_future_valid[:, :2] - gt_future_valid[:, :2]) ** 2).sum(dim=-1)
+            head_mse = ((pred_future_valid[:, 2:4] - gt_future_valid[:, 2:4]) ** 2).sum(dim=-1)
+            if self.recon_pos_weight > 0.0:
+                recon_loss = recon_loss + self.recon_pos_weight * pos_mse
+            pos_loss = pos_mse
+            head_loss = head_mse
+            loss = self.loss_weights['recon'] * recon_loss.mean()
 
-        # KL loss: Phase 1 only
+        # KL loss: Phase 1 only (encoder frozen in Phase 2 → KL constant → no gradient)
         if self.phase == 1 and self.loss_weights.get('kl', 0.0) > 0.0:
             loss = loss + self.loss_weights['kl'] * kl_loss.mean()
 
@@ -1065,7 +1178,8 @@ class TrafficPlannerLoss(nn.Module):
         }
 
         # Auxiliary losses (Redesign)
-        aux_loss = self._compute_auxiliary_losses(model, scene_graph, loss_out)
+        aux_loss = self._compute_auxiliary_losses(model, scene_graph, loss_out,
+                                                     map_idx=map_idx, map_env=map_env)
         if aux_loss.item() > 0:
             loss = loss + aux_loss
             loss_out['loss'] = loss.view((1,))
@@ -1092,6 +1206,16 @@ class TrafficPlannerLoss(nn.Module):
         '''
         gt_future = scene_graph.future_gt # NA x FT x 6
         pred_future = pred['future_pred'] # NA x FT x 4
+
+        # Phase 1: dummy zeros with wrong dim — return empty errors
+        if self.phase == 1:
+            device = gt_future.device
+            return {
+                'pos_err': torch.zeros(1, device=device),
+                'ang_err': torch.zeros(1, device=device),
+                'z_logprob': torch.zeros(1, device=device),
+                'z_mdist': torch.zeros(1, device=device),
+            }
 
         NA, FT, _ = gt_future.size()
 

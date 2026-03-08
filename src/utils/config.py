@@ -72,7 +72,7 @@ def add_base_args(parser):
     #--------------------------------Line Added------------------------------------
     
     parser.add_argument('--map_layers', type=str, nargs='+', 
-                        default=['drivable_area', 'solid_line', 'dashed_line'])
+                        default=['drivable_area', 'solid_line', 'dashed_line', 'solid_dist', 'dashed_dist'])
     
     #--------------------------------Line Added------------------------------------
 

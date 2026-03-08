@@ -82,8 +82,8 @@ def parse_cfg():
 
     # V5/V6 Redesign params (Enc-Dec Cross-Attention)
     parser.add_argument('--use_a2a_rel_bias', type=str2bool, default=False)
-    parser.add_argument('--num_z_tokens', type=int, default=4)
-    parser.add_argument('--num_z_queries', type=int, default=2)
+    parser.add_argument('--num_z_queries', type=int, default=4)
+    parser.add_argument('--enc_dropout', type=float, default=0.0)
     parser.add_argument('--context_num_layers', type=int, default=2)
     parser.add_argument('--map_summary_tokens', type=int, default=8)
 
@@ -419,8 +419,8 @@ def main():
         use_sur_z_local=cfg.use_sur_z_local,
         # V5/V6 Redesign params (Enc-Dec Cross-Attention)
         use_a2a_rel_bias=getattr(cfg, 'use_a2a_rel_bias', False),
-        num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
-        num_z_queries=getattr(cfg, 'num_z_queries', 2),
+        num_z_queries=getattr(cfg, 'num_z_queries', 4),
+        enc_dropout=getattr(cfg, 'enc_dropout', 0.0),
         context_num_layers=getattr(cfg, 'context_num_layers', 2),
         map_summary_tokens=getattr(cfg, 'map_summary_tokens', 8),
     ).to(device)

@@ -48,6 +48,11 @@ from utils.torch import get_device, count_params, save_state, load_state, comput
 from utils.config import get_parser, add_base_args
 from torch.nn.parallel import DistributedDataParallel as DDP
 import matplotlib.pyplot as plt
+from viz_attn_intent import (
+    render_map_bg, compute_soft_label_grid, remap_attn_to_gt_frame,
+    visualize_map_attention, visualize_intent_codebook, visualize_intent_grid,
+    world_to_crop_pixel
+)
 
 def parse_cfg():
     '''
@@ -206,16 +211,18 @@ def parse_cfg():
     parser.add_argument('--use_a2a_rel_bias', type=str2bool, default=False,
                         help='Enable A2A relative physical bias (8-feature MLP → attention bias)')
     # z separation: z(Q) × context(KV) → z_context → A2Z in decoder
-    parser.add_argument('--num_z_tokens', type=int, default=4,
-                        help='Number of z tokens for ZCrossAttention')
-    parser.add_argument('--num_z_queries', type=int, default=2,
+    parser.add_argument('--num_z_queries', type=int, default=4,
                         help='Number of learnable z_query tokens for cross-attention z generation')
     parser.add_argument('--context_num_layers', type=int, default=2,
                         help='Number of TransformerEncoder layers in context encoder')
     parser.add_argument('--map_summary_tokens', type=int, default=8,
                         help='Number of learnable query tokens for map summary pooling')
     parser.add_argument('--loss_z_aux', type=float, default=0.0,
-                        help='z_global auxiliary decoder loss weight')
+                        help='z_global auxiliary head loss weight (Phase 1)')
+    parser.add_argument('--loss_map_dist_aux', type=float, default=0.0,
+                        help='Map distance field auxiliary loss weight (Phase 1)')
+    parser.add_argument('--loss_dist_aux', type=float, default=0.0,
+                        help='Decoder dist_aux loss weight (Phase 2, last cross_attn → distance)')
     parser.add_argument('--action_blending', type=str2bool, default=False,
                         help='Enable action blending (GT/predicted action interpolation)')
     parser.add_argument('--blend_start_step', type=int, default=50000,
@@ -233,6 +240,246 @@ def parse_cfg():
     config = dict2obj(config_dict)
 
     return config, config_dict
+
+
+def _compute_gt_intent_label(model, scene_graph, ego_idx, device, cfg):
+    """Compute GT intent soft label for a single ego agent. Mirrors loss logic."""
+    from datasets.utils import CARLA_NORM_STATS
+    ninfo = CARLA_NORM_STATS[('car', 'truck')]
+
+    num_intents = getattr(cfg, 'num_intents', 9)
+    intent_range = getattr(cfg, 'intent_range', 2.0)
+    intent_sigma = getattr(cfg, 'intent_sigma', 0.5)
+
+    n_acc = int(np.sqrt(num_intents))
+    n_yaw = num_intents // n_acc
+    acc_vals = np.linspace(-intent_range, intent_range, n_acc)
+    yaw_vals = np.linspace(-intent_range, intent_range, n_yaw)
+    acc_grid, yaw_grid = np.meshgrid(acc_vals, yaw_vals, indexing='ij')
+    prototypes = np.stack([acc_grid.ravel(), yaw_grid.ravel()], axis=-1)  # (K, 2)
+
+    normalizer = model.get_normalizer()
+    s_mean = normalizer.mean_vals[4].item()
+    s_std = normalizer.std_vals[4].item()
+    hdot_mean = normalizer.mean_vals[5].item()
+    hdot_std = normalizer.std_vals[5].item()
+    dt = model.dt
+
+    ego_future = scene_graph.future[ego_idx].cpu().numpy()  # (FT, 6) normalized
+    ego_past_speed_norm = scene_graph.past[ego_idx, -1, 4].item()
+    FT = ego_future.shape[0]
+
+    # Unnormalize speed → compute acc
+    ego_speed_raw = ego_future[:, 4] * s_std + s_mean
+    prev_speeds = np.concatenate([[ego_past_speed_norm * s_std + s_mean], ego_speed_raw[:-1]])
+    raw_acc = (ego_speed_raw - prev_speeds) / dt
+    ego_acc = raw_acc / ninfo['a'][1]
+
+    # Unnormalize yaw rate
+    raw_yaw_rate = ego_future[:, 5] * hdot_std + hdot_mean
+    ego_yaw_rate = raw_yaw_rate / ninfo['hdot'][1]
+
+    gt_xy = np.stack([ego_acc, ego_yaw_rate], axis=-1)  # (FT, 2)
+    dist_sq = ((gt_xy[:, None, :] - prototypes[None, :, :]) ** 2).sum(axis=-1)  # (FT, K)
+    # softmax
+    logits = -dist_sq / (2 * intent_sigma ** 2)
+    logits -= logits.max(axis=1, keepdims=True)
+    exp_logits = np.exp(logits)
+    gt_soft_label = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+    return gt_soft_label, gt_xy, prototypes  # (FT, K), (FT, 2), (K, 2)
+
+
+def _visualize_train_sample(model, scene_graph, map_idx, map_env, device,
+                            out_path, global_step, cfg):
+    """Generate map attn + intent viz for current train batch (first ego only)."""
+    try:
+        was_training = model.training
+        model.eval()
+
+        with torch.no_grad():
+            # AR forward on this batch
+            pred = model.reconstruct(scene_graph, map_idx, map_env)
+            ego_map_attn = model.get_ego_map_attn_weights()
+            intent_weights = model.get_intent_weights()
+
+        if ego_map_attn is None:
+            if was_training:
+                model.train()
+            return
+
+        # Find first ego agent
+        ego_mask = scene_graph.sem[:, 0] == 1
+        if not ego_mask.any():
+            ego_mask = torch.zeros(scene_graph.past.size(0), dtype=torch.bool)
+            ego_mask[0] = True
+        ego_idx = ego_mask.nonzero(as_tuple=True)[0][0].item()
+
+        state_norm = model.get_normalizer()
+        bounds = cfg.map_obs_bounds
+        pix = cfg.map_obs_size_pix
+
+        # Unnormalize ego data
+        with torch.no_grad():
+            ego_pos = state_norm.unnormalize(scene_graph.past[ego_idx, -1:]).squeeze(0).cpu().numpy()
+            gt_future = state_norm.unnormalize(scene_graph.future[ego_idx]).cpu().numpy()
+            pred_future = state_norm.unnormalize(pred['future_pred'][ego_idx]).cpu().numpy()
+
+        FT_len = gt_future.shape[0]
+        mapix = map_idx[scene_graph.batch[ego_idx]].unsqueeze(0)
+
+        # Attn tensor
+        if isinstance(ego_map_attn, torch.Tensor):
+            attn_tensor = ego_map_attn
+        elif isinstance(ego_map_attn, list) and len(ego_map_attn) > 0:
+            attn_tensor = torch.cat(ego_map_attn, dim=0)
+        else:
+            if was_training:
+                model.train()
+            return
+
+        if attn_tensor.dim() == 3:
+            attn_np = attn_tensor[:, 0, :].cpu().numpy()
+        elif attn_tensor.dim() == 2:
+            attn_np = attn_tensor.cpu().numpy()
+        else:
+            if was_training:
+                model.train()
+            return
+
+        num_tokens = attn_np.shape[1]
+        gs = int(np.sqrt(num_tokens))
+        _rf_s = getattr(model, 'map_rf_stride', None)
+        _rf_o = getattr(model, 'map_rf_offset', None)
+
+        # Per-step map crops
+        show_steps = [s for s in [0, 3, 6, 9, 11] if s < FT_len]
+        map_obs_dict = {}
+
+        ego_frames_world = np.zeros((FT_len + 1, 4))
+        ego_frames_world[0] = ego_pos[:4]
+        ego_frames_world[1:] = gt_future[:, :4]
+
+        pred_frames_world = np.zeros((FT_len + 1, 4))
+        pred_frames_world[0] = ego_pos[:4]
+        pred_frames_world[1:] = pred_future[:, :4]
+
+        with torch.no_grad():
+            # t=0 map crop
+            ego_t0 = torch.tensor(ego_pos[:4], device=device, dtype=torch.float32).unsqueeze(0)
+            map_obs_t0 = map_env.get_map_crop_pos(ego_t0, mapix).cpu().numpy()[0]
+            map_obs_dict['traj'] = map_obs_t0
+            map_obs_dict[0] = map_obs_t0
+
+            for t in show_steps:
+                if t == 0:
+                    continue
+                frame_pos = gt_future[t - 1, :4]
+                frame_tensor = torch.tensor(frame_pos, dtype=torch.float32, device=device).unsqueeze(0)
+                map_obs_dict[t] = map_env.get_map_crop_pos(frame_tensor, mapix).cpu().numpy()[0]
+
+        # GT soft labels
+        soft_labels = compute_soft_label_grid(
+            gt_future, ego_frames_world, grid_size=gs,
+            bounds=bounds, pix_size=pix,
+            sigma_d=getattr(cfg, 'map_gt_sigma_d', 1.0),
+            decay_lambda=getattr(cfg, 'map_gt_decay_lambda', 0.075),
+            rf_stride=_rf_s, rf_offset=_rf_o
+        )
+
+        # Remap attn from pred frame to GT frame
+        attn_remapped = attn_np.copy()
+        pred_pix_per_step = {}
+        for t in range(FT_len):
+            gt_frame = ego_frames_world[t]
+            pred_frame = pred_frames_world[t]
+            attn_grid = attn_np[t].reshape(gs, gs)
+            remapped = remap_attn_to_gt_frame(
+                attn_grid, pred_frame, gt_frame, gs, bounds,
+                pix_size=pix, rf_stride=_rf_s, rf_offset=_rf_o)
+            attn_remapped[t] = remapped.reshape(-1)
+
+            if t in show_steps:
+                dx = pred_future[t, 0] - gt_frame[0]
+                dy = pred_future[t, 1] - gt_frame[1]
+                local_l = dx * gt_frame[2] + dy * gt_frame[3]
+                local_w = -dx * gt_frame[3] + dy * gt_frame[2]
+                pix_x = (local_l - bounds[0]) / (bounds[2] - bounds[0]) * pix
+                pix_y = (local_w - bounds[1]) / (bounds[3] - bounds[1]) * pix
+                pred_pix_per_step[t] = (pix_x, pix_y)
+
+        gt_traj_pix = world_to_crop_pixel(gt_future[:, :2], ego_pos, bounds, pix, pix)
+        pred_traj_pix = world_to_crop_pixel(pred_future[:, :2], ego_pos, bounds, pix, pix)
+
+        # Save
+        viz_dir = os.path.join(out_path, 'viz_train_steps')
+        map_attn_dir = os.path.join(viz_dir, 'map_attention')
+        intent_dir = os.path.join(viz_dir, 'intent')
+        os.makedirs(map_attn_dir, exist_ok=True)
+        os.makedirs(intent_dir, exist_ok=True)
+
+        map_attn_path = os.path.join(map_attn_dir, f'step{global_step:07d}_map_attn.png')
+        visualize_map_attention(
+            map_obs_dict, attn_remapped, map_attn_path,
+            agent_idx=ego_idx,
+            soft_labels=soft_labels,
+            pred_pix_per_step=pred_pix_per_step,
+            gt_traj_pix=gt_traj_pix,
+            pred_traj_pix=pred_traj_pix,
+            rf_stride=_rf_s, rf_offset=_rf_o,
+            pix_size=pix, bounds=bounds,
+        )
+
+        # Intent viz (with GT intent soft label)
+        if intent_weights is not None:
+            if isinstance(intent_weights, torch.Tensor):
+                iw = intent_weights
+            elif isinstance(intent_weights, list) and len(intent_weights) > 0:
+                iw = torch.stack(intent_weights, dim=0)
+            else:
+                iw = None
+
+            if iw is not None:
+                if iw.dim() == 3:
+                    iw_np = iw[:, 0, :].cpu().numpy()
+                elif iw.dim() == 2:
+                    iw_np = iw.cpu().numpy()
+                else:
+                    iw_np = None
+
+                if iw_np is not None:
+                    # Compute GT intent soft label (same logic as loss)
+                    gt_intent_np, gt_xy_np, proto_np = _compute_gt_intent_label(
+                        model, scene_graph, ego_idx, device, cfg)
+
+                    intent_path = os.path.join(intent_dir, f'step{global_step:07d}_intent.png')
+                    visualize_intent_codebook(iw_np, intent_path, agent_idx=ego_idx,
+                                              num_intents=getattr(cfg, 'num_intents', 9),
+                                              gt_intent_label=gt_intent_np,
+                                              map_obs=map_obs_dict.get('traj'),
+                                              gt_traj_pix=gt_traj_pix,
+                                              pred_traj_pix=pred_traj_pix)
+
+                    # Intent grid scatter (GT positions on prototype grid)
+                    intent_grid_dir = os.path.join(viz_dir, 'intent_grid')
+                    os.makedirs(intent_grid_dir, exist_ok=True)
+                    grid_path = os.path.join(intent_grid_dir, f'step{global_step:07d}_intent_grid.png')
+                    visualize_intent_grid(gt_xy_np, proto_np, iw_np, grid_path,
+                                          agent_idx=ego_idx,
+                                          intent_range=getattr(cfg, 'intent_range', 2.0),
+                                          map_obs=map_obs_dict.get('traj'),
+                                          gt_traj_pix=gt_traj_pix,
+                                          pred_traj_pix=pred_traj_pix)
+
+        if was_training:
+            model.train()
+
+    except Exception as e:
+        import traceback
+        print(f'[Viz] Error at step {global_step}: {e}')
+        traceback.print_exc()
+        if model.training != was_training:
+            model.train() if was_training else model.eval()
 
 
 def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
@@ -434,6 +681,13 @@ def run_one_epoch(data_loader, model, map_env, loss_fn, device, out_path,
                 for hk, hv in health.items():
                     tb_writer.add_scalar(f'health_step/{hk}', hv, global_step)
 
+        # Visualization: every 200 steps during training (skip Phase 1 — no decoder)
+        viz_every = getattr(cfg, 'viz_every_steps', 200) if cfg is not None else 200
+        current_phase = getattr(cfg, 'phase', 2)
+        if train and global_step > 0 and global_step % viz_every == 0 and current_phase != 1:
+            _visualize_train_sample(model, scene_graph, map_idx, map_env,
+                                    device, out_path, global_step, cfg)
+
     wandb_epoch_metrics = {}
     epoch_metrics = {}
     for k, v in metrics.items():
@@ -567,8 +821,7 @@ def main():
         use_sur_z_local=cfg.use_sur_z_local,
         # V5/V6 redesign (Enc-Dec Cross-Attention)
         use_a2a_rel_bias=cfg.use_a2a_rel_bias,
-        num_z_tokens=getattr(cfg, 'num_z_tokens', 4),
-        num_z_queries=getattr(cfg, 'num_z_queries', 2),
+        num_z_queries=getattr(cfg, 'num_z_queries', 4),
         enc_dropout=getattr(cfg, 'enc_dropout', 0.1),
         context_num_layers=getattr(cfg, 'context_num_layers', 2),
         map_summary_tokens=getattr(cfg, 'map_summary_tokens', 8),
@@ -596,6 +849,8 @@ def main():
         'intent_ce': cfg.loss_intent_ce,
         'map_attn': cfg.loss_map_attn,
         'z_aux': cfg.loss_z_aux,
+        'map_dist_aux': getattr(cfg, 'loss_map_dist_aux', 0.0),
+        'dist_aux': getattr(cfg, 'loss_dist_aux', 0.0),
     }
 
     # Potential field configuration
@@ -647,11 +902,18 @@ def main():
 
     Logger.log('Num model params: %d' % (count_params(model)))
 
-    # create optimizer
-    optimizer = optim.Adam(model.parameters(),
+    # Phase 1: freeze decoder, train encoder only
+    if cfg.phase == 1:
+        model.phase = 1
+        model.freeze_for_phase1()
+
+    # create optimizer (only trainable params)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(trainable_params,
                            lr=cfg.lr,
                            betas=(0.9, 0.95),
                            weight_decay=cfg.weight_decay)
+    Logger.log('Optimizer: %d trainable parameter groups' % len(trainable_params))
 
     # load model weights & optimizer to start from, if given
     ckpt_epoch = 0
@@ -669,9 +931,12 @@ def main():
         ckpt_eval_loss = float('inf')  # Reset eval loss tracking
         global_step = 0  # Reset step counter for Phase 2
 
-        # Freeze z_global encoder for Phase 2
+        # Set Phase 2: reinit decoder, freeze encoder
+        model.phase = 2
+        model.reinit_decoder()
         model.freeze_z_global()
-        Logger.log('Frozen z_global encoder for Phase 2 training')
+        loss_fn.set_phase(2)
+        Logger.log('Phase 2: decoder reinitialized, encoder frozen, loss phase=2')
 
         # Recreate optimizer with only trainable parameters
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -764,8 +1029,8 @@ def main():
     Logger.log(f'  map_recrop: {model.map_recrop}')
     Logger.log(f'  use_a2a_rel_bias: {model.use_a2a_rel_bias}')
     Logger.log(f'  context_encoder: {model.context_encoder}')
-    Logger.log(f'  z_cross_attn: {model.z_cross_attn}')
     Logger.log(f'  map_summary_pooling: {model.map_summary_pooling.num_queries} tokens')
+    Logger.log(f'  num_z_queries: {model.num_z_queries}')
 
     # Action blending
     Logger.log('\n[Action Blending]')
